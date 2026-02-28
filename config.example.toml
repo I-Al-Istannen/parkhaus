@@ -1,0 +1,14 @@
+listen = "127.0.0.1:8080"
+db_path = "./tiering.db"
+db_queue_capacity = 16384
+
+[upstreams.hot]
+priority = 1
+base_url = "http://127.0.0.1:9090"
+addressing_style = "path"
+
+[upstreams.cold]
+priority = 2
+name = "cold"
+base_url = "http://127.0.0.1:9091"
+addressing_style = "path"
