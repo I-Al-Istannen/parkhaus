@@ -8,7 +8,7 @@ use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use url::Url;
 
 pub async fn handle_request(
@@ -16,18 +16,19 @@ pub async fn handle_request(
     OriginalUri(original_uri): OriginalUri,
     req: Request,
 ) -> Result<Response, TierError> {
-    info!(%original_uri, "received request for URL");
+    debug!(%original_uri, method=%req.method(), "received request for URL");
+
     if req.uri().path().chars().filter(|&it| it == '/').count() == 1 {
         // bucket-specific operation, nothing for us to track
         let upstream = state.config.hottest_upstream();
-        info!(%original_uri, "handling bucket-level request for URL");
+        debug!(%original_uri, method=%req.method(), "handling bucket-level request for URL");
         let mut upstream_url = upstream.base_url.clone();
         upstream_url.set_query(req.uri().query());
         upstream_url.set_path(original_uri.path());
         return forward_request(&state, upstream, upstream_url, req).await;
     }
 
-    info!(foo=%original_uri, "handling request for URL");
+    debug!(foo=%original_uri, method=%req.method(), "handling request for URL");
     let Some((bucket, key)) = original_uri.path().trim_start_matches('/').split_once('/') else {
         return Err(report!("url misses bucket: '{original_uri}'")
             .attach(StatusCode::BAD_REQUEST)
@@ -97,8 +98,7 @@ async fn forward_request(
         in_req.into_body().into_data_stream(),
     ));
 
-    info!(
-        %target,
+    debug!(
         upstream = %upstream.name,
         %target,
         "forwarding request to upstream"
