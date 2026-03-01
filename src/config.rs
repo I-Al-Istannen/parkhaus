@@ -22,7 +22,23 @@ pub enum AddressingStyle {
 pub struct Config {
     pub listen: String,
     pub db_path: PathBuf,
-    pub upstreams: HashMap<String, Upstream>,
+    pub upstreams: HashMap<UpstreamId, Upstream>,
+}
+
+impl Config {
+    pub fn hottest_upstream(&self) -> &Upstream {
+        self.upstreams
+            .values()
+            .min_by_key(|u| u.order)
+            .expect("config must contain at least one upstream")
+    }
+
+    pub fn coldest_upstream(&self) -> &Upstream {
+        self.upstreams
+            .values()
+            .min_by_key(|u| u.order)
+            .expect("config must contain at least one upstream")
+    }
 }
 
 #[derive(Debug, Clone, From, Display, PartialEq, Eq, Hash, Type)]
@@ -32,7 +48,7 @@ pub struct UpstreamId(pub String);
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub name: UpstreamId,
-    pub priority: usize,
+    pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
 }
@@ -70,7 +86,7 @@ struct RawConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RawUpstream {
-    pub priority: usize,
+    pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
 }
@@ -85,7 +101,7 @@ pub fn load(path: &Path) -> Result<Config, Report> {
     let priorities = raw
         .upstreams
         .iter()
-        .map(|it| it.1.priority)
+        .map(|it| it.1.order)
         .collect::<HashSet<_>>();
     if priorities.len() != raw.upstreams.len() {
         bail!("upstream priorities must be unique");
@@ -97,11 +113,11 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         .map(|(name, raw)| {
             let upstream = Upstream {
                 name: UpstreamId(name.clone()),
-                priority: raw.priority,
+                order: raw.order,
                 base_url: raw.base_url,
                 addressing_style: raw.addressing_style,
             };
-            (name, upstream)
+            (UpstreamId(name), upstream)
         })
         .collect();
 
