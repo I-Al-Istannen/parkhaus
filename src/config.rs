@@ -1,18 +1,46 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
 use super::toml_utils;
+use crate::data::S3ObjectId;
+use axum::http::Uri;
+use derive_more::{Display, From};
 use rootcause::bail;
 use rootcause::prelude::ResultExt;
 use rootcause::Report;
 use serde::Deserialize;
 use serde::Serialize;
+use sqlx::Type;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddressingStyle {
     Path,
     VirtualHosted,
+}
+
+impl AddressingStyle {
+    pub fn format_url(&self, base_url: &Uri, s3object_id: &S3ObjectId) -> Url {
+        let mut url = Url::parse(&base_url.to_string()).expect("invalid base URL");
+        match self {
+            Self::Path => {
+                url.path_segments_mut()
+                    .expect("base URL can't be cannot-be-a-base")
+                    .push(&s3object_id.bucket)
+                    .push(&s3object_id.key);
+                url
+            }
+            Self::VirtualHosted => {
+                let host = url.host_str().expect("base URL can't be cannot-be-a-base");
+                let host = format!("{}.{}", s3object_id.bucket, host);
+                url.set_host(Some(&host)).expect("failed to set host");
+                url.path_segments_mut()
+                    .expect("base URL can't be cannot-be-a-base")
+                    .push(&s3object_id.key);
+                url
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -22,11 +50,15 @@ pub struct Config {
     pub upstreams: HashMap<String, Upstream>,
 }
 
+#[derive(Debug, Clone, From, Display, PartialEq, Eq, Hash, Type)]
+#[sqlx(transparent)]
+pub struct UpstreamId(pub String);
+
 #[derive(Debug, Clone)]
 pub struct Upstream {
-    pub name: String,
+    pub name: UpstreamId,
     pub priority: usize,
-    pub base_url: String,
+    pub base_url: Url,
     pub addressing_style: AddressingStyle,
 }
 
@@ -40,7 +72,7 @@ struct RawConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RawUpstream {
     pub priority: usize,
-    pub base_url: String,
+    pub base_url: Url,
     pub addressing_style: AddressingStyle,
 }
 
@@ -65,7 +97,7 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         .into_iter()
         .map(|(name, raw)| {
             let upstream = Upstream {
-                name: name.clone(),
+                name: UpstreamId(name.clone()),
                 priority: raw.priority,
                 base_url: raw.base_url,
                 addressing_style: raw.addressing_style,

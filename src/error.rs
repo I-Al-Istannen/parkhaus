@@ -26,8 +26,10 @@ impl IntoResponse for TierError {
     }
 }
 
-impl From<Report> for TierError {
-    fn from(report: Report) -> Self {
-        Self { report }
+impl<T: ?Sized> From<Report<T>> for TierError {
+    fn from(report: Report<T>) -> Self {
+        Self {
+            report: report.into_dynamic(),
+        }
     }
 }
