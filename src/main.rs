@@ -65,7 +65,11 @@ async fn run() -> AppResult<()> {
         .attach(format!("path: {}", &config.db_path.display()))?;
 
     match cli.command {
-        Command::Serve => serve(config, db).await,
+        Command::Serve => {
+            let res = serve(config, db.clone()).await;
+            let _ = db.close().await;
+            res
+        },
         Command::Import => todo!(),
     }
 }

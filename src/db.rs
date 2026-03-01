@@ -1,18 +1,17 @@
 mod objects;
 
 use crate::data::{S3Object, S3ObjectId};
-use rootcause::Report;
 use rootcause::prelude::ResultExt;
+use rootcause::Report;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
-use sqlx::{Pool, Sqlite, query};
-use std::path::{Path, PathBuf};
+use sqlx::{query, Pool, Sqlite};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Clone)]
 pub struct Database {
     con: Arc<RwLock<Pool<Sqlite>>>,
-    path: PathBuf,
 }
 
 impl Database {
@@ -45,7 +44,6 @@ impl Database {
 
         Ok(Self {
             con: Arc::new(RwLock::new(pool)),
-            path: path.to_path_buf(),
         })
     }
 
@@ -57,18 +55,28 @@ impl Database {
         self.con.write().await
     }
 
-    async fn get_object(&self, obj: &S3ObjectId) -> Result<S3Object, Report> {
-        let con = self.write().await;
+    pub async fn get_object(&self, obj: &S3ObjectId) -> Result<S3Object, Report> {
+        let con = self.read().await;
         objects::get_object(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
-    async fn delete_object(&self, obj: &S3ObjectId) -> Result<(), Report> {
+    pub async fn delete_object(&self, obj: &S3ObjectId) -> Result<(), Report> {
         let con = self.write().await;
         objects::delete_object(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
-    async fn record_creation(&self, obj: &S3Object) -> Result<(), Report> {
+    pub async fn record_creation(&self, obj: &S3Object) -> Result<(), Report> {
         let con = self.write().await;
         objects::record_creation(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    pub async fn close(&self) -> Result<(), Report> {
+        // Checkpoint the database to collapse the WAL file and truncate it. This ensures we only
+        // have a single db file after shutdown.
+        let pool = self.write().await;
+        query("PRAGMA WAL_CHECKPOINT(FULL)")
+            .execute(&mut *pool.acquire().await?)
+            .await?;
+        Ok(())
     }
 }
