@@ -1,9 +1,9 @@
 use super::toml_utils;
 use crate::data::S3ObjectId;
 use derive_more::{Display, From};
-use rootcause::Report;
 use rootcause::bail;
 use rootcause::prelude::ResultExt;
+use rootcause::{Report, report};
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::Type;
@@ -51,6 +51,7 @@ pub struct Upstream {
     pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
+    pub max_age: Option<jiff::Span>,
 }
 
 impl Upstream {
@@ -89,6 +90,7 @@ struct RawUpstream {
     pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
+    pub max_age: Option<jiff::Span>,
 }
 
 pub fn load(path: &Path) -> Result<Config, Report> {
@@ -107,6 +109,18 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         bail!("upstream priorities must be unique");
     }
 
+    let mut upstreams = raw.upstreams.iter().collect::<Vec<_>>();
+    upstreams.sort_unstable_by_key(|it| it.1.order);
+    upstreams.pop(); // remove coldest upstream
+    for (name, val) in upstreams {
+        if val.max_age.is_none() {
+            return Err(
+                report!("all upstreams except the coldest one must have max_age set")
+                    .attach(format!("upstream: {name:?}")),
+            );
+        }
+    }
+
     let parsed_upstreams = raw
         .upstreams
         .into_iter()
@@ -116,6 +130,7 @@ pub fn load(path: &Path) -> Result<Config, Report> {
                 order: raw.order,
                 base_url: raw.base_url,
                 addressing_style: raw.addressing_style,
+                max_age: raw.max_age,
             };
             (UpstreamId(name), upstream)
         })

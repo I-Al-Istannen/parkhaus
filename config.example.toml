@@ -6,6 +6,7 @@ db_queue_capacity = 16384
 order = 1
 base_url = "http://127.0.0.1:9090"
 addressing_style = "path"
+max_age = "30d 25m 2s"
 
 [upstreams.cold]
 order = 2
