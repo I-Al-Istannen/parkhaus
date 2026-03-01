@@ -1,10 +1,10 @@
 use crate::config::Upstream;
-use crate::data::S3ObjectId;
+use crate::data::{S3Object, S3ObjectId};
 use crate::error::TierError;
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
@@ -38,6 +38,28 @@ pub async fn handle_request(
         bucket: bucket.to_string(),
         key: key.to_string(),
     };
+
+    // TODO: Only do this if the result is 200?
+    if req.method() == Method::PUT {
+        state
+            .db
+            .record_creation(&S3Object {
+                id: object_id.clone(),
+                assigned_upstream: upstream.name.clone(),
+                last_modified: jiff::Timestamp::now(),
+            })
+            .await
+            .context("could not record creation")
+            .attach(format!("object: {object_id:?}"))?;
+    } else if req.method() == Method::DELETE {
+        state
+            .db
+            .delete_object(&object_id)
+            .await
+            .context("could not record deletion")
+            .attach(format!("object: {object_id:?}"))?;
+    }
+
     forward_request(&state, upstream, upstream.format_url(&object_id), req).await
 }
 
