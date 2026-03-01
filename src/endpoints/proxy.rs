@@ -14,7 +14,7 @@ use url::Url;
 
 const fn nop() {}
 
-pub async fn handle_request(
+pub async fn proxy_request(
     State(state): State<AppState>,
     OriginalUri(original_uri): OriginalUri,
     req: Request,

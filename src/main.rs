@@ -1,8 +1,8 @@
 mod config;
 mod data;
 mod db;
+mod endpoints;
 mod error;
-mod proxy;
 mod toml_utils;
 
 use std::path::PathBuf;
@@ -84,8 +84,8 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
     };
 
     let app = Router::new()
-        .route("/", any(proxy::handle_request))
-        .route("/{*path}", any(proxy::handle_request))
+        .route("/", any(endpoints::proxy_request))
+        .route("/{*path}", any(endpoints::proxy_request))
         .with_state(app_state);
 
     let listener = TcpListener::bind(&config.listen)
