@@ -1,30 +1,44 @@
 use crate::config::Upstream;
+use crate::data::S3ObjectId;
 use crate::error::TierError;
 use crate::AppState;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 pub async fn handle_request(
     State(state): State<AppState>,
+    OriginalUri(original_uri): OriginalUri,
     req: Request,
 ) -> Result<Response, TierError> {
     let upstream = state.config.upstreams.values().next().unwrap();
-    if req.uri().path() == "/" {
+    info!(%original_uri, "received request for URL");
+    if req.uri().path().chars().filter(|&it| it == '/').count() == 1 {
+        info!(%original_uri, "handling bucket-level request for URL");
         // bucket-specific operation, nothing for us to track
         let mut upstream_url = upstream.base_url.clone();
         upstream_url.set_query(req.uri().query());
+        upstream_url.set_path(original_uri.path());
         return forward_request(&state, upstream, upstream_url, req).await;
     }
 
-    Err(report!("handling request: {} {}", req.method(), req.uri())
-        .attach(StatusCode::NOT_ACCEPTABLE)
-        .into())
+    info!(foo=%original_uri, "handling request for URL");
+    let Some((bucket, key)) = original_uri.path().trim_start_matches('/').split_once('/') else {
+        return Err(report!("url misses bucket: '{original_uri}'")
+            .attach(StatusCode::BAD_REQUEST)
+            .into());
+    };
+
+    let object_id = S3ObjectId {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    };
+    forward_request(&state, upstream, upstream.format_url(&object_id), req).await
 }
 
 async fn forward_request(
@@ -43,6 +57,13 @@ async fn forward_request(
     out_req = out_req.body(reqwest::Body::wrap_stream(
         in_req.into_body().into_data_stream(),
     ));
+
+    info!(
+        %target,
+        upstream = %upstream.name,
+        %target,
+        "forwarding request to upstream"
+    );
 
     let in_response = state
         .http

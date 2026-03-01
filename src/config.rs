@@ -1,6 +1,5 @@
 use super::toml_utils;
 use crate::data::S3ObjectId;
-use axum::http::Uri;
 use derive_more::{Display, From};
 use rootcause::bail;
 use rootcause::prelude::ResultExt;
@@ -17,30 +16,6 @@ use url::Url;
 pub enum AddressingStyle {
     Path,
     VirtualHosted,
-}
-
-impl AddressingStyle {
-    pub fn format_url(&self, base_url: &Uri, s3object_id: &S3ObjectId) -> Url {
-        let mut url = Url::parse(&base_url.to_string()).expect("invalid base URL");
-        match self {
-            Self::Path => {
-                url.path_segments_mut()
-                    .expect("base URL can't be cannot-be-a-base")
-                    .push(&s3object_id.bucket)
-                    .push(&s3object_id.key);
-                url
-            }
-            Self::VirtualHosted => {
-                let host = url.host_str().expect("base URL can't be cannot-be-a-base");
-                let host = format!("{}.{}", s3object_id.bucket, host);
-                url.set_host(Some(&host)).expect("failed to set host");
-                url.path_segments_mut()
-                    .expect("base URL can't be cannot-be-a-base")
-                    .push(&s3object_id.key);
-                url
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +35,30 @@ pub struct Upstream {
     pub priority: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
+}
+
+impl Upstream {
+    pub fn format_url(&self, s3object_id: &S3ObjectId) -> Url {
+        let mut url = self.base_url.clone();
+        match self.addressing_style {
+            AddressingStyle::Path => {
+                url.path_segments_mut()
+                    .expect("base URL can't be cannot-be-a-base")
+                    .push(&s3object_id.bucket)
+                    .push(&s3object_id.key);
+                url
+            }
+            AddressingStyle::VirtualHosted => {
+                let host = url.host_str().expect("base URL can't be cannot-be-a-base");
+                let host = format!("{}.{}", s3object_id.bucket, host);
+                url.set_host(Some(&host)).expect("failed to set host");
+                url.path_segments_mut()
+                    .expect("base URL can't be cannot-be-a-base")
+                    .push(&s3object_id.key);
+                url
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
