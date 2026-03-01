@@ -1,8 +1,8 @@
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use jiff::Timestamp;
-use rootcause::prelude::ResultExt;
 use rootcause::Report;
-use sqlx::{query, query_as, SqliteConnection};
+use rootcause::prelude::ResultExt;
+use sqlx::{SqliteConnection, query, query_as};
 
 struct DbObject {
     bucket: String,

@@ -1,10 +1,10 @@
 mod objects;
 
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
-use rootcause::prelude::ResultExt;
 use rootcause::Report;
+use rootcause::prelude::ResultExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
-use sqlx::{query, Pool, Sqlite};
+use sqlx::{Pool, Sqlite, query};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};

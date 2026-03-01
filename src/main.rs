@@ -69,7 +69,7 @@ async fn run() -> AppResult<()> {
             let res = serve(config, db.clone()).await;
             let _ = db.close().await;
             res
-        },
+        }
         Command::Import => todo!(),
     }
 }

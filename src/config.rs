@@ -1,9 +1,9 @@
 use super::toml_utils;
 use crate::data::S3ObjectId;
 use derive_more::{Display, From};
+use rootcause::Report;
 use rootcause::bail;
 use rootcause::prelude::ResultExt;
-use rootcause::Report;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::Type;
