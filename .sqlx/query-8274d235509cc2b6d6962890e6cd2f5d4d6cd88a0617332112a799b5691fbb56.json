@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT * FROM objects WHERE bucket = $1 AND key = $2",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "assigned_upstream",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "last_modified",
+        "ordinal": 3,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8274d235509cc2b6d6962890e6cd2f5d4d6cd88a0617332112a799b5691fbb56"
+}

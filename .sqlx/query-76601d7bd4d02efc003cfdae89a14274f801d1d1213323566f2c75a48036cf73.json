@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT assigned_upstream FROM objects WHERE bucket = $1 AND key = $2",
+  "describe": {
+    "columns": [
+      {
+        "name": "assigned_upstream",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "76601d7bd4d02efc003cfdae89a14274f801d1d1213323566f2c75a48036cf73"
+}
