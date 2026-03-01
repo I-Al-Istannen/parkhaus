@@ -1,15 +1,18 @@
 use crate::AppState;
-use crate::config::Upstream;
+use crate::config::{Upstream, UpstreamId};
 use crate::data::{S3Object, S3ObjectId};
+use crate::db::Database;
 use crate::error::TierError;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use rootcause::prelude::ResultExt;
-use rootcause::report;
-use tracing::{debug, info, trace, warn};
+use rootcause::{Report, report};
+use tracing::{debug, warn};
 use url::Url;
+
+const fn nop() {}
 
 pub async fn handle_request(
     State(state): State<AppState>,
@@ -25,7 +28,7 @@ pub async fn handle_request(
         let mut upstream_url = upstream.base_url.clone();
         upstream_url.set_query(req.uri().query());
         upstream_url.set_path(original_uri.path());
-        return forward_request(&state, upstream, upstream_url, req).await;
+        return forward_request(&state, upstream, upstream_url, req, nop).await;
     }
 
     debug!(foo=%original_uri, method=%req.method(), "handling request for URL");
@@ -57,28 +60,20 @@ pub async fn handle_request(
             coldest
         });
 
-    // TODO: Only do this if the result is 200?
-    if req.method() == Method::PUT {
-        state
-            .db
-            .record_creation(&S3Object {
-                id: object_id.clone(),
-                assigned_upstream: upstream.name.clone(),
-                last_modified: jiff::Timestamp::now(),
-            })
-            .await
-            .context("could not record creation")
-            .attach(format!("object: {object_id:?}"))?;
-    } else if req.method() == Method::DELETE {
-        state
-            .db
-            .delete_object(&object_id)
-            .await
-            .context("could not record deletion")
-            .attach(format!("object: {object_id:?}"))?;
-    }
-
-    forward_request(&state, upstream, upstream.format_url(&object_id), req).await
+    let on_success = record_successful_request(
+        req.method().clone(),
+        object_id.clone(),
+        state.db.clone(),
+        upstream.name.clone(),
+    );
+    forward_request(
+        &state,
+        upstream,
+        upstream.format_url(&object_id),
+        req,
+        on_success,
+    )
+    .await
 }
 
 async fn forward_request(
@@ -86,6 +81,7 @@ async fn forward_request(
     upstream: &Upstream,
     target: Url,
     in_req: Request,
+    on_success: impl FnOnce(),
 ) -> Result<Response, TierError> {
     let mut out_req = state.http.request(in_req.method().clone(), target.clone());
     for (name, val) in in_req.headers() {
@@ -137,6 +133,10 @@ async fn forward_request(
         }
     }
 
+    if in_resp_status.is_success() {
+        on_success();
+    }
+
     Ok(out_response)
 }
 
@@ -157,4 +157,43 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn record_successful_request(
+    req_method: Method,
+    obj_id: S3ObjectId,
+    db: Database,
+    upstream_name: UpstreamId,
+) -> impl FnOnce() {
+    move || {
+        let obj_id_clone = obj_id.clone();
+        let recording = async move {
+            if req_method == Method::PUT {
+                db.record_creation(&S3Object {
+                    id: obj_id_clone.clone(),
+                    assigned_upstream: upstream_name,
+                    last_modified: jiff::Timestamp::now(),
+                })
+                .await
+                .context("could not record creation")
+                .attach(format!("object: {obj_id_clone:?}"))?;
+            } else if req_method == Method::DELETE {
+                db.delete_object(&obj_id_clone)
+                    .await
+                    .context("could not record deletion")
+                    .attach(format!("object: {obj_id_clone:?}"))?;
+            }
+            Result::<(), Report>::Ok(())
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = recording.await {
+                warn!(
+                    %e,
+                    object_id=?obj_id,
+                    "failed to record object creation/deletion"
+                );
+            }
+        });
+    }
 }
