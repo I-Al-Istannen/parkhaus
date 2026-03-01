@@ -1,8 +1,8 @@
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use jiff::Timestamp;
-use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use sqlx::{SqliteConnection, query, query_as};
+use rootcause::Report;
+use sqlx::{query, query_as, SqliteConnection};
 
 struct DbObject {
     bucket: String,
@@ -46,6 +46,23 @@ pub(super) async fn get_object(
     .context("Failed to fetch object")
     .attach(format!("object: {obj:?}"))?
     .try_into()
+}
+
+pub(super) async fn get_upstream(
+    con: &mut SqliteConnection,
+    obj: &S3ObjectId,
+) -> Result<Option<UpstreamId>, Report> {
+    Ok(query!(
+        "SELECT assigned_upstream FROM objects WHERE bucket = $1 AND key = $2",
+        obj.bucket,
+        obj.key
+    )
+    .map(|row| row.assigned_upstream)
+    .fetch_optional(con)
+    .await
+    .context("Failed to fetch object")
+    .attach(format!("object: {obj:?}"))?
+    .map(UpstreamId))
 }
 
 pub(super) async fn delete_object(

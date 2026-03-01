@@ -1,6 +1,6 @@
 mod objects;
 
-use crate::data::{S3Object, S3ObjectId};
+use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use rootcause::prelude::ResultExt;
 use rootcause::Report;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
@@ -58,6 +58,11 @@ impl Database {
     pub async fn get_object(&self, obj: &S3ObjectId) -> Result<S3Object, Report> {
         let con = self.read().await;
         objects::get_object(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    pub async fn get_upstream(&self, obj: &S3ObjectId) -> Result<Option<UpstreamId>, Report> {
+        let con = self.read().await;
+        objects::get_upstream(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
     pub async fn delete_object(&self, obj: &S3ObjectId) -> Result<(), Report> {

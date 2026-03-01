@@ -8,7 +8,7 @@ use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 pub async fn handle_request(
@@ -16,11 +16,11 @@ pub async fn handle_request(
     OriginalUri(original_uri): OriginalUri,
     req: Request,
 ) -> Result<Response, TierError> {
-    let upstream = state.config.upstreams.values().next().unwrap();
     info!(%original_uri, "received request for URL");
     if req.uri().path().chars().filter(|&it| it == '/').count() == 1 {
-        info!(%original_uri, "handling bucket-level request for URL");
         // bucket-specific operation, nothing for us to track
+        let upstream = state.config.hottest_upstream();
+        info!(%original_uri, "handling bucket-level request for URL");
         let mut upstream_url = upstream.base_url.clone();
         upstream_url.set_query(req.uri().query());
         upstream_url.set_path(original_uri.path());
@@ -38,6 +38,23 @@ pub async fn handle_request(
         bucket: bucket.to_string(),
         key: key.to_string(),
     };
+
+    let upstream = state
+        .db
+        .get_upstream(&object_id)
+        .await
+        .context("failed to get upstream for object")?
+        .and_then(|it| state.config.upstreams.get(&it))
+        // default to the coldest upstream
+        .unwrap_or_else(|| {
+            let coldest = state.config.coldest_upstream();
+            debug!(
+                ?object_id,
+                %coldest.name,
+                "object not found in database, defaulting to coldest upstream"
+            );
+            coldest
+        });
 
     // TODO: Only do this if the result is 200?
     if req.method() == Method::PUT {
