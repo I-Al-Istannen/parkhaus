@@ -3,12 +3,14 @@ mod data;
 mod db;
 mod endpoints;
 mod error;
+mod import;
 mod toml_utils;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::Database;
+use crate::import::import;
 use axum::Router;
 use axum::routing::any;
 use clap::{Parser, Subcommand};
@@ -17,7 +19,9 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 type AppResult<T> = Result<T, Report>;
 
@@ -30,10 +34,17 @@ struct Cli {
     command: Command,
 }
 
+/// A lightweight and transparent S3 proxy server implementing object tiering.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Start the proxy server.
     Serve,
-    Import,
+    Import {
+        /// Optional timestamp to use as the last modified time for all imported objects.
+        /// If not provided, the last modified time from S3 will be used.
+        #[arg(long)]
+        import_time: Option<jiff::Timestamp>,
+    },
 }
 
 #[derive(Clone)]
@@ -45,13 +56,8 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
-        .init();
-
     if let Err(error) = run().await {
-        error!(%error, "application failed");
+        eprintln!("Application error: {error}");
         std::process::exit(1);
     }
 }
@@ -64,17 +70,29 @@ async fn run() -> AppResult<()> {
         .context("failed to initialize database")
         .attach(format!("path: {}", &config.db_path.display()))?;
 
-    match cli.command {
-        Command::Serve => {
-            let res = serve(config, db.clone()).await;
-            let _ = db.close().await;
-            res
-        }
-        Command::Import => todo!(),
+    let res = match cli.command {
+        Command::Serve => serve(config, db.clone()).await,
+        Command::Import { import_time } => import(config, db.clone(), import_time).await,
+    };
+
+    if let Err(e) = db.close().await {
+        eprintln!("Failed to close database: {e}");
     }
+    res
 }
 
 async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact(),
+        )
+        .init();
+
     let app_state = AppState {
         config: Arc::clone(&config),
         db,

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sqlx::Type;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -45,6 +46,15 @@ impl Config {
 #[sqlx(transparent)]
 pub struct UpstreamId(pub String);
 
+#[derive(Clone)]
+pub struct S3Secret(pub String);
+
+impl Debug for S3Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "s3:{}", "*".repeat(self.0.len()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub name: UpstreamId,
@@ -52,6 +62,8 @@ pub struct Upstream {
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
     pub max_age: Option<jiff::Span>,
+    pub s3_access_key: String,
+    pub s3_secret: S3Secret,
 }
 
 impl Upstream {
@@ -78,19 +90,21 @@ impl Upstream {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawConfig {
     pub listen: String,
     pub db_path: PathBuf,
     pub upstreams: HashMap<String, RawUpstream>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct RawUpstream {
     pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
     pub max_age: Option<jiff::Span>,
+    pub s3_access_key: String,
+    pub s3_secret: String,
 }
 
 pub fn load(path: &Path) -> Result<Config, Report> {
@@ -131,6 +145,8 @@ pub fn load(path: &Path) -> Result<Config, Report> {
                 base_url: raw.base_url,
                 addressing_style: raw.addressing_style,
                 max_age: raw.max_age,
+                s3_access_key: raw.s3_access_key,
+                s3_secret: S3Secret(raw.s3_secret),
             };
             (UpstreamId(name), upstream)
         })
