@@ -4,14 +4,15 @@ use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
-use sqlx::{Pool, Sqlite, query};
-use std::path::Path;
+use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Clone)]
 pub struct Database {
     con: Arc<RwLock<Pool<Sqlite>>>,
+    path: PathBuf,
 }
 
 impl Database {
@@ -44,6 +45,7 @@ impl Database {
 
         Ok(Self {
             con: Arc::new(RwLock::new(pool)),
+            path: path.to_owned(),
         })
     }
 
@@ -75,13 +77,20 @@ impl Database {
         objects::record_creation(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
-    pub async fn close(&self) -> Result<(), Report> {
-        // Checkpoint the database to collapse the WAL file and truncate it. This ensures we only
-        // have a single db file after shutdown.
-        let pool = self.write().await;
-        query("PRAGMA WAL_CHECKPOINT(FULL)")
-            .execute(&mut *pool.acquire().await?)
+    pub async fn close(self) -> Result<(), Report> {
+        // Close the existing connection to ensure it does not block cleanup
+        self.write().await.close().await;
+
+        // Clean up WAL files. This should happen above but sqlx does not correctly close sqlite
+        // See: https://github.com/launchbadge/sqlx/issues/2249
+        SqliteConnectOptions::default()
+            .journal_mode(SqliteJournalMode::Wal)
+            .filename(&self.path)
+            .connect()
+            .await?
+            .close()
             .await?;
+
         Ok(())
     }
 }
