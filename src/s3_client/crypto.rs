@@ -1,7 +1,12 @@
+use std::collections::BTreeMap;
+
 use hmac::{Hmac, Mac};
+use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderValue};
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
+use rootcause::prelude::ResultExt;
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -14,87 +19,219 @@ const SIGV4_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// Result of signing a request with AWS Signature Version 4.
+const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 #[derive(Debug, Clone)]
-pub struct SignedRequest {
-    pub host: String,
-    pub amz_date: String,
-    pub authorization: String,
+struct SigningResult {
+    payload_hash: String,
+    host: String,
+    amz_date: String,
+    authorization: String,
+    signature: String,
+    scope: String,
+    signing_key: Vec<u8>,
 }
 
-/// Sign an HTTP request using AWS Signature Version 4 (header-based auth) at the current time.
-///
-/// See <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html>
-pub fn sign_v4(
-    key_id: &str,
-    secret: &str,
-    region: &str,
-    method: &str,
-    url: &Url,
-    payload_hash: &str,
-) -> Result<SignedRequest, Report> {
-    sign_v4_at(
-        key_id,
-        secret,
-        region,
-        method,
-        url,
-        payload_hash,
-        jiff::Timestamp::now(),
-    )
+impl SigningResult {
+    fn headers(&self) -> Result<HeaderMap, Report> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HOST,
+            HeaderValue::from_str(&self.host).context("invalid host")?,
+        );
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.authorization).context("invalid authorization")?,
+        );
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&self.payload_hash).context("invalid hash")?,
+        );
+        headers.insert(
+            "x-amz-date",
+            HeaderValue::from_str(&self.amz_date).context("invalid date")?,
+        );
+        Ok(headers)
+    }
 }
 
-/// Sign an HTTP request at a specific point in time.
-pub fn sign_v4_at(
-    key_id: &str,
-    secret: &str,
-    region: &str,
-    method: &str,
-    url: &Url,
-    payload_hash: &str,
-    current_time: jiff::Timestamp,
-) -> Result<SignedRequest, Report> {
-    // Spec: Date must be in ISO 8601 basic format: YYYYMMDD'T'HHMMSS'Z'
-    let amz_date = current_time.strftime("%Y%m%dT%H%M%SZ").to_string();
-    let date_stamp = current_time.strftime("%Y%m%d").to_string();
+pub struct ChunkSigner {
+    signing_key: Vec<u8>,
+    scope: String,
+    amz_date: String,
+    previous_signature: String,
+}
 
-    let host = url.host_str().context("URL must have a host")?;
+impl ChunkSigner {
+    pub fn sign_chunk(&mut self, chunk_data: &[u8]) -> String {
+        let chunk_hash = hex::encode(Sha256::digest(chunk_data));
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{chunk_hash}",
+            self.amz_date, self.scope, self.previous_signature,
+        );
+        let signature = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
+        self.previous_signature.clone_from(&signature);
+        signature
+    }
+}
 
-    // Include the origin if it is not the default port for the scheme
-    let host_header = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    };
+pub struct SignRequest<'a> {
+    method: &'a str,
+    url: &'a Url,
+    payload_hash: &'a str,
+    current_time: Timestamp,
+    extra_headers: &'a [(&'a str, &'a str)],
+}
 
-    // Task 1: Create a Canonical Request
-    // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html#canonical-request
-    let (canonical_request, signed_headers) =
-        build_canonical_request(method, url, &host_header, &amz_date, payload_hash);
+impl<'a> SignRequest<'a> {
+    pub fn new(method: &'a str, url: &'a Url, current_time: Timestamp) -> Self {
+        Self {
+            method,
+            url,
+            payload_hash: EMPTY_SHA256,
+            current_time,
+            extra_headers: &[],
+        }
+    }
 
-    // Task 2: Create a String to Sign
-    // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html#request-string
-    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
-    let string_to_sign = build_string_to_sign(&amz_date, &scope, &canonical_request);
+    pub fn now(method: &'a str, url: &'a Url) -> Self {
+        Self::new(method, url, Timestamp::now())
+    }
 
-    // Task 3: Calculate Signature
-    // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html#signing-key
-    // The final signature is the HMAC-SHA256 hash of the string to sign,
-    // using the signing key as the key.
-    let signing_key = derive_signing_key(secret, &date_stamp, region);
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    pub fn get(url: &'a Url) -> Self {
+        Self::now("GET", url)
+    }
 
-    // Task 4: Authorization header
-    // Spec: Authorization = algorithm Credential=access key ID/credential scope,
-    //        SignedHeaders=signed headers, Signature=signature
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={key_id}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    );
+    pub fn with_payload_hash(mut self, payload_hash: &'a str) -> Self {
+        self.payload_hash = payload_hash;
+        self
+    }
 
-    Ok(SignedRequest {
-        host: host_header,
-        amz_date,
-        authorization,
-    })
+    pub fn with_extra_headers(mut self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+        self.extra_headers = extra_headers;
+        self
+    }
+}
+
+pub struct StreamingSignRequest<'a> {
+    url: &'a Url,
+    decoded_content_length: u64,
+    current_time: Timestamp,
+}
+
+impl<'a> StreamingSignRequest<'a> {
+    pub fn new(url: &'a Url, decoded_content_length: u64, current_time: Timestamp) -> Self {
+        Self {
+            url,
+            decoded_content_length,
+            current_time,
+        }
+    }
+
+    pub fn now(url: &'a Url, decoded_content_length: u64) -> Self {
+        Self::new(url, decoded_content_length, Timestamp::now())
+    }
+}
+
+#[derive(Clone)]
+pub struct SigningConfig {
+    key_id: String,
+    secret: String,
+    region: String,
+}
+
+impl SigningConfig {
+    pub fn new(
+        key_id: impl Into<String>,
+        secret: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            secret: secret.into(),
+            region: region.into(),
+        }
+    }
+
+    pub fn sign(&self, request: SignRequest<'_>) -> Result<HeaderMap, Report> {
+        let res = self.sign_impl(request)?;
+        res.headers()
+    }
+
+    pub fn sign_streaming(
+        &self,
+        request: StreamingSignRequest<'_>,
+    ) -> Result<(HeaderMap, ChunkSigner), Report> {
+        let decoded_len_str = request.decoded_content_length.to_string();
+        let signed = self.sign_impl(
+            SignRequest::new("PUT", request.url, request.current_time)
+                .with_payload_hash(STREAMING_PAYLOAD_HASH)
+                .with_extra_headers(&[
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", decoded_len_str.as_str()),
+                ]),
+        )?;
+
+        let chunk_signer = ChunkSigner {
+            signing_key: signed.signing_key.clone(),
+            amz_date: signed.amz_date.clone(),
+            scope: signed.scope.clone(),
+            previous_signature: signed.signature.clone(),
+        };
+
+        let mut headers = signed.headers()?;
+        headers.insert("content-encoding", HeaderValue::from_str("aws-chunked")?);
+        headers.insert(
+            "x-amz-decoded-content-length",
+            HeaderValue::from_str(&decoded_len_str)?,
+        );
+
+        Ok((headers, chunk_signer))
+    }
+
+    fn sign_impl(&self, request: SignRequest<'_>) -> Result<SigningResult, Report> {
+        // Spec: Date must be in ISO 8601 basic format: YYYYMMDD'T'HHMMSS'Z'
+        let amz_date = request.current_time.strftime("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = request.current_time.strftime("%Y%m%d").to_string();
+
+        let host = request.url.host_str().context("URL must have a host")?;
+
+        // Include the origin if it is not the default port for the scheme
+        let host_header = match request.url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+
+        let (canonical_request, signed_headers) = build_canonical_request(
+            request.method,
+            request.url,
+            &host_header,
+            &amz_date,
+            request.payload_hash,
+            request.extra_headers,
+        );
+
+        let scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
+        let string_to_sign = build_string_to_sign(&amz_date, &scope, &canonical_request);
+        let signing_key = derive_signing_key(&self.secret, &date_stamp, &self.region);
+        let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.key_id,
+        );
+
+        Ok(SigningResult {
+            payload_hash: request.payload_hash.to_string(),
+            host: host_header,
+            amz_date,
+            authorization,
+            signing_key,
+            scope,
+            signature,
+        })
+    }
 }
 
 // Task 1: Create a Canonical Request
@@ -113,21 +250,32 @@ fn build_canonical_request(
     host: &str,
     amz_date: &str,
     payload_hash: &str,
+    extra: &[(&str, &str)],
 ) -> (String, String) {
     let canonical_uri = canonical_uri(url);
     let canonical_query = canonical_query_string(url);
+
+    let extra = extra
+        .iter()
+        .cloned()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect::<Vec<_>>();
+    let mut headers = BTreeMap::new();
+    headers.insert("host", host);
+    headers.insert("x-amz-content-sha256", payload_hash);
+    headers.insert("x-amz-date", amz_date);
+    headers.extend(extra.iter().map(|(k, v)| (k.as_str(), *v)));
 
     // Individual header name and value pairs are separated by the newline character ("\n").
     // Header names must be in lowercase.
     // You must sort the header names alphabetically to construct the string
     //
     // For S3 you MUST include: host, x-amz-content-sha256, x-amz-date
-    let canonical_headers =
-        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
 
     // SignedHeaders is an alphabetically sorted, semicolon-separated list
     // of lowercase request header names.
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let signed_headers: String = headers.keys().copied().collect::<Vec<_>>().join(";");
 
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
@@ -302,6 +450,7 @@ mod tests {
             "my-precious-bucket.s3.amazonaws.com",
             EXAMPLE_AMZ_DATE,
             EMPTY_HASH,
+            &[],
         );
 
         let expected = format!(
@@ -330,6 +479,7 @@ host;x-amz-content-sha256;x-amz-date
             "my-precious-bucket.s3.amazonaws.com",
             EXAMPLE_AMZ_DATE,
             EMPTY_HASH,
+            &[],
         );
 
         let scope = format!("{EXAMPLE_DATE}/{EXAMPLE_REGION}/s3/aws4_request");
@@ -355,20 +505,19 @@ host;x-amz-content-sha256;x-amz-date
     fn test_full_signature() -> Result<(), Report> {
         // Reproduce the full example signature from the blog post
         let url = Url::parse("https://my-precious-bucket.s3.amazonaws.com/")?;
-        let ts: jiff::Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = sign_v4_at(
-            EXAMPLE_KEY_ID,
-            EXAMPLE_SECRET,
-            EXAMPLE_REGION,
-            "GET",
-            &url,
-            EMPTY_HASH,
-            ts,
-        )?;
+        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
 
-        assert_eq!(signed.host, "my-precious-bucket.s3.amazonaws.com");
-        assert_eq!(signed.amz_date, EXAMPLE_AMZ_DATE);
+        assert_eq!(
+            signed.get("host").context("expected host header")?,
+            "my-precious-bucket.s3.amazonaws.com"
+        );
+        assert_eq!(
+            signed.get("x-amz-date").context("expected x-amz-date")?,
+            EXAMPLE_AMZ_DATE
+        );
 
         let expected_auth_credential = format!(
             "Credential=AKIAIOSFODNN7EXAMPLE/{EXAMPLE_DATE}/{EXAMPLE_REGION}/s3/aws4_request"
@@ -377,8 +526,10 @@ host;x-amz-content-sha256;x-amz-date
         let expected_auth_signature =
             "Signature=182072eb53d85c36b2d791a1fa46a12d23454ec1e921b02075c23aee40166d5a";
         assert_eq!(
-            signed.authorization,
-            format!(
+            signed
+                .get("authorization")
+                .context("expected authorization header")?,
+            &format!(
                 "AWS4-HMAC-SHA256 {expected_auth_credential}, {expected_auth_headers}, {expected_auth_signature}"
             )
         );
@@ -390,22 +541,20 @@ host;x-amz-content-sha256;x-amz-date
     fn test_sign_with_query_params() -> Result<(), Report> {
         // Verify query string parameters get included
         let url = Url::parse("https://bucket.s3.amazonaws.com/path?list-type=2&prefix=foo")?;
-        let ts: jiff::Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = sign_v4_at(
-            EXAMPLE_KEY_ID,
-            EXAMPLE_SECRET,
-            EXAMPLE_REGION,
-            "GET",
-            &url,
-            EMPTY_HASH,
-            ts,
-        )?;
+        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
 
         assert!(
-            !signed.authorization.contains(
-                "Signature=182072eb53d85c36b2d791a1fa46a12d23454ec1e921b02075c23aee40166d5a"
-            ),
+            !signed
+                .get("authorization")
+                .context("expected authorization header")?
+                .to_str()
+                .context("expect string value")?
+                .contains(
+                    "Signature=182072eb53d85c36b2d791a1fa46a12d23454ec1e921b02075c23aee40166d5a"
+                ),
             "signature should change when query parameters are included"
         );
 
@@ -415,19 +564,15 @@ host;x-amz-content-sha256;x-amz-date
     #[test]
     fn test_sign_with_port() -> Result<(), Report> {
         let url = Url::parse("https://localhost:9000/bucket")?;
-        let ts: jiff::Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = sign_v4_at(
-            EXAMPLE_KEY_ID,
-            EXAMPLE_SECRET,
-            EXAMPLE_REGION,
-            "GET",
-            &url,
-            EMPTY_HASH,
-            ts,
-        )?;
+        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
 
-        assert_eq!(signed.host, "localhost:9000");
+        assert_eq!(
+            signed.get("host").context("expected host header")?,
+            "localhost:9000"
+        );
 
         Ok(())
     }

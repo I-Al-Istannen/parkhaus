@@ -1901,6 +1901,7 @@ dependencies = [
  "clap",
  "derive_more",
  "dialoguer",
+ "futures-util",
  "hex",
  "hmac",
  "jiff",

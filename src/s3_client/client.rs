@@ -1,21 +1,21 @@
-use super::crypto::sign_v4;
+use super::crypto::{SignRequest, SigningConfig, StreamingSignRequest};
+use crate::data::S3ObjectId;
+use futures_util::stream;
+use jiff::Timestamp;
 use reqwest::Client;
 use rootcause::prelude::ResultExt;
-use rootcause::{Report, report};
+use rootcause::{Report, bail, report};
 use serde::Deserialize;
+use std::io::Write as _;
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use url::Url;
 
-const EMPTY_PAYLOAD_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
 pub struct S3Client {
     client: Client,
-    key_id: String,
-    secret: String,
+    signing: SigningConfig,
     endpoint: Url,
-    region: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,39 +28,27 @@ pub struct ObjectInfo {
     pub key: String,
     #[allow(unused)]
     pub size: u64,
-    pub last_modified: jiff::Timestamp,
+    pub last_modified: Timestamp,
 }
 
 impl S3Client {
     pub fn new(client: Client, endpoint: Url, region: &str, key_id: &str, secret: &str) -> Self {
         Self {
             client,
-            key_id: key_id.to_owned(),
-            secret: secret.to_owned(),
+            signing: SigningConfig::new(key_id, secret, region),
             endpoint,
-            region: region.to_owned(),
         }
     }
 
     async fn signed_get(&self, url: &Url) -> Result<String, Report> {
         // S3 SigV4 signed GET with an explicit payload hash header.
         // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-        let signed = sign_v4(
-            &self.key_id,
-            &self.secret,
-            &self.region,
-            "GET",
-            url,
-            EMPTY_PAYLOAD_SHA256,
-        )?;
+        let signed_headers = self.signing.sign(SignRequest::get(url))?;
 
         let response = self
             .client
             .get(url.as_str())
-            .header("host", signed.host)
-            .header("x-amz-date", signed.amz_date)
-            .header("x-amz-content-sha256", EMPTY_PAYLOAD_SHA256)
-            .header("authorization", signed.authorization)
+            .headers(signed_headers)
             .send()
             .await
             .context("S3 request failed")?;
@@ -72,7 +60,7 @@ impl S3Client {
             .context("failed to read S3 response body")?;
 
         if !status.is_success() {
-            rootcause::bail!("S3 returned {status}: {body}");
+            bail!("S3 returned {status}: {body}");
         }
 
         Ok(body)
@@ -154,6 +142,206 @@ impl S3Client {
 
         Ok(url)
     }
+
+    pub async fn put_file(
+        &self,
+        id: &S3ObjectId,
+        data: impl AsyncRead + Unpin + Send + 'static,
+        content_length: u64,
+    ) -> Result<(), Report> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(&id.bucket)
+            .push(&id.key);
+
+        let (signed_headers, chunk_signer) = self
+            .signing
+            .sign_streaming(StreamingSignRequest::now(&url, content_length))?;
+
+        let body = reqwest::Body::wrap_stream(chunked_upload_stream(data, chunk_signer));
+
+        let response = self
+            .client
+            .put(url.as_str())
+            .headers(signed_headers)
+            .body(body)
+            .send()
+            .await
+            .context("PUT request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            bail!("S3 PUT returned {status}: {text}");
+        }
+        println!("Upload complete: {id:?} -\n{}", response.text().await?);
+
+        Ok(())
+    }
+}
+
+const CHUNK_SIZE: usize = 64 * 1024;
+
+fn chunked_upload_stream(
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    signer: super::crypto::ChunkSigner,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, Report>> {
+    struct ChunkState<R> {
+        reader: R,
+        signer: super::crypto::ChunkSigner,
+        buf: Vec<u8>,
+        done: bool,
+    }
+
+    let state = ChunkState {
+        reader: BufReader::new(reader),
+        signer,
+        buf: vec![0u8; CHUNK_SIZE],
+        done: false,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+
+        let written = match read_full(&mut state.reader, &mut state.buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                state.done = true;
+                return Some((Err(e), state));
+            }
+        };
+
+        let mut chunk = Vec::new();
+
+        if written > 0 {
+            let sig = state.signer.sign_chunk(&state.buf[..written]);
+            write!(chunk, "{written:x};chunk-signature={sig}\r\n").unwrap();
+            chunk.extend_from_slice(&state.buf[..written]);
+            chunk.extend_from_slice(b"\r\n");
+        }
+
+        if written < CHUNK_SIZE {
+            let final_sig = state.signer.sign_chunk(b"");
+            write!(chunk, "0;chunk-signature={final_sig}\r\n\r\n").unwrap();
+            state.done = true;
+        }
+
+        Some((Ok(chunk), state))
+    })
+}
+
+async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Result<usize, Report> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader
+            .read(&mut buf[filled..])
+            .await
+            .context("failed to read upload data")?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn test_client(port: u16) -> S3Client {
+        let client = Client::new();
+        let endpoint: Url = format!("http://localhost:{port}").parse().unwrap();
+        S3Client::new(client, endpoint, "us-east-1", "test-key", "test-secret")
+    }
+
+    async fn make_bucket(client: &S3Client, bucket: &str) -> Result<(), Report> {
+        let mut url = client.endpoint.clone();
+        url.path_segments_mut().unwrap().push(bucket);
+        let signed_headers = client.signing.sign(SignRequest::now("PUT", &url))?;
+        client
+            .client
+            .put(url.as_str())
+            .headers(signed_headers)
+            .send()
+            .await
+            .context("failed to create bucket")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_file() -> Result<(), Report> {
+        let client = test_client(9090);
+        make_bucket(&client, "test-put-bucket").await?;
+
+        let payload = b"Hello, chunked S3 upload!";
+        let id = S3ObjectId {
+            bucket: "test-put-bucket".into(),
+            key: "test-key.txt".into(),
+        };
+
+        client
+            .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+            .await?;
+
+        let get_url: Url = "http://localhost:9090/test-put-bucket/test-key.txt".parse()?;
+        let body = client.signed_get(&get_url).await?;
+        assert_eq!(body, "Hello, chunked S3 upload!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_put_large_file() -> Result<(), Report> {
+        let client = test_client(9090);
+        make_bucket(&client, "test-put-large").await?;
+
+        let payload: Vec<u8> = (0..CHUNK_SIZE * 2 + 1000)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let id = S3ObjectId {
+            bucket: "test-put-large".into(),
+            key: "large-file.bin".into(),
+        };
+
+        client
+            .put_file(&id, Cursor::new(payload.clone()), payload.len() as u64)
+            .await?;
+
+        let get_url: Url = "http://localhost:9090/test-put-large/large-file.bin".parse()?;
+        let signed_headers = client.signing.sign(SignRequest::get(&get_url))?;
+        let resp = client
+            .client
+            .get(get_url.as_str())
+            .headers(signed_headers)
+            .send()
+            .await?;
+        let body = resp.bytes().await?;
+        assert_eq!(body.len(), payload.len(), "body length mismatch");
+        assert_eq!(body.as_ref(), payload.as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_put_empty_file() -> Result<(), Report> {
+        let client = test_client(9090);
+        make_bucket(&client, "test-put-empty").await?;
+
+        let id = S3ObjectId {
+            bucket: "test-put-empty".into(),
+            key: "empty.txt".into(),
+        };
+
+        client.put_file(&id, Cursor::new(vec![]), 0).await?;
+
+        let get_url: Url = "http://localhost:9090/test-put-empty/empty.txt".parse()?;
+        let body = client.signed_get(&get_url).await?;
+        assert_eq!(body, "");
+        Ok(())
+    }
 }
 
 // XML response types for S3 APIs
@@ -191,5 +379,5 @@ struct ListBucketResult {
 struct ContentsXml {
     key: String,
     size: u64,
-    last_modified: jiff::Timestamp,
+    last_modified: Timestamp,
 }

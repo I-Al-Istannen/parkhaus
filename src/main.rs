@@ -11,8 +11,10 @@ mod toml_utils;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::data::S3ObjectId;
 use crate::db::Database;
 use crate::import::import;
+use crate::s3_client::client::S3Client;
 use axum::Router;
 use axum::routing::any;
 use clap::{Parser, Subcommand};
@@ -24,6 +26,7 @@ use tokio::signal;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use url::Url;
 
 type AppResult<T> = Result<T, Report>;
 
@@ -71,6 +74,23 @@ async fn run() -> AppResult<()> {
         .await
         .context("failed to initialize database")
         .attach(format!("path: {}", &config.db_path.display()))?;
+
+    let s3 = S3Client::new(
+        Client::new(),
+        Url::parse("http://localhost:9090")?,
+        "us-east-1",
+        "adsds",
+        "dsdsd",
+    );
+    s3.put_file(
+        &S3ObjectId {
+            bucket: "test-put-bucket".to_string(),
+            key: "test".to_string(),
+        },
+        "test!!".as_bytes(),
+        0,
+    )
+    .await?;
 
     let res = match cli.command {
         Command::Serve => serve(config, db.clone()).await,
