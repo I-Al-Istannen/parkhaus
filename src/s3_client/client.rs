@@ -252,31 +252,97 @@ async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::time::Duration;
+    use testcontainers::{
+        ContainerAsync, GenericImage,
+        core::{IntoContainerPort, WaitFor, wait::HttpWaitStrategy},
+        runners::AsyncRunner,
+    };
 
-    fn test_client(port: u16) -> S3Client {
+    const S3MOCK_PORT: u16 = 9090;
+
+    struct TestS3Mock {
+        _container: ContainerAsync<GenericImage>,
+        client: S3Client,
+    }
+
+    fn test_client(endpoint: Url) -> S3Client {
         let client = Client::new();
-        let endpoint: Url = format!("http://localhost:{port}").parse().unwrap();
         S3Client::new(client, endpoint, "us-east-1", "test-key", "test-secret")
     }
 
-    async fn make_bucket(client: &S3Client, bucket: &str) -> Result<(), Report> {
+    impl TestS3Mock {
+        async fn start() -> Result<Self, Report> {
+            let container = GenericImage::new("adobe/s3mock", "latest")
+                .with_exposed_port(S3MOCK_PORT.tcp())
+                .with_wait_for(WaitFor::http(
+                    HttpWaitStrategy::new("/")
+                        .with_port(S3MOCK_PORT.tcp())
+                        .with_response_matcher(|response| {
+                            let status = response.status();
+                            status.is_success() || status.is_client_error()
+                        })
+                        .with_poll_interval(Duration::from_millis(100)),
+                ))
+                .start()
+                .await
+                .context("failed to start s3mock container")?;
+
+            let host = container
+                .get_host()
+                .await
+                .context("failed to resolve s3mock host")?;
+            let port = container
+                .get_host_port_ipv4(S3MOCK_PORT)
+                .await
+                .context("failed to resolve s3mock port mapping")?;
+            let endpoint: Url = format!("http://{host}:{port}")
+                .parse()
+                .context("failed to parse s3mock endpoint URL")?;
+
+            Ok(Self {
+                client: test_client(endpoint),
+                _container: container,
+            })
+        }
+
+        async fn make_bucket(&self, bucket: &str) -> Result<(), Report> {
+            let mut url = self.client.endpoint.clone();
+            url.path_segments_mut().unwrap().push(bucket);
+            let signed_headers = self.client.signing.sign(SignRequest::now("PUT", &url))?;
+            let response = self
+                .client
+                .client
+                .put(url.as_str())
+                .headers(signed_headers)
+                .send()
+                .await
+                .context("failed to create bucket")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                bail!("failed to create bucket {bucket}: {status}: {body}");
+            }
+
+            Ok(())
+        }
+    }
+
+    fn object_url(client: &S3Client, bucket: &str, key: &str) -> Result<Url, Report> {
         let mut url = client.endpoint.clone();
-        url.path_segments_mut().unwrap().push(bucket);
-        let signed_headers = client.signing.sign(SignRequest::now("PUT", &url))?;
-        client
-            .client
-            .put(url.as_str())
-            .headers(signed_headers)
-            .send()
-            .await
-            .context("failed to create bucket")?;
-        Ok(())
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(bucket)
+            .push(key);
+        Ok(url)
     }
 
     #[tokio::test]
     async fn test_put_and_get_file() -> Result<(), Report> {
-        let client = test_client(9090);
-        make_bucket(&client, "test-put-bucket").await?;
+        let s3mock = TestS3Mock::start().await?;
+        let client = &s3mock.client;
+        s3mock.make_bucket("test-put-bucket").await?;
 
         let payload = b"Hello, chunked S3 upload!";
         let id = S3ObjectId {
@@ -288,7 +354,7 @@ mod tests {
             .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
             .await?;
 
-        let get_url: Url = "http://localhost:9090/test-put-bucket/test-key.txt".parse()?;
+        let get_url = object_url(client, &id.bucket, &id.key)?;
         let body = client.signed_get(&get_url).await?;
         assert_eq!(body, "Hello, chunked S3 upload!");
         Ok(())
@@ -296,10 +362,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_large_file() -> Result<(), Report> {
-        let client = test_client(9090);
-        make_bucket(&client, "test-put-large").await?;
+        let s3mock = TestS3Mock::start().await?;
+        let client = &s3mock.client;
+        s3mock.make_bucket("test-put-large").await?;
 
-        let payload: Vec<u8> = (0..CHUNK_SIZE * 2 + 1000)
+        let payload: Vec<u8> = (0..CHUNK_SIZE * 10 + 1000)
             .map(|i| (i % 256) as u8)
             .collect();
         let id = S3ObjectId {
@@ -311,7 +378,7 @@ mod tests {
             .put_file(&id, Cursor::new(payload.clone()), payload.len() as u64)
             .await?;
 
-        let get_url: Url = "http://localhost:9090/test-put-large/large-file.bin".parse()?;
+        let get_url = object_url(client, &id.bucket, &id.key)?;
         let signed_headers = client.signing.sign(SignRequest::get(&get_url))?;
         let resp = client
             .client
@@ -327,8 +394,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_empty_file() -> Result<(), Report> {
-        let client = test_client(9090);
-        make_bucket(&client, "test-put-empty").await?;
+        let s3mock = TestS3Mock::start().await?;
+        let client = &s3mock.client;
+        s3mock.make_bucket("test-put-empty").await?;
 
         let id = S3ObjectId {
             bucket: "test-put-empty".into(),
@@ -337,7 +405,7 @@ mod tests {
 
         client.put_file(&id, Cursor::new(vec![]), 0).await?;
 
-        let get_url: Url = "http://localhost:9090/test-put-empty/empty.txt".parse()?;
+        let get_url = object_url(client, &id.bucket, &id.key)?;
         let body = client.signed_get(&get_url).await?;
         assert_eq!(body, "");
         Ok(())
