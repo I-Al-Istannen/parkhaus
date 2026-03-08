@@ -18,6 +18,10 @@ const SIGV4_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+// Encode the forward slash character, '/', everywhere except in the object key name.
+// For example, if the object key name is photos/Jan/sample.jpg, the forward slash in the key name
+// is not encoded.
+const SIGV4_ENCODE_SET_NAME: &AsciiSet = &SIGV4_ENCODE_SET.remove(b'/');
 
 const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -296,7 +300,7 @@ fn canonical_uri(url: &Url) -> String {
     let encoded: String = segments
         .map(|seg| {
             let decoded = percent_decode_str(seg).decode_utf8_lossy();
-            utf8_percent_encode(&decoded, SIGV4_ENCODE_SET).to_string()
+            utf8_percent_encode(&decoded, SIGV4_ENCODE_SET_NAME).to_string()
         })
         .collect::<Vec<_>>()
         .join("/");

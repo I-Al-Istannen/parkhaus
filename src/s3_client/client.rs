@@ -153,13 +153,15 @@ impl S3Client {
         url.path_segments_mut()
             .map_err(|_| report!("endpoint URL cannot be a base URL"))?
             .push(&id.bucket)
-            .push(&id.key);
+            .extend(id.key.split('/'));
 
         let (signed_headers, chunk_signer) = self
             .signing
             .sign_streaming(StreamingSignRequest::now(&url, content_length))?;
 
         let body = reqwest::Body::wrap_stream(chunked_upload_stream(data, chunk_signer));
+
+        println!("URL: {url}");
 
         let response = self
             .client
@@ -175,7 +177,6 @@ impl S3Client {
             let text = response.text().await.unwrap_or_default();
             bail!("S3 PUT returned {status}: {text}");
         }
-        println!("Upload complete: {id:?} -\n{}", response.text().await?);
 
         Ok(())
     }
@@ -251,6 +252,7 @@ async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::time::Duration;
     use testcontainers::{
@@ -327,6 +329,16 @@ mod tests {
 
             Ok(())
         }
+
+        async fn put_object(&self, bucket: &str, key: &str, payload: &[u8]) -> Result<(), Report> {
+            let id = S3ObjectId {
+                bucket: bucket.into(),
+                key: key.into(),
+            };
+            self.client
+                .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+                .await
+        }
     }
 
     fn object_url(client: &S3Client, bucket: &str, key: &str) -> Result<Url, Report> {
@@ -334,7 +346,7 @@ mod tests {
         url.path_segments_mut()
             .map_err(|_| report!("endpoint URL cannot be a base URL"))?
             .push(bucket)
-            .push(key);
+            .extend(key.split('/'));
         Ok(url)
     }
 
@@ -408,6 +420,86 @@ mod tests {
         let get_url = object_url(client, &id.bucket, &id.key)?;
         let body = client.signed_get(&get_url).await?;
         assert_eq!(body, "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_buckets() -> Result<(), Report> {
+        let s3mock = TestS3Mock::start().await?;
+        let client = &s3mock.client;
+
+        let expected_buckets = ["test-list-buckets-a", "test-list-buckets-b"];
+        for bucket in expected_buckets {
+            s3mock.make_bucket(bucket).await?;
+        }
+
+        let bucket_names = client
+            .list_buckets()
+            .await?
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect::<Vec<_>>();
+
+        for bucket in expected_buckets {
+            assert!(
+                bucket_names.iter().any(|name| name == bucket),
+                "missing bucket {bucket} in {bucket_names:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_objects() -> Result<(), Report> {
+        let s3mock = TestS3Mock::start().await?;
+        let client = &s3mock.client;
+        let bucket = "test-list-objects";
+        s3mock.make_bucket(bucket).await?;
+
+        let expected_objects = [
+            ("alpha.txt", b"alpha".as_slice()),
+            ("bravo.bin", &[1, 2, 3, 4, 5]),
+            ("foo/bar.bin", &[1, 2, 3, 4, 5]),
+            ("foos/bars/bar.bin", "ayyy".as_bytes()),
+            ("charlie-empty", b"".as_slice()),
+        ];
+        for (key, payload) in expected_objects {
+            s3mock.put_object(bucket, key, payload).await?;
+        }
+
+        let mut objects = client.list_objects(bucket).await?;
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let mut expected = expected_objects
+            .into_iter()
+            .map(|(key, payload)| (key.to_string(), payload.len() as u64))
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        assert_eq!(objects.len(), expected.len());
+        for (object, (expected_key, expected_size)) in objects.iter().zip(expected) {
+            assert_eq!(object.key, expected_key);
+            assert_eq!(object.size, expected_size);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_objects_url_with_continuation_token() -> Result<(), Report> {
+        let client = test_client(Url::parse("http://example.com")?);
+        let url = client.list_objects_url("bucket-name", &Some("next token/+".to_string()))?;
+
+        assert_eq!(url.path(), "/bucket-name");
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        assert_eq!(query.get("list-type"), Some(&"2".to_string()));
+        assert_eq!(
+            query.get("continuation-token"),
+            Some(&"next token/+".to_string())
+        );
+        assert_eq!(query.get("max-keys"), Some(&"1000".to_string()));
+
         Ok(())
     }
 }
