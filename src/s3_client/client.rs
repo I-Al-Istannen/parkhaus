@@ -1,12 +1,15 @@
 use super::crypto::{SignRequest, SigningConfig, StreamingSignRequest};
 use crate::data::S3ObjectId;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures_util::stream;
 use jiff::Timestamp;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail, report};
 use serde::Deserialize;
-use std::io::Write as _;
+use sha2::Digest;
+use std::io::Write;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -40,11 +43,16 @@ impl S3Client {
         }
     }
 
-    async fn signed_get(&self, url: &Url) -> Result<String, Report> {
+    async fn signed_get(
+        &self,
+        url: &Url,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response, Report> {
         // S3 SigV4 signed GET with an explicit payload hash header.
         // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-        let signed_headers = self.signing.sign(SignRequest::get(url))?;
-
+        let signed_headers = self
+            .signing
+            .sign(SignRequest::get(url).with_extra_headers(extra_headers))?;
         let response = self
             .client
             .get(url.as_str())
@@ -54,24 +62,26 @@ impl S3Client {
             .context("S3 request failed")?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed to read S3 response body")?;
-
         if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .context("failed to read S3 response body")?;
             bail!("S3 returned {status}: {body}");
         }
 
-        Ok(body)
+        Ok(response)
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Report> {
         // we just assume this is not paginated, screw it.
         let body = self
-            .signed_get(&self.endpoint)
+            .signed_get(&self.endpoint, &[])
             .await
-            .context("failed to list buckets")?;
+            .context("failed to list buckets")?
+            .text()
+            .await
+            .context("failed to read ListBuckets response body")?;
         let result: ListAllMyBucketsResult =
             quick_xml::de::from_str(&body).context("failed to parse ListBuckets XML")?;
 
@@ -95,9 +105,12 @@ impl S3Client {
             let url = self.list_objects_url(bucket, &continuation_token)?;
 
             let body = self
-                .signed_get(&url)
+                .signed_get(&url, &[])
                 .await
-                .context("failed to list objects")?;
+                .context("failed to list objects")?
+                .text()
+                .await
+                .context("failed to read ListObjectsV2 response body")?;
             let result: ListBucketResult =
                 quick_xml::de::from_str(&body).context("failed to parse ListObjectsV2 XML")?;
 
@@ -119,6 +132,28 @@ impl S3Client {
         }
 
         Ok(all_objects)
+    }
+
+    async fn get_object_metadata(
+        &self,
+        id: &S3ObjectId,
+    ) -> Result<GetObjectAttributesOutput, Report> {
+        let mut url = self.object_url(id)?;
+        url.set_query(Some("attributes="));
+        let body = self
+            .signed_get(
+                &url,
+                &[(
+                    "x-amz-object-attributes",
+                    "Checksum,ETag,ObjectSize,StorageClass",
+                )],
+            )
+            .await?
+            .text()
+            .await
+            .context("failed to read GetObjectAttributes response body")?;
+
+        Ok(quick_xml::de::from_str(&body).context("failed to parse GetObjectAttributes XML")?)
     }
 
     /// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
@@ -143,17 +178,22 @@ impl S3Client {
         Ok(url)
     }
 
+    fn object_url(&self, id: &S3ObjectId) -> Result<Url, Report> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(&id.bucket)
+            .extend(id.key.split('/'));
+        Ok(url)
+    }
+
     pub async fn put_file(
         &self,
         id: &S3ObjectId,
         data: impl AsyncRead + Unpin + Send + 'static,
         content_length: u64,
     ) -> Result<(), Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(&id.bucket)
-            .extend(id.key.split('/'));
+        let url = self.object_url(id)?;
 
         let (signed_headers, chunk_signer) = self
             .signing
@@ -176,6 +216,9 @@ impl S3Client {
             bail!("S3 PUT returned {status}: {text}");
         }
 
+        let attributes = self.get_object_metadata(id).await?;
+        println!("Uploaded object metadata: {attributes:#?}");
+
         Ok(())
     }
 }
@@ -190,6 +233,7 @@ fn chunked_upload_stream(
         reader: R,
         signer: super::crypto::ChunkSigner,
         buf: Vec<u8>,
+        checksum: sha2::Sha256,
         done: bool,
     }
 
@@ -197,6 +241,7 @@ fn chunked_upload_stream(
         reader: BufReader::new(reader),
         signer,
         buf: vec![0u8; CHUNK_SIZE],
+        checksum: sha2::Sha256::new(),
         done: false,
     };
 
@@ -216,6 +261,7 @@ fn chunked_upload_stream(
         let mut chunk = Vec::new();
 
         if written > 0 {
+            state.checksum.update(&state.buf[..written]);
             let sig = state.signer.sign_chunk(&state.buf[..written]);
             write!(chunk, "{written:x};chunk-signature={sig}\r\n").unwrap();
             chunk.extend_from_slice(&state.buf[..written]);
@@ -223,8 +269,14 @@ fn chunked_upload_stream(
         }
 
         if written < CHUNK_SIZE {
+            // https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html#trailing-checksums-trailer-chunks
             let final_sig = state.signer.sign_chunk(b"");
-            write!(chunk, "0;chunk-signature={final_sig}\r\n\r\n").unwrap();
+            let checksum_base64 = STANDARD.encode(state.checksum.clone().finalize());
+            let trailer_signature = state.signer.sign_trailing_headers(&checksum_base64);
+
+            write!(chunk, "0;chunk-signature={final_sig}\r\n").unwrap();
+            write!(chunk, "x-amz-checksum-sha256:{checksum_base64}\r\n").unwrap();
+            write!(chunk, "x-amz-trailer-signature:{trailer_signature}\r\n\r\n").unwrap();
             state.done = true;
         }
 
@@ -372,15 +424,6 @@ mod tests {
         }
     }
 
-    fn object_url(client: &S3Client, bucket: &str, key: &str) -> Result<Url, Report> {
-        let mut url = client.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(bucket)
-            .extend(key.split('/'));
-        Ok(url)
-    }
-
     #[tokio::test]
     async fn test_put_and_get_file() -> Result<(), Report> {
         let s3mock = s3mock().await?;
@@ -398,8 +441,22 @@ mod tests {
             .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
             .await?;
 
-        let get_url = object_url(&client, &id.bucket, &id.key)?;
-        let body = client.signed_get(&get_url).await?;
+        let attributes = client.get_object_metadata(&id).await?;
+        let expected_checksum = STANDARD.encode(sha2::Sha256::digest(payload));
+
+        assert!(attributes.etag.is_some());
+        assert_eq!(attributes.object_size, Some(payload.len() as u64));
+        assert_eq!(attributes.storage_class.as_deref(), Some("STANDARD"));
+        assert_eq!(
+            attributes.checksum.map(|checksum| {
+                assert_eq!(checksum.checksum_type, "FULL_OBJECT");
+                checksum.sha256
+            }),
+            Some(expected_checksum)
+        );
+
+        let get_url = client.object_url(&id)?;
+        let body = client.signed_get(&get_url, &[]).await?.text().await?;
         assert_eq!(body, "Hello, chunked S3 upload!");
         Ok(())
     }
@@ -423,7 +480,7 @@ mod tests {
             .put_file(&id, Cursor::new(payload.clone()), payload.len() as u64)
             .await?;
 
-        let get_url = object_url(&client, &id.bucket, &id.key)?;
+        let get_url = client.object_url(&id)?;
         let signed_headers = client.signing.sign(SignRequest::get(&get_url))?;
         let resp = client
             .client
@@ -451,8 +508,8 @@ mod tests {
 
         client.put_file(&id, Cursor::new(vec![]), 0).await?;
 
-        let get_url = object_url(&client, &id.bucket, &id.key)?;
-        let body = client.signed_get(&get_url).await?;
+        let get_url = client.object_url(&id)?;
+        let body = client.signed_get(&get_url, &[]).await?.text().await?;
         assert_eq!(body, "");
         Ok(())
     }
@@ -578,4 +635,24 @@ struct ContentsXml {
     key: String,
     size: u64,
     last_modified: Timestamp,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetObjectAttributesOutput {
+    checksum: Option<ChecksumXml>,
+    #[serde(rename = "ETag")]
+    etag: Option<String>,
+    object_size: Option<u64>,
+    storage_class: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ChecksumXml {
+    #[serde(rename = "ChecksumSHA256")]
+    sha256: String,
+    checksum_type: String,
 }

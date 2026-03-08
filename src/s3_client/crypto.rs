@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
-
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use url::Url;
 
 // Spec: URI encode every byte except the unreserved characters:
@@ -23,8 +23,9 @@ const SIGV4_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 // is not encoded.
 const SIGV4_ENCODE_SET_NAME: &AsciiSet = &SIGV4_ENCODE_SET.remove(b'/');
 
-const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const STREAMING_PAYLOAD_TRAILER_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const CHECKSUM_TRAILER_HEADER: &str = "x-amz-checksum-sha256";
 
 #[derive(Debug, Clone)]
 struct SigningResult {
@@ -35,6 +36,7 @@ struct SigningResult {
     signature: String,
     scope: String,
     signing_key: Vec<u8>,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl SigningResult {
@@ -56,6 +58,12 @@ impl SigningResult {
             "x-amz-date",
             HeaderValue::from_str(&self.amz_date).context("invalid date")?,
         );
+        for (name, val) in &self.extra_headers {
+            headers.insert(
+                HeaderName::from_str(name).context("invalid header name")?,
+                HeaderValue::from_str(val).context("invalid header value")?,
+            );
+        }
         Ok(headers)
     }
 }
@@ -72,6 +80,19 @@ impl ChunkSigner {
         let chunk_hash = hex::encode(Sha256::digest(chunk_data));
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{chunk_hash}",
+            self.amz_date, self.scope, self.previous_signature,
+        );
+        let signature = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
+        self.previous_signature.clone_from(&signature);
+        signature
+    }
+
+    pub fn sign_trailing_headers(&mut self, checksum_base64: &str) -> String {
+        let canonical_trailer = format!("{CHECKSUM_TRAILER_HEADER}:{checksum_base64}\n");
+        let trailing_headers_hash = hex::encode(Sha256::digest(canonical_trailer.as_bytes()));
+
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{trailing_headers_hash}",
             self.amz_date, self.scope, self.previous_signature,
         );
         let signature = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
@@ -170,10 +191,12 @@ impl SigningConfig {
         let decoded_len_str = request.decoded_content_length.to_string();
         let signed = self.sign_impl(
             SignRequest::new("PUT", request.url, request.current_time)
-                .with_payload_hash(STREAMING_PAYLOAD_HASH)
+                .with_payload_hash(STREAMING_PAYLOAD_TRAILER_HASH)
                 .with_extra_headers(&[
                     ("content-encoding", "aws-chunked"),
-                    ("x-amz-decoded-content-length", decoded_len_str.as_str()),
+                    ("x-amz-decoded-content-length", &decoded_len_str),
+                    ("x-amz-sdk-checksum-algorithm", "SHA256"),
+                    ("x-amz-trailer", "x-amz-checksum-sha256"),
                 ]),
         )?;
 
@@ -184,14 +207,7 @@ impl SigningConfig {
             previous_signature: signed.signature.clone(),
         };
 
-        let mut headers = signed.headers()?;
-        headers.insert("content-encoding", HeaderValue::from_str("aws-chunked")?);
-        headers.insert(
-            "x-amz-decoded-content-length",
-            HeaderValue::from_str(&decoded_len_str)?,
-        );
-
-        Ok((headers, chunk_signer))
+        Ok((signed.headers()?, chunk_signer))
     }
 
     fn sign_impl(&self, request: SignRequest<'_>) -> Result<SigningResult, Report> {
@@ -234,6 +250,11 @@ impl SigningConfig {
             signing_key,
             scope,
             signature,
+            extra_headers: request
+                .extra_headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         })
     }
 }
