@@ -56,7 +56,7 @@ impl S3Client {
             .sign(SignRequest::get(url).with_extra_headers(extra_headers))?;
         let response = self
             .client
-            .get(url.as_str())
+            .get(url.clone())
             .headers(signed_headers)
             .send()
             .await
@@ -144,7 +144,7 @@ impl S3Client {
         )?;
         let response = self
             .client
-            .head(url.as_str())
+            .head(url)
             .headers(signed_headers)
             .send()
             .await
@@ -216,7 +216,7 @@ impl S3Client {
 
         let response = self
             .client
-            .put(url.as_str())
+            .put(url)
             .headers(signed_headers)
             .body(body)
             .send()
@@ -228,9 +228,6 @@ impl S3Client {
             let text = response.text().await.unwrap_or_default();
             bail!("S3 PUT returned {status}: {text}");
         }
-
-        let attributes = self.get_object_sha256(id).await?;
-        println!("Uploaded object metadata: {attributes:#?}");
 
         Ok(())
     }
@@ -411,7 +408,7 @@ mod tests {
             let signed_headers = client.signing.sign(SignRequest::now("PUT", &url))?;
             let response = client
                 .client
-                .put(url.as_str())
+                .put(url)
                 .headers(signed_headers)
                 .send()
                 .await
@@ -488,7 +485,7 @@ mod tests {
         let signed_headers = client.signing.sign(SignRequest::get(&get_url))?;
         let resp = client
             .client
-            .get(get_url.as_str())
+            .get(get_url)
             .headers(signed_headers)
             .send()
             .await?;
