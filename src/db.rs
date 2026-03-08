@@ -1,6 +1,8 @@
+mod migrate;
 mod objects;
 
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
+use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
@@ -75,6 +77,22 @@ impl Database {
     pub async fn record_creation(&self, obj: &S3Object) -> Result<(), Report> {
         let con = self.write().await;
         objects::record_creation(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    pub async fn get_objects_in_range(
+        &self,
+        upstream: &UpstreamId,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<Vec<(S3ObjectId, Timestamp)>, Report> {
+        let con = self.read().await;
+        migrate::get_objects_in_range(
+            &mut *con.acquire().await.context("acquire con")?,
+            upstream,
+            start,
+            end,
+        )
+        .await
     }
 
     pub async fn close(self) -> Result<(), Report> {

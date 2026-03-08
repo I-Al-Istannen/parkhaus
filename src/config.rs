@@ -42,7 +42,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, From, Display, PartialEq, Eq, Hash, Type)]
+#[derive(Debug, Clone, From, Display, PartialEq, Eq, Hash, Type, Serialize)]
 #[sqlx(transparent)]
 pub struct UpstreamId(pub String);
 
@@ -86,6 +86,14 @@ impl Upstream {
                     .push(&s3object_id.key);
                 url
             }
+        }
+    }
+
+    pub fn is_too_old(&self, now: &jiff::Zoned, last_modified: jiff::Timestamp) -> bool {
+        if let Some(max_age) = self.max_age {
+            last_modified < (now - max_age).timestamp()
+        } else {
+            false
         }
     }
 }

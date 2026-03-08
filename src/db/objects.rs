@@ -4,7 +4,7 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::{SqliteConnection, query, query_as};
 
-struct DbObject {
+pub(super) struct DbObject {
     bucket: String,
     key: String,
     assigned_upstream: UpstreamId,

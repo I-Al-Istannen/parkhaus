@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT bucket, key, last_modified\n        FROM objects\n        WHERE assigned_upstream = ? AND last_modified >= ? AND last_modified <= ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "last_modified",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "66d247b0aa0ce72fae6ccff9ec0ba298c29b3b66fe27edcbfde10a1e640fad9a"
+}

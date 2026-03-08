@@ -1,6 +1,7 @@
 pub(crate) use crate::config::UpstreamId;
+use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct S3ObjectId {
     pub bucket: String,
     pub key: String,

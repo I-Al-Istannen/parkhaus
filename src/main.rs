@@ -4,6 +4,7 @@ mod db;
 mod endpoints;
 mod error;
 mod import;
+mod migrate;
 mod toml_utils;
 
 use std::path::PathBuf;
@@ -104,6 +105,10 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
     let app = Router::new()
         .route("/", any(endpoints::proxy_request))
         .route("/{*path}", any(endpoints::proxy_request))
+        .route(
+            "/debug/pending-migrations",
+            any(endpoints::get_migration_list),
+        )
         .with_state(app_state);
 
     let listener = TcpListener::bind(&config.listen)
