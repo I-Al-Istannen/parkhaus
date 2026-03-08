@@ -5,6 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::stream;
 use jiff::Timestamp;
 use reqwest::{Client, Response};
+use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail, report};
 use serde::Deserialize;
@@ -134,26 +135,38 @@ impl S3Client {
         Ok(all_objects)
     }
 
-    async fn get_object_metadata(
-        &self,
-        id: &S3ObjectId,
-    ) -> Result<GetObjectAttributesOutput, Report> {
-        let mut url = self.object_url(id)?;
-        url.set_query(Some("attributes="));
-        let body = self
-            .signed_get(
-                &url,
-                &[(
-                    "x-amz-object-attributes",
-                    "Checksum,ETag,ObjectSize,StorageClass",
-                )],
-            )
-            .await?
-            .text()
+    /// Only works if the server supports the header and the object was uploaded with checksums
+    async fn get_object_sha256(&self, id: &S3ObjectId) -> Result<String, Report> {
+        let url = self.object_url(id)?;
+        let signed_headers = self.signing.sign(
+            SignRequest::now("HEAD", &url)
+                .with_extra_headers(&[("x-amz-checksum-mode", "ENABLED")]),
+        )?;
+        let response = self
+            .client
+            .head(url.as_str())
+            .headers(signed_headers)
+            .send()
             .await
-            .context("failed to read GetObjectAttributes response body")?;
+            .context("S3 request failed")?;
 
-        Ok(quick_xml::de::from_str(&body).context("failed to parse GetObjectAttributes XML")?)
+        let status = response.status();
+        if !status.is_success() {
+            return Err(report!("S3 returned {status}").attach(format!("object: {id:?}")));
+        }
+
+        let checksum_header = response
+            .headers()
+            .get("x-amz-checksum-sha256")
+            .context("missing checksum header")
+            .attach(format!("object: {id:?}"))?;
+        let checksum = checksum_header
+            .to_str()
+            .context("invalid checksum header value")
+            .attach(format!("header: {:?}", checksum_header))
+            .attach(format!("object: {id:?}"))?;
+
+        Ok(checksum.to_string())
     }
 
     /// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
@@ -216,7 +229,7 @@ impl S3Client {
             bail!("S3 PUT returned {status}: {text}");
         }
 
-        let attributes = self.get_object_metadata(id).await?;
+        let attributes = self.get_object_sha256(id).await?;
         println!("Uploaded object metadata: {attributes:#?}");
 
         Ok(())
@@ -441,19 +454,10 @@ mod tests {
             .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
             .await?;
 
-        let attributes = client.get_object_metadata(&id).await?;
+        let actual_sha256 = client.get_object_sha256(&id).await?;
         let expected_checksum = STANDARD.encode(sha2::Sha256::digest(payload));
 
-        assert!(attributes.etag.is_some());
-        assert_eq!(attributes.object_size, Some(payload.len() as u64));
-        assert_eq!(attributes.storage_class.as_deref(), Some("STANDARD"));
-        assert_eq!(
-            attributes.checksum.map(|checksum| {
-                assert_eq!(checksum.checksum_type, "FULL_OBJECT");
-                checksum.sha256
-            }),
-            Some(expected_checksum)
-        );
+        assert_eq!(actual_sha256, expected_checksum);
 
         let get_url = client.object_url(&id)?;
         let body = client.signed_get(&get_url, &[]).await?.text().await?;
