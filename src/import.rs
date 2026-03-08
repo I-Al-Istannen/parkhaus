@@ -1,11 +1,10 @@
 mod logging;
-pub mod s3;
 
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId};
 use crate::db::Database;
 use crate::import::logging::{bar_progress_style, logger_config};
-use crate::import::s3::{BucketInfo, S3Client};
+use crate::s3_client::client::{BucketInfo, S3Client};
 use reqwest::Client;
 use rootcause::Report;
 use rootcause::hooks::Hooks;

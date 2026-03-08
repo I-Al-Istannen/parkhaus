@@ -1,7 +1,4 @@
-#[path = "s3-crypto.rs"]
-mod s3_crypto;
-
-use self::s3_crypto::sign_v4;
+use super::crypto::sign_v4;
 use reqwest::Client;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};

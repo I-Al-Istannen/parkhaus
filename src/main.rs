@@ -5,6 +5,7 @@ mod endpoints;
 mod error;
 mod import;
 mod migrate;
+mod s3_client;
 mod toml_utils;
 
 use std::path::PathBuf;
