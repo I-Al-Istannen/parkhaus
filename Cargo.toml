@@ -49,4 +49,5 @@ rust.unused_qualifications = "warn"
 clippy.use_self = "warn"
 
 [dev-dependencies]
+ctor = "0.6.3"
 testcontainers = { version = "0.27.1", features = ["http_wait"] }
