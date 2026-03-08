@@ -270,9 +270,9 @@ fn chunked_upload_stream(
 
         if written < CHUNK_SIZE {
             // https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html#trailing-checksums-trailer-chunks
-            let final_sig = state.signer.sign_chunk(b"");
             let checksum_base64 = STANDARD.encode(state.checksum.clone().finalize());
-            let trailer_signature = state.signer.sign_trailing_headers(&checksum_base64);
+            let (final_sig, trailer_signature) =
+                state.signer.sign_final_chunk_and_trailer(&checksum_base64);
 
             write!(chunk, "0;chunk-signature={final_sig}\r\n").unwrap();
             write!(chunk, "x-amz-checksum-sha256:{checksum_base64}\r\n").unwrap();

@@ -87,17 +87,32 @@ impl ChunkSigner {
         signature
     }
 
-    pub fn sign_trailing_headers(&mut self, checksum_base64: &str) -> String {
+    /// Signs the empty final chunk and the trailing headers.
+    ///
+    /// Returns `(final_chunk_sig, trailer_sig)`. The trailer signature is computed
+    /// using the last *data* chunk's signature as the previous.
+    pub fn sign_final_chunk_and_trailer(&mut self, checksum_base64: &str) -> (String, String) {
+        // Compute the empty terminal chunk signature (sig2 = sign(prev=sig1, data=empty))
+        let final_chunk_sig = {
+            let empty_hash = EMPTY_SHA256;
+            let sts = format!(
+                "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{empty_hash}",
+                self.amz_date, self.scope, self.previous_signature,
+            );
+            hex::encode(hmac_sha256(&self.signing_key, sts.as_bytes()))
+        };
+
+        // Compute the trailer signature using *current* previous_signature (sig1),
+        // NOT sig2.
         let canonical_trailer = format!("{CHECKSUM_TRAILER_HEADER}:{checksum_base64}\n");
         let trailing_headers_hash = hex::encode(Sha256::digest(canonical_trailer.as_bytes()));
-
         let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{trailing_headers_hash}",
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{trailing_headers_hash}",
             self.amz_date, self.scope, self.previous_signature,
         );
-        let signature = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
-        self.previous_signature.clone_from(&signature);
-        signature
+        let trailer_sig = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
+
+        (final_chunk_sig, trailer_sig)
     }
 }
 
