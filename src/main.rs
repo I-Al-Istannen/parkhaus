@@ -6,6 +6,8 @@ mod error;
 mod import;
 mod migrate;
 mod s3_client;
+#[cfg(test)]
+mod testing;
 mod toml_utils;
 
 use std::path::PathBuf;

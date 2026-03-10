@@ -52,4 +52,5 @@ clippy.use_self = "warn"
 
 [dev-dependencies]
 ctor = "0.6.3"
+serde_json = "1.0.149"
 testcontainers = { version = "0.27.1", features = ["http_wait"] }

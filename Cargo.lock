@@ -2480,6 +2480,7 @@ dependencies = [
  "rootcause",
  "rootcause-tracing",
  "serde",
+ "serde_json",
  "sha2",
  "sqlx",
  "testcontainers",

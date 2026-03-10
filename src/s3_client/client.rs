@@ -244,33 +244,6 @@ impl S3Client {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn create_bucket(&self, bucket: &str) -> Result<(), Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(bucket);
-        let signed_headers = self.signing.sign(SignRequest::now("PUT", &url))?;
-        let response = self
-            .client
-            .put(url)
-            .headers(signed_headers)
-            .send()
-            .await
-            .context("failed to create bucket")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(report!("failed to create bucket")
-                .attach(format!("bucket: {bucket}"))
-                .attach(format!("status: {status}"))
-                .attach(format!("body: {body}")));
-        }
-
-        Ok(())
-    }
-
     pub async fn get_file(
         &self,
         id: &S3ObjectId,
@@ -364,40 +337,29 @@ async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::garage::GarageInstance;
     use std::collections::BTreeMap;
     use std::io::Cursor;
-    use std::sync::Mutex;
-    use std::time::Duration;
-    use testcontainers::{
-        ContainerAsync, GenericImage,
-        core::{IntoContainerPort, WaitFor, wait::HttpWaitStrategy},
-        runners::AsyncRunner,
-    };
     use tokio::sync::OnceCell;
 
-    const S3MOCK_PORT: u16 = 9090;
-    static S3MOCK: OnceCell<TestS3Mock> = OnceCell::const_new();
-
-    struct TestS3Mock {
-        container: Mutex<Option<ContainerAsync<GenericImage>>>,
-        endpoint: Url,
-    }
+    static GARAGE: OnceCell<GarageInstance> = OnceCell::const_new();
 
     #[ctor::dtor]
-    fn shutdown_s3mock() {
-        if let Some(s3mock) = S3MOCK.get() {
-            let mut container = s3mock.container.lock().expect("s3mock mutex poisoned");
-            if let Some(container) = container.take() {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build test teardown runtime")
-                    .block_on(async move {
-                        drop(container);
-                        tokio::task::yield_now().await;
-                    });
-            }
+    fn shutdown_garage() {
+        if let Some(container) = GARAGE.get().and_then(GarageInstance::take_container) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("teardown runtime")
+                .block_on(async move {
+                    drop(container);
+                    tokio::task::yield_now().await;
+                });
         }
+    }
+
+    async fn garage() -> Result<&'static GarageInstance, Report> {
+        GARAGE.get_or_try_init(GarageInstance::start).await
     }
 
     fn bucket_name(test_name: &str) -> String {
@@ -408,72 +370,40 @@ mod tests {
         format!("{}-{suffix}", bucket_name(test_name))
     }
 
-    async fn s3mock() -> Result<&'static TestS3Mock, Report> {
-        S3MOCK
-            .get_or_try_init(|| async {
-                let container = GenericImage::new("adobe/s3mock", "latest")
-                    .with_exposed_port(S3MOCK_PORT.tcp())
-                    .with_wait_for(WaitFor::http(
-                        HttpWaitStrategy::new("/")
-                            .with_port(S3MOCK_PORT.tcp())
-                            .with_response_matcher(|response| {
-                                let status = response.status();
-                                status.is_success() || status.is_client_error()
-                            })
-                            .with_poll_interval(Duration::from_millis(100)),
-                    ))
-                    .start()
-                    .await
-                    .context("failed to start s3mock container")?;
-
-                let host = container
-                    .get_host()
-                    .await
-                    .context("failed to resolve s3mock host")?;
-                let port = container
-                    .get_host_port_ipv4(S3MOCK_PORT)
-                    .await
-                    .context("failed to resolve s3mock port mapping")?;
-                let endpoint: Url = format!("http://{host}:{port}")
-                    .parse()
-                    .context("failed to parse s3mock endpoint URL")?;
-
-                Ok(TestS3Mock {
-                    container: Mutex::new(Some(container)),
-                    endpoint,
-                })
-            })
-            .await
+    /// Create a bucket + key with full permissions, return a ready-to-use client.
+    async fn setup_bucket(g: &GarageInstance, bucket: &str) -> Result<S3Client, Report> {
+        let bucket_id = g.create_bucket(bucket).await?;
+        let (key_id, secret) = g.create_key(bucket).await?;
+        g.allow_key_on_bucket(&bucket_id, &key_id).await?;
+        Ok(S3Client::new(
+            Client::new(),
+            g.s3_endpoint().clone(),
+            g.region(),
+            &key_id,
+            &secret,
+        ))
     }
 
-    impl TestS3Mock {
-        fn client(&self) -> S3Client {
-            let endpoint = self.endpoint.clone();
-            let client = Client::new();
-            S3Client::new(client, endpoint, "us-east-1", "test-key", "test-secret")
-        }
-
-        async fn make_bucket(&self, bucket: &str) -> Result<(), Report> {
-            self.client().create_bucket(bucket).await
-        }
-
-        async fn put_object(&self, bucket: &str, key: &str, payload: &[u8]) -> Result<(), Report> {
-            let id = S3ObjectId {
-                bucket: bucket.into(),
-                key: key.into(),
-            };
-            self.client()
-                .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
-                .await
-        }
+    async fn put_object(
+        client: &S3Client,
+        bucket: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<(), Report> {
+        let id = S3ObjectId {
+            bucket: bucket.into(),
+            key: key.into(),
+        };
+        client
+            .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+            .await
     }
 
     #[tokio::test]
     async fn test_put_and_get_file() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
-        let bucket = bucket_name("test_put_and_get_file");
-        s3mock.make_bucket(&bucket).await?;
+        let g = garage().await?;
+        let bucket = bucket_name("test-put-and-get-file");
+        let client = setup_bucket(g, &bucket).await?;
 
         let payload = b"Hello, chunked S3 upload!";
         let id = S3ObjectId {
@@ -498,10 +428,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_large_file() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
-        let bucket = bucket_name("test_put_large_file");
-        s3mock.make_bucket(&bucket).await?;
+        let g = garage().await?;
+        let bucket = bucket_name("test-put-large-file");
+        let client = setup_bucket(g, &bucket).await?;
 
         let payload: Vec<u8> = (0..CHUNK_SIZE * 10 + 1000)
             .map(|i| (i % 256) as u8)
@@ -531,10 +460,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_empty_file() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
-        let bucket = bucket_name("test_put_empty_file");
-        s3mock.make_bucket(&bucket).await?;
+        let g = garage().await?;
+        let bucket = bucket_name("test-put-empty-file");
+        let client = setup_bucket(g, &bucket).await?;
 
         let id = S3ObjectId {
             bucket,
@@ -551,16 +479,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_buckets() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
-
+        let g = garage().await?;
         let expected_buckets = [
-            bucket_name_with_suffix("test_list_buckets", "a"),
-            bucket_name_with_suffix("test_list_buckets", "b"),
+            bucket_name_with_suffix("test-list-buckets", "a"),
+            bucket_name_with_suffix("test-list-buckets", "b"),
         ];
-        for bucket in &expected_buckets {
-            s3mock.make_bucket(bucket).await?;
-        }
+        // Both buckets must share the same key: S3 ListBuckets only returns
+        // buckets the calling key has been granted access to.
+        let id_a = g.create_bucket(&expected_buckets[0]).await?;
+        let id_b = g.create_bucket(&expected_buckets[1]).await?;
+        let (key_id, secret) = g.create_key("test-list-buckets").await?;
+        g.allow_key_on_bucket(&id_a, &key_id).await?;
+        g.allow_key_on_bucket(&id_b, &key_id).await?;
+        let client = S3Client::new(
+            Client::new(),
+            g.s3_endpoint().clone(),
+            g.region(),
+            &key_id,
+            &secret,
+        );
 
         let bucket_names = client
             .list_buckets()
@@ -581,10 +518,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_objects() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
-        let bucket = bucket_name("test_list_objects");
-        s3mock.make_bucket(&bucket).await?;
+        let g = garage().await?;
+        let bucket = bucket_name("test-list-objects");
+        let client = setup_bucket(g, &bucket).await?;
 
         let expected_objects = [
             ("alpha.txt", b"alpha".as_slice()),
@@ -594,7 +530,7 @@ mod tests {
             ("charlie-empty", b"".as_slice()),
         ];
         for (key, payload) in expected_objects {
-            s3mock.put_object(&bucket, key, payload).await?;
+            put_object(&client, &bucket, key, payload).await?;
         }
 
         let mut objects = client.list_objects(&bucket).await?;
@@ -617,8 +553,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_objects_url_with_continuation_token() -> Result<(), Report> {
-        let s3mock = s3mock().await?;
-        let client = s3mock.client();
+        let g = garage().await?;
+        // This test only checks URL construction — any bucket/key will do.
+        let client = S3Client::new(
+            Client::new(),
+            g.s3_endpoint().clone(),
+            g.region(),
+            "dummy-key",
+            "dummy-secret",
+        );
         let url = client.list_objects_url("bucket-name", &Some("next token/+".to_string()))?;
 
         assert_eq!(url.path(), "/bucket-name");
