@@ -95,6 +95,20 @@ impl Database {
         .await
     }
 
+    pub async fn set_upstream(
+        &self,
+        obj: &S3ObjectId,
+        upstream: &UpstreamId,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        objects::set_upstream(
+            &mut *con.acquire().await.context("acquire con")?,
+            obj,
+            upstream,
+        )
+        .await
+    }
+
     pub async fn close(self) -> Result<(), Report> {
         // Close the existing connection to ensure it does not block cleanup
         self.write().await.close().await;

@@ -2484,6 +2484,7 @@ dependencies = [
  "sqlx",
  "testcontainers",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-indicatif",

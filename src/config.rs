@@ -67,6 +67,7 @@ pub struct Upstream {
     pub max_age: Option<jiff::Span>,
     pub s3_access_key: String,
     pub s3_secret: S3Secret,
+    pub region: String,
 }
 
 impl Upstream {
@@ -116,6 +117,7 @@ struct RawUpstream {
     pub max_age: Option<jiff::Span>,
     pub s3_access_key: String,
     pub s3_secret: String,
+    pub region: String,
 }
 
 pub fn load(path: &Path) -> Result<Config, Report> {
@@ -134,6 +136,7 @@ pub fn load(path: &Path) -> Result<Config, Report> {
                 max_age: raw.max_age,
                 s3_access_key: raw.s3_access_key,
                 s3_secret: S3Secret(raw.s3_secret),
+                region: raw.region,
             };
             (UpstreamId(name), upstream)
         })

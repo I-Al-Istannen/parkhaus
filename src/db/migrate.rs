@@ -31,7 +31,7 @@ pub(super) async fn get_objects_in_range(
             .context("invalid last_modified timestamp")
             .attach(format!("upstream: {upstream}"))
             .attach(format!("last_modified: {}", row.last_modified))
-            .attach(format!("object: {}/{}", id.bucket, id.key))?;
+            .attach(format!("object: {}", id))?;
         Ok((id, time))
     })
     .fetch_all(con)

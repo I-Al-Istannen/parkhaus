@@ -21,7 +21,7 @@ impl TryFrom<DbObject> for S3Object {
         };
         let last_modified = Timestamp::from_millisecond(db_obj.last_modified)
             .context("invalid last_modified timestamp")
-            .attach(format!("object: {id:?}"))?;
+            .attach(format!("object: {id}"))?;
 
         Ok(Self {
             id,
@@ -44,7 +44,7 @@ pub(super) async fn get_object(
     .fetch_one(con)
     .await
     .context("Failed to fetch object")
-    .attach(format!("object: {obj:?}"))?
+    .attach(format!("object: {obj}"))?
     .try_into()
 }
 
@@ -61,7 +61,7 @@ pub(super) async fn get_upstream(
     .fetch_optional(con)
     .await
     .context("Failed to fetch object")
-    .attach(format!("object: {obj:?}"))?
+    .attach(format!("object: {obj}"))?
     .map(UpstreamId))
 }
 
@@ -77,7 +77,7 @@ pub(super) async fn delete_object(
     .execute(con)
     .await
     .context("Failed to delete object")
-    .attach(format!("object: {obj:?}"))?;
+    .attach(format!("object: {obj}"))?;
 
     Ok(())
 }
@@ -104,7 +104,32 @@ pub(super) async fn record_creation(
     .execute(con)
     .await
     .context("Failed to record object creation")
-    .attach(format!("object: {obj:?}"))?;
+    .attach(format!("object: {}", obj.id))
+    .attach(format!("upstream: {}", obj.assigned_upstream))?;
+
+    Ok(())
+}
+
+pub(super) async fn set_upstream(
+    con: &mut SqliteConnection,
+    obj: &S3ObjectId,
+    upstream: &UpstreamId,
+) -> Result<(), Report> {
+    sqlx::query!(
+        r#"
+        UPDATE objects
+        SET assigned_upstream = ?
+        WHERE bucket = ? AND key = ?
+        "#,
+        upstream,
+        obj.bucket,
+        obj.key
+    )
+    .execute(con)
+    .await
+    .context("failed to set upstream for object")
+    .attach(format!("upstream: {upstream}"))
+    .attach(format!("object: '{}'", obj))?;
 
     Ok(())
 }

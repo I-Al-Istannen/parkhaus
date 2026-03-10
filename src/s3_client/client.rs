@@ -1,8 +1,9 @@
 use super::crypto::{SignRequest, SigningConfig, StreamingSignRequest};
+use crate::config::Upstream;
 use crate::data::S3ObjectId;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use futures_util::stream;
+use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
 use reqwest::{Client, Response};
 use rootcause::option_ext::OptionExt;
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use sha2::Digest;
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio_util::io::StreamReader;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use url::Url;
@@ -42,6 +44,16 @@ impl S3Client {
             signing: SigningConfig::new(key_id, secret, region),
             endpoint,
         }
+    }
+
+    pub fn for_upstream(client: Client, upstream: &Upstream) -> Self {
+        Self::new(
+            client,
+            upstream.base_url.clone(),
+            &upstream.region,
+            &upstream.s3_access_key,
+            &upstream.s3_secret.0,
+        )
     }
 
     async fn signed_get(
@@ -231,12 +243,52 @@ impl S3Client {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    pub async fn create_bucket(&self, bucket: &str) -> Result<(), Report> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(bucket);
+        let signed_headers = self.signing.sign(SignRequest::now("PUT", &url))?;
+        let response = self
+            .client
+            .put(url)
+            .headers(signed_headers)
+            .send()
+            .await
+            .context("failed to create bucket")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(report!("failed to create bucket")
+                .attach(format!("bucket: {bucket}"))
+                .attach(format!("status: {status}"))
+                .attach(format!("body: {body}")));
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_file(
+        &self,
+        id: &S3ObjectId,
+    ) -> Result<(Option<u64>, impl AsyncRead + use<>), Report> {
+        let url = self.object_url(id)?;
+        let response = self.signed_get(&url, &[]).await?;
+        let content_length = response.content_length();
+
+        let bytes_stream = response.bytes_stream().map_err(std::io::Error::other);
+
+        Ok((content_length, StreamReader::new(bytes_stream)))
+    }
 }
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
 fn chunked_upload_stream(
-    reader: impl AsyncRead + Unpin + Send + 'static,
+    reader: impl AsyncRead + Unpin,
     signer: super::crypto::ChunkSigner,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, Report>> {
     struct ChunkState<R> {
@@ -402,25 +454,7 @@ mod tests {
         }
 
         async fn make_bucket(&self, bucket: &str) -> Result<(), Report> {
-            let client = self.client();
-            let mut url = client.endpoint.clone();
-            url.path_segments_mut().unwrap().push(bucket);
-            let signed_headers = client.signing.sign(SignRequest::now("PUT", &url))?;
-            let response = client
-                .client
-                .put(url)
-                .headers(signed_headers)
-                .send()
-                .await
-                .context("failed to create bucket")?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                bail!("failed to create bucket {bucket}: {status}: {body}");
-            }
-
-            Ok(())
+            self.client().create_bucket(bucket).await
         }
 
         async fn put_object(&self, bucket: &str, key: &str, payload: &[u8]) -> Result<(), Report> {
