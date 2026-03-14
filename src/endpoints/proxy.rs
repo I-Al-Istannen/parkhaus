@@ -175,12 +175,12 @@ fn record_successful_request(
                     last_modified: jiff::Timestamp::now(),
                 })
                 .await
-                .context("could not record creation")
+                .context("failed to record creation")
                 .attach(format!("object: {obj_id_clone:?}"))?;
             } else if req_method == Method::DELETE {
                 db.delete_object(&obj_id_clone)
                     .await
-                    .context("could not record deletion")
+                    .context("failed to record deletion")
                     .attach(format!("object: {obj_id_clone:?}"))?;
             }
             Result::<(), Report>::Ok(())

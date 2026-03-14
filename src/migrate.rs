@@ -1,36 +1,13 @@
 use crate::config::{Config, Upstream};
-use crate::data::{S3ObjectId, UpstreamId};
+use crate::data::{MigrationState, PendingMigration, S3ObjectId, UpstreamId};
 use crate::db::Database;
 use crate::s3_client::client::S3Client;
-use derive_more::Display;
 use futures_util::StreamExt;
 use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
-use serde::Serialize;
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, Display)]
-pub enum InCaseOfFailure {
-    Retry(MigrateAction),
-    Discard,
-}
-
-#[derive(Debug, Clone, Serialize, Display)]
-pub enum MigrateAction {
-    #[display("Move {object} from {source} to {target}")]
-    MoveToUpstream {
-        source: UpstreamId,
-        target: UpstreamId,
-        object: S3ObjectId,
-    },
-    #[display("Delete {object} from {upstream}")]
-    DeleteObject {
-        upstream: UpstreamId,
-        object: S3ObjectId,
-    },
-}
 
 struct SortedUpstreams<'a> {
     upstreams: Vec<&'a Upstream>,
@@ -41,7 +18,7 @@ impl<'a> SortedUpstreams<'a> {
         sorted_upstreams.sort_unstable_by(|a, b| match (a.max_age, b.max_age) {
             (Some(a_age), Some(b_age)) => a_age
                 .compare((b_age, &now))
-                .expect("date comparison failed"),
+                .expect("failed to compare dates"),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
@@ -56,7 +33,7 @@ impl<'a> SortedUpstreams<'a> {
 pub async fn get_pending_migrations(
     config: &Config,
     db: Database,
-) -> Result<Vec<MigrateAction>, Report> {
+) -> Result<Vec<PendingMigration>, Report> {
     let now = Zoned::now();
     let sorted_upstreams = SortedUpstreams::new(now.clone(), config.upstreams.values());
 
@@ -73,23 +50,24 @@ pub async fn get_pending_migrations(
             .attach(format!("upstream: {}", upstream.name))?
             .into_iter()
             .map(|(object, last_modified)| {
-                Ok(MigrateAction::MoveToUpstream {
-                    source: upstream.name.clone(),
-                    target: find_correct_upstream_for_object(
+                Ok(PendingMigration {
+                    source_upstream: upstream.name.clone(),
+                    target_upstream: find_correct_upstream_for_object(
                         &now,
                         &object,
                         last_modified,
                         sorted_upstreams.upstreams.as_slice(),
                     )
-                    .context("found no target upstream for object")
+                    .context("failed to find target upstream for object")
                     .attach(format!("object: {}/{}", object.bucket, object.key))?
                     .name
                     .clone(),
                     object,
+                    state: MigrationState::Pending,
                 })
             })
-            .collect::<Result<Vec<MigrateAction>, Report>>()
-            .context("found no correct upstream for some object in migration time range")
+            .collect::<Result<Vec<PendingMigration>, Report>>()
+            .context("failed to find correct upstream for some object in migration time range")
             .attach(format!("upstream: {}", upstream.name))?;
 
         all_actions.extend(actions);
@@ -115,12 +93,11 @@ fn find_correct_upstream_for_object<'u>(
 }
 
 /// Executes a set of migration actions and returns all accumulated errors.
-/// The errors are reports of [InCaseOfFailure], which allows you to retry failed actions.
-pub async fn execute_migration_actions(
-    actions: Vec<MigrateAction>,
+pub async fn execute_pending_migrations(
+    pending: Vec<PendingMigration>,
     config: &Config,
     db: Database,
-) -> Result<Vec<Report<InCaseOfFailure>>, Report> {
+) -> Result<Vec<Report>, Report> {
     let client = reqwest::Client::new();
     let upstream_to_client = config
         .upstreams
@@ -128,104 +105,129 @@ pub async fn execute_migration_actions(
         .map(|it| (it.name.clone(), S3Client::for_upstream(client.clone(), it)))
         .collect::<HashMap<_, _>>();
 
-    let errors = futures_util::stream::iter(actions)
+    let errors = futures_util::stream::iter(pending)
         .then(|action| async {
-            execute_migration_action(action, &upstream_to_client, db.clone())
+            execute_pending_migration(action, &upstream_to_client, db.clone())
                 .await
+                .context("failed to execute a pending migration")
                 .into_report()
         })
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .filter_map(Result::err)
+        .map(|it| it.into_dynamic())
         .collect::<Vec<_>>();
 
     Ok(errors)
 }
 
-/// Execute a migration action. It also attaches an [InCaseOfFailure] to the error, which indicates
-/// whether to retry failed operations.
-async fn execute_migration_action(
-    action: MigrateAction,
+async fn execute_pending_migration(
+    action: PendingMigration,
     upstream_to_client: &HashMap<UpstreamId, S3Client>,
     db: Database,
-) -> Result<(), Report<InCaseOfFailure>> {
-    match &action {
-        MigrateAction::DeleteObject { upstream, object } => {
-            let client = upstream_to_client
-                .get(upstream)
-                .context("unknown upstream")
-                .attach(format!("upstream: {upstream}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
+) -> Result<(), Report> {
+    let PendingMigration {
+        source_upstream: source,
+        target_upstream: target,
+        state,
+        object,
+    } = &action;
 
-            client
-                .delete_file(object)
-                .await
-                .context("failed to delete object from upstream")
-                .attach(format!("upstream: {upstream}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-        }
-        MigrateAction::MoveToUpstream {
-            source,
-            target,
-            object,
-        } => {
-            let source_client = upstream_to_client
-                .get(source)
-                .context("unknown upstream")
-                .attach(format!("source upstream: {source}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-            let target_client = upstream_to_client
-                .get(target)
-                .context("unknown upstream")
-                .attach(format!("target upstream: {target}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-
-            let (size, data) = source_client
-                .get_file(object)
-                .await
-                .context("failed to download object from source upstream")
-                .attach(format!("source upstream: {source}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-
-            target_client
-                .put_file(object, data, size.unwrap_or(0))
-                .await
-                .context("uploading file failed")
-                .attach(format!("object upstream: {target}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-
-            // At this point we have copied the file over, so we can adjust the upstream.
-            // We also _have_ to adjust it, as we then delete the file and failures during
-            // deletion might still leave the object removed from source!
-            db.set_upstream(object, target)
-                .await
-                .context("failed to update upstream in database")
-                .attach(format!("object: {}", &object))
-                .attach(format!("old upstream: {source}"))
-                .attach(format!("new upstream: {target}"))
-                .context(InCaseOfFailure::Retry(action.clone()))?;
-
-            // Try to delete the object. If it fails, we can't retry the action itself.
-            source_client
-                .delete_file(object)
-                .await
-                .context("failed to delete object from source upstream")
-                .attach(format!("old upstream: {source}"))
-                .attach(format!("new upstream: {target}"))
-                .attach(format!("object: {object}"))
-                .context(InCaseOfFailure::Retry(MigrateAction::DeleteObject {
-                    upstream: source.clone(),
-                    object: object.clone(),
-                }))?;
-        }
+    if matches!(state, MigrationState::Finished) {
+        return Ok(());
     }
 
+    let source_client = upstream_to_client
+        .get(source)
+        .context("unknown upstream")
+        .attach(format!("source upstream: {source}"))
+        .attach(format!("object: {object}"))?;
+    let target_client = upstream_to_client
+        .get(target)
+        .context("unknown upstream")
+        .attach(format!("target upstream: {target}"))
+        .attach(format!("object: {object}"))?;
+
+    if matches!(state, MigrationState::Pending) {
+        upload_object(&db, source_client, target_client, object, source, target).await?;
+    }
+
+    delete_object(&db, source_client, &action).await?;
+
     Ok(())
+}
+
+async fn upload_object(
+    db: &Database,
+    source_client: &S3Client,
+    target_client: &S3Client,
+    object: &S3ObjectId,
+    source: &UpstreamId,
+    target: &UpstreamId,
+) -> Result<(), Report> {
+    let (size, data) = source_client
+        .get_file(object)
+        .await
+        .context("failed to download object from source upstream")
+        .attach(format!("source upstream: {source}"))
+        .attach(format!("object: {object}"))?;
+
+    target_client
+        .put_file(object, data, size.unwrap_or(0))
+        .await
+        .context("failed to upload file")
+        .attach(format!("object upstream: {target}"))
+        .attach(format!("object: {object}"))?;
+
+    // At this point we have copied the file over, so we can adjust the upstream.
+    // We also _have_ to adjust it, as we then delete the file and failures during
+    // deletion might still leave the object removed from source!
+    db.set_upstream(object, target)
+        .await
+        .context("failed to update upstream in database")
+        .attach(format!("object: {}", &object))
+        .attach(format!("old upstream: {source}"))
+        .attach(format!("new upstream: {target}"))?;
+    // If this update fails we do the whole copy again, but that is fine.
+    update_pending_state(db, source, object, MigrationState::CopiedToTarget).await?;
+
+    Ok(())
+}
+
+async fn delete_object(
+    db: &Database,
+    source_client: &S3Client,
+    action: &PendingMigration,
+) -> Result<(), Report> {
+    // This will just return false and succeed if the file is already gone
+    source_client
+        .delete_file(&action.object)
+        .await
+        .context("failed to delete object from source upstream")
+        .attach(format!("old upstream: {}", &action.source_upstream))
+        .attach(format!("new upstream: {}", &action.target_upstream))
+        .attach(format!("object: {}", &action.object))?;
+    update_pending_state(
+        db,
+        &action.source_upstream,
+        &action.object,
+        MigrationState::Finished,
+    )
+    .await
+}
+
+async fn update_pending_state(
+    db: &Database,
+    source: &UpstreamId,
+    object: &S3ObjectId,
+    state: MigrationState,
+) -> Result<(), Report> {
+    db.set_pending_state(source, object, state)
+        .await
+        .context("failed to update pending migration state in database")
+        .attach(format!("object: {}", &object))
+        .attach(format!("old upstream: {source}"))
+        .attach(format!("new state: {state}"))
+        .map_err(Report::into_dynamic)
 }

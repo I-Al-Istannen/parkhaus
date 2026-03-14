@@ -23,7 +23,7 @@ pub async fn import(
     import_time: Option<jiff::Timestamp>,
 ) -> Result<(), Report> {
     let indicatif_layer =
-        logging::get_indicatif_layer().context("Could not build indicatif layer")?;
+        logging::get_indicatif_layer().context("failed to build indicatif layer")?;
 
     tracing_subscriber::registry()
         .with(logger_config(indicatif_layer.get_stderr_writer()))
@@ -37,7 +37,7 @@ pub async fn import(
         .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
         .report_creation_hook(SpanCollector::new())
         .install()
-        .context("Failed to install hooks")?;
+        .context("failed to install hooks")?;
 
     let client = Client::builder()
         .build()
@@ -103,7 +103,7 @@ async fn record_objects_of_bucket(
         .list_objects(&bucket.name)
         .instrument(info_span!("Listing objects"))
         .await
-        .context(format!("listing objects in bucket {}", bucket.name))?;
+        .context(format!("failed to list objects in bucket {}", bucket.name))?;
     Span::current().pb_set_length(objects.len() as u64);
 
     for obj in &objects {
@@ -116,7 +116,7 @@ async fn record_objects_of_bucket(
             last_modified: import_time.unwrap_or(obj.last_modified),
         })
         .await
-        .context("recording object creation in database")?;
+        .context("failed to record object creation in database")?;
 
         Span::current().pb_inc(1);
     }

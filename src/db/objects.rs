@@ -43,7 +43,7 @@ pub(super) async fn get_object(
     )
     .fetch_one(con)
     .await
-    .context("Failed to fetch object")
+    .context("failed to fetch object")
     .attach(format!("object: {obj}"))?
     .try_into()
 }
@@ -60,7 +60,7 @@ pub(super) async fn get_upstream(
     .map(|row| row.assigned_upstream)
     .fetch_optional(con)
     .await
-    .context("Failed to fetch object")
+    .context("failed to fetch object")
     .attach(format!("object: {obj}"))?
     .map(UpstreamId))
 }
@@ -76,7 +76,7 @@ pub(super) async fn delete_object(
     )
     .execute(con)
     .await
-    .context("Failed to delete object")
+    .context("failed to delete object")
     .attach(format!("object: {obj}"))?;
 
     Ok(())
@@ -103,7 +103,7 @@ pub(super) async fn record_creation(
     )
     .execute(con)
     .await
-    .context("Failed to record object creation")
+    .context("failed to record object creation")
     .attach(format!("object: {}", obj.id))
     .attach(format!("upstream: {}", obj.assigned_upstream))?;
 

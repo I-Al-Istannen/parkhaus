@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO PendingMigrations\n            (source_upstream, target_upstream, bucket, key, state)\n        VALUES\n            ($1, $2, $3, $4, $5)\n        ON CONFLICT DO UPDATE SET\n            state = $5\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "b48c3345cd93e5d8479ef721e0a41e07f57765ff26681257b1aee74fbe86d72e"
+}

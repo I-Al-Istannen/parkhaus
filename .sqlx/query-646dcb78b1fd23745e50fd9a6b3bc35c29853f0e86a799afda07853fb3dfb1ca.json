@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE PendingMigrations\n        SET state = $1\n        WHERE source_upstream = $2 AND bucket = $3 AND key = $4\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "646dcb78b1fd23745e50fd9a6b3bc35c29853f0e86a799afda07853fb3dfb1ca"
+}

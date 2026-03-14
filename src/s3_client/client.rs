@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
-use reqwest::{Client, Method, Response};
+use reqwest::{Client, Method, Response, StatusCode};
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
@@ -138,13 +138,13 @@ impl S3Client {
             .body(body)
             .send()
             .await
-            .context("PUT request failed")
+            .context("failed sending PUT request")
             .attach(format!("object: {id}"))?;
 
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(report!("S3 request failed")
+            return Err(report!("failed S3 request")
                 .attach("method: streaming PUT")
                 .attach(format!("status: {status}"))
                 .attach(format!("url: {url}"))
@@ -201,7 +201,9 @@ impl S3Client {
         Ok(checksum.to_string())
     }
 
-    pub async fn delete_file(&self, id: &S3ObjectId) -> Result<(), Report> {
+    /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
+    /// `true` if it was deleted.
+    pub async fn delete_file(&self, id: &S3ObjectId) -> Result<bool, Report> {
         let url = self.object_url(id)?;
         let signed_headers = self.signing.sign(SignRequest::now(Method::DELETE, &url))?;
         let response = self
@@ -215,6 +217,9 @@ impl S3Client {
             .attach(format!("url: {}", self.endpoint))?;
 
         let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             return Err(report!("S3 delete failed")
@@ -223,7 +228,7 @@ impl S3Client {
                 .attach(format!("response body: {text}")));
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn signed_request(
@@ -243,7 +248,7 @@ impl S3Client {
             .headers(signed_headers)
             .send()
             .await
-            .context("S3 request failed")
+            .context("failed to send S3 request")
             .attach(format!("url: {url}"))?;
 
         let status = response.status();
@@ -252,7 +257,7 @@ impl S3Client {
                 .text()
                 .await
                 .context("failed to read S3 response body")?;
-            return Err(report!("S3 request failed")
+            return Err(report!("failed S3 request")
                 .attach(format!("method: {method}"))
                 .attach(format!("status: {status}"))
                 .attach(format!("url: {url}"))

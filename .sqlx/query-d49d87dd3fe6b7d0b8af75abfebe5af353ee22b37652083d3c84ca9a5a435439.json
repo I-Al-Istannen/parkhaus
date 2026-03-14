@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        DELETE FROM PendingMigrations\n               WHERE\n                   source_upstream = $1 AND bucket = $2 AND key = $3 ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "d49d87dd3fe6b7d0b8af75abfebe5af353ee22b37652083d3c84ca9a5a435439"
+}

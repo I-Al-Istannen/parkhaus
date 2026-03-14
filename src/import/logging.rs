@@ -110,7 +110,7 @@ pub fn bar_progress_style() -> Result<ProgressStyle, Report> {
 {span_fields} {wide_bar:.cyan} {pos}/{len}";
 
     ProgressStyle::with_template(template)
-        .context("Could not set progress style")
+        .context("failed to set progress style")
         .map_err(Report::into_dynamic)
 }
 
@@ -118,6 +118,6 @@ pub fn spinner_style() -> Result<ProgressStyle, Report> {
     let template = "{span_child_prefix}{spinner:.cyan} [{elapsed_precise:.bold}] {span_name:.bold.cyan}{msg} {span_fields}";
 
     Ok(ProgressStyle::with_template(template)
-        .context("Failed to create progress style")?
+        .context("failed to create progress style")?
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⢰", "⣰", "⣠", "⣄", "⣆", "⠇", "⠏", "✓"]))
 }

@@ -1,7 +1,7 @@
 mod migrate;
 mod objects;
 
-use crate::data::{S3Object, S3ObjectId, UpstreamId};
+use crate::data::{MigrationState, PendingMigration, S3Object, S3ObjectId, UpstreamId};
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
@@ -107,6 +107,57 @@ impl Database {
             upstream,
         )
         .await
+    }
+
+    /// Adds all migrations in a transaction (to speed up database operations).
+    pub async fn add_all_pending(&self, migrations: &[PendingMigration]) -> Result<(), Report> {
+        let con = self.write().await;
+        let mut transaction = con.begin().await.context("begin transaction")?;
+        for migration in migrations {
+            migrate::add_pending(&mut transaction, migration).await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    pub async fn set_pending_state(
+        &self,
+        source_upstream: &UpstreamId,
+        object: &S3ObjectId,
+        state: MigrationState,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        migrate::set_pending_state(
+            &mut *con.acquire().await.context("acquire con")?,
+            source_upstream,
+            object,
+            state,
+        )
+        .await
+    }
+
+    pub async fn delete_pending(
+        &self,
+        source_upstream: &UpstreamId,
+        object: &S3ObjectId,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        migrate::delete_pending(
+            &mut *con.acquire().await.context("acquire con")?,
+            source_upstream,
+            object,
+        )
+        .await
+    }
+
+    pub async fn get_pending_with_state(
+        &self,
+        state: Option<MigrationState>,
+    ) -> Result<Vec<PendingMigration>, Report> {
+        let con = self.read().await;
+        migrate::get_pending_with_state(&mut *con.acquire().await.context("acquire con")?, state)
+            .await
     }
 
     pub async fn close(self) -> Result<(), Report> {
