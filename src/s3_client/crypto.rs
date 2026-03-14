@@ -1,6 +1,7 @@
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
@@ -117,7 +118,7 @@ impl ChunkSigner {
 }
 
 pub struct SignRequest<'a> {
-    method: &'a str,
+    method: Method,
     url: &'a Url,
     payload_hash: &'a str,
     current_time: Timestamp,
@@ -125,7 +126,7 @@ pub struct SignRequest<'a> {
 }
 
 impl<'a> SignRequest<'a> {
-    pub fn new(method: &'a str, url: &'a Url, current_time: Timestamp) -> Self {
+    pub fn new(method: Method, url: &'a Url, current_time: Timestamp) -> Self {
         Self {
             method,
             url,
@@ -135,12 +136,8 @@ impl<'a> SignRequest<'a> {
         }
     }
 
-    pub fn now(method: &'a str, url: &'a Url) -> Self {
+    pub fn now(method: Method, url: &'a Url) -> Self {
         Self::new(method, url, Timestamp::now())
-    }
-
-    pub fn get(url: &'a Url) -> Self {
-        Self::now("GET", url)
     }
 
     pub fn with_payload_hash(mut self, payload_hash: &'a str) -> Self {
@@ -205,7 +202,7 @@ impl SigningConfig {
     ) -> Result<(HeaderMap, ChunkSigner), Report> {
         let decoded_len_str = request.decoded_content_length.to_string();
         let signed = self.sign_impl(
-            SignRequest::new("PUT", request.url, request.current_time)
+            SignRequest::new(Method::PUT, request.url, request.current_time)
                 .with_payload_hash(STREAMING_PAYLOAD_TRAILER_HASH)
                 .with_extra_headers(&[
                     ("content-encoding", "aws-chunked"),
@@ -239,7 +236,7 @@ impl SigningConfig {
         };
 
         let (canonical_request, signed_headers) = build_canonical_request(
-            request.method,
+            request.method.as_str(),
             request.url,
             &host_header,
             &amz_date,
@@ -548,7 +545,7 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
+        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
 
         assert_eq!(
             signed.get("host").context("expected host header")?,
@@ -584,7 +581,7 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
+        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
 
         assert!(
             !signed
@@ -607,7 +604,7 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new("GET", &url, ts))?;
+        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
 
         assert_eq!(
             signed.get("host").context("expected host header")?,

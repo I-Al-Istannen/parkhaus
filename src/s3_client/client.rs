@@ -8,7 +8,7 @@ use jiff::Timestamp;
 use reqwest::{Client, Method, Response};
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
-use rootcause::{Report, bail, report};
+use rootcause::{Report, report};
 use serde::Deserialize;
 use sha2::Digest;
 use std::io::Write;
@@ -133,17 +133,22 @@ impl S3Client {
 
         let response = self
             .client
-            .put(url)
+            .put(url.clone())
             .headers(signed_headers)
             .body(body)
             .send()
             .await
-            .context("PUT request failed")?;
+            .context("PUT request failed")
+            .attach(format!("object: {id}"))?;
 
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            bail!("S3 PUT returned {status}: {text}");
+            return Err(report!("S3 request failed")
+                .attach("method: streaming PUT")
+                .attach(format!("status: {status}"))
+                .attach(format!("url: {url}"))
+                .attach(format!("response body: {text}")));
         }
 
         Ok(())
@@ -166,7 +171,7 @@ impl S3Client {
     async fn get_object_sha256(&self, id: &S3ObjectId) -> Result<String, Report> {
         let url = self.object_url(id)?;
         let signed_headers = self.signing.sign(
-            SignRequest::now("HEAD", &url)
+            SignRequest::now(Method::HEAD, &url)
                 .with_extra_headers(&[("x-amz-checksum-mode", "ENABLED")]),
         )?;
         let response = self
@@ -198,7 +203,7 @@ impl S3Client {
 
     pub async fn delete_file(&self, id: &S3ObjectId) -> Result<(), Report> {
         let url = self.object_url(id)?;
-        let signed_headers = self.signing.sign(SignRequest::now("DELETE", &url))?;
+        let signed_headers = self.signing.sign(SignRequest::now(Method::DELETE, &url))?;
         let response = self
             .client
             .delete(url)
@@ -231,7 +236,7 @@ impl S3Client {
         // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
         let signed_headers = self
             .signing
-            .sign(SignRequest::now(method.as_str(), url).with_extra_headers(extra_headers))?;
+            .sign(SignRequest::now(method.clone(), url).with_extra_headers(extra_headers))?;
         let response = self
             .client
             .request(method.clone(), url.clone())
@@ -509,7 +514,9 @@ mod tests {
             .await?;
 
         let get_url = client.object_url(&id)?;
-        let signed_headers = client.signing.sign(SignRequest::get(&get_url))?;
+        let signed_headers = client
+            .signing
+            .sign(SignRequest::now(Method::GET, &get_url))?;
         let resp = client
             .client
             .get(get_url)
