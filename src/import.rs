@@ -106,8 +106,9 @@ async fn record_objects_of_bucket(
         .context(format!("failed to list objects in bucket {}", bucket.name))?;
     Span::current().pb_set_length(objects.len() as u64);
 
-    for obj in &objects {
-        db.record_creation(&S3Object {
+    let objects = objects
+        .into_iter()
+        .map(|obj| S3Object {
             id: S3ObjectId {
                 bucket: bucket.name.clone(),
                 key: obj.key.clone(),
@@ -115,11 +116,11 @@ async fn record_objects_of_bucket(
             assigned_upstream: upstream.name.clone(),
             last_modified: import_time.unwrap_or(obj.last_modified),
         })
-        .await
-        .context("failed to record object creation in database")?;
+        .collect::<Vec<_>>();
 
-        Span::current().pb_inc(1);
-    }
+    db.bulk_import_creations(&objects)
+        .await
+        .context("failed to record object creations in database")?;
 
     Ok(())
 }

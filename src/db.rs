@@ -10,6 +10,8 @@ use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tracing::Span;
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -77,6 +79,24 @@ impl Database {
     pub async fn record_creation(&self, obj: &S3Object) -> Result<(), Report> {
         let con = self.write().await;
         objects::record_creation(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    /// This calls [record_creation] for all objects in batches. It also updates the progress bar
+    /// of the current span.
+    pub async fn bulk_import_creations(&self, objects: &[S3Object]) -> Result<(), Report> {
+        let con = self.write().await;
+        const BATCH_SIZE: usize = 10_000; // randomly chosen (after some experiments)
+
+        for batch in objects.chunks(BATCH_SIZE) {
+            let mut transaction = con.begin().await.context("begin transaction")?;
+            for obj in batch {
+                objects::record_creation(&mut transaction, obj).await?;
+            }
+            transaction.commit().await?;
+            Span::current().pb_inc(batch.len() as u64);
+        }
+
+        Ok(())
     }
 
     pub async fn get_objects_in_range(
