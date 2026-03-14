@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
-use reqwest::{Client, Response};
+use reqwest::{Client, Method, Response};
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail, report};
@@ -54,36 +54,6 @@ impl S3Client {
             &upstream.s3_access_key,
             &upstream.s3_secret.0,
         )
-    }
-
-    async fn signed_get(
-        &self,
-        url: &Url,
-        extra_headers: &[(&str, &str)],
-    ) -> Result<Response, Report> {
-        // S3 SigV4 signed GET with an explicit payload hash header.
-        // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-        let signed_headers = self
-            .signing
-            .sign(SignRequest::get(url).with_extra_headers(extra_headers))?;
-        let response = self
-            .client
-            .get(url.clone())
-            .headers(signed_headers)
-            .send()
-            .await
-            .context("S3 request failed")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .context("failed to read S3 response body")?;
-            bail!("S3 returned {status}: {body}");
-        }
-
-        Ok(response)
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Report> {
@@ -147,71 +117,6 @@ impl S3Client {
         Ok(all_objects)
     }
 
-    /// Only works if the server supports the header and the object was uploaded with checksums
-    async fn get_object_sha256(&self, id: &S3ObjectId) -> Result<String, Report> {
-        let url = self.object_url(id)?;
-        let signed_headers = self.signing.sign(
-            SignRequest::now("HEAD", &url)
-                .with_extra_headers(&[("x-amz-checksum-mode", "ENABLED")]),
-        )?;
-        let response = self
-            .client
-            .head(url)
-            .headers(signed_headers)
-            .send()
-            .await
-            .context("S3 request failed")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(report!("S3 returned {status}").attach(format!("object: {id:?}")));
-        }
-
-        let checksum_header = response
-            .headers()
-            .get("x-amz-checksum-sha256")
-            .context("missing checksum header")
-            .attach(format!("object: {id:?}"))?;
-        let checksum = checksum_header
-            .to_str()
-            .context("invalid checksum header value")
-            .attach(format!("header: {:?}", checksum_header))
-            .attach(format!("object: {id:?}"))?;
-
-        Ok(checksum.to_string())
-    }
-
-    /// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
-    fn list_objects_url(
-        &self,
-        bucket: &str,
-        continuation_token: &Option<String>,
-    ) -> Result<Url, Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(bucket);
-
-        // V2 api
-        url.query_pairs_mut().append_pair("list-type", "2");
-        if let Some(token) = continuation_token {
-            url.query_pairs_mut()
-                .append_pair("continuation-token", token);
-        }
-        url.query_pairs_mut().append_pair("max-keys", "1000");
-
-        Ok(url)
-    }
-
-    fn object_url(&self, id: &S3ObjectId) -> Result<Url, Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(&id.bucket)
-            .extend(id.key.split('/'));
-        Ok(url)
-    }
-
     pub async fn put_file(
         &self,
         id: &S3ObjectId,
@@ -255,6 +160,140 @@ impl S3Client {
         let bytes_stream = response.bytes_stream().map_err(std::io::Error::other);
 
         Ok((content_length, StreamReader::new(bytes_stream)))
+    }
+
+    /// Only works if the server supports the header and the object was uploaded with checksums
+    async fn get_object_sha256(&self, id: &S3ObjectId) -> Result<String, Report> {
+        let url = self.object_url(id)?;
+        let signed_headers = self.signing.sign(
+            SignRequest::now("HEAD", &url)
+                .with_extra_headers(&[("x-amz-checksum-mode", "ENABLED")]),
+        )?;
+        let response = self
+            .client
+            .head(url)
+            .headers(signed_headers)
+            .send()
+            .await
+            .context("S3 request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(report!("S3 returned {status}").attach(format!("object: {id:?}")));
+        }
+
+        let checksum_header = response
+            .headers()
+            .get("x-amz-checksum-sha256")
+            .context("missing checksum header")
+            .attach(format!("object: {id:?}"))?;
+        let checksum = checksum_header
+            .to_str()
+            .context("invalid checksum header value")
+            .attach(format!("header: {:?}", checksum_header))
+            .attach(format!("object: {id:?}"))?;
+
+        Ok(checksum.to_string())
+    }
+
+    pub async fn delete_file(&self, id: &S3ObjectId) -> Result<(), Report> {
+        let url = self.object_url(id)?;
+        let signed_headers = self.signing.sign(SignRequest::now("DELETE", &url))?;
+        let response = self
+            .client
+            .delete(url)
+            .headers(signed_headers)
+            .send()
+            .await
+            .context("DELETE request failed")
+            .attach(format!("object: {id}"))
+            .attach(format!("url: {}", self.endpoint))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(report!("S3 delete failed")
+                .attach(format!("status: {status}"))
+                .attach(format!("object: {id}"))
+                .attach(format!("response body: {text}")));
+        }
+
+        Ok(())
+    }
+
+    async fn signed_request(
+        &self,
+        url: &Url,
+        method: Method,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response, Report> {
+        // S3 SigV4 signed GET with an explicit payload hash header.
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+        let signed_headers = self
+            .signing
+            .sign(SignRequest::now(method.as_str(), url).with_extra_headers(extra_headers))?;
+        let response = self
+            .client
+            .request(method.clone(), url.clone())
+            .headers(signed_headers)
+            .send()
+            .await
+            .context("S3 request failed")
+            .attach(format!("url: {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .context("failed to read S3 response body")?;
+            return Err(report!("S3 request failed")
+                .attach(format!("method: {method}"))
+                .attach(format!("status: {status}"))
+                .attach(format!("url: {url}"))
+                .attach(format!("response body: {body}")));
+        }
+
+        Ok(response)
+    }
+
+    async fn signed_get(
+        &self,
+        url: &Url,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response, Report> {
+        self.signed_request(url, Method::GET, extra_headers).await
+    }
+
+    /// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+    fn list_objects_url(
+        &self,
+        bucket: &str,
+        continuation_token: &Option<String>,
+    ) -> Result<Url, Report> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(bucket);
+
+        // V2 api
+        url.query_pairs_mut().append_pair("list-type", "2");
+        if let Some(token) = continuation_token {
+            url.query_pairs_mut()
+                .append_pair("continuation-token", token);
+        }
+        url.query_pairs_mut().append_pair("max-keys", "1000");
+
+        Ok(url)
+    }
+
+    fn object_url(&self, id: &S3ObjectId) -> Result<Url, Report> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
+            .push(&id.bucket)
+            .extend(id.key.split('/'));
+        Ok(url)
     }
 }
 
@@ -427,6 +466,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_object_sha() -> Result<(), Report> {
+        let g = garage().await?;
+        let bucket = bucket_name("test-get-object-sha");
+        let client = setup_bucket(g, &bucket).await?;
+
+        let payload = b"Hello, chunked S3 upload!";
+        let id = S3ObjectId {
+            bucket,
+            key: "test-key.txt".into(),
+        };
+
+        client
+            .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+            .await?;
+
+        let mut data = Vec::new();
+        client.get_file(&id).await?.1.read_to_end(&mut data).await?;
+        let actual_sha256 = STANDARD.encode(sha2::Sha256::digest(&data));
+        let fetched_sha256 = STANDARD.encode(sha2::Sha256::digest(&data));
+        assert_eq!(actual_sha256, fetched_sha256);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_put_large_file() -> Result<(), Report> {
         let g = garage().await?;
         let bucket = bucket_name("test-put-large-file");
@@ -547,6 +611,35 @@ mod tests {
             assert_eq!(object.key, expected_key);
             assert_eq!(object.size, expected_size);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete() -> Result<(), Report> {
+        let g = garage().await?;
+        let bucket = bucket_name("test-delete-objects");
+        let client = setup_bucket(g, &bucket).await?;
+
+        let expected_objects = [
+            ("flag.txt", b"cool!".as_slice()),
+            ("flag2.txt", b"cool!".as_slice()),
+        ];
+        for (key, payload) in expected_objects {
+            put_object(&client, &bucket, key, payload).await?;
+        }
+        assert_eq!(client.list_objects(&bucket).await?.len(), 2);
+
+        client
+            .delete_file(&S3ObjectId {
+                bucket: bucket.clone(),
+                key: "flag.txt".into(),
+            })
+            .await?;
+
+        let objects = client.list_objects(&bucket).await?;
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "flag2.txt");
 
         Ok(())
     }
