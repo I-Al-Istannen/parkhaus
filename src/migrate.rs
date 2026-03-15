@@ -45,7 +45,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
     let work = async {
         loop {
             // Only check sometimes :)
-            tokio::time::sleep(Duration::from_mins(5)).await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
 
             debug!("Computing pending migrations");
             if let Err(error) = compute_pending(&config, &db, Zoned::now()).await {
@@ -53,6 +53,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             }
             match execute_pending(&config, &db).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
+                Ok(errors) if errors.is_empty() => {}
                 Ok(errors) => {
                     error!(
                         error_count = errors.len(),
