@@ -12,6 +12,7 @@ use sqlx::Type;
 use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -27,9 +28,87 @@ pub struct Config {
     pub listen: String,
     pub db_path: PathBuf,
     pub upstreams: HashMap<UpstreamId, Upstream>,
+    _prevent_construction: PhantomData<String>,
 }
 
 impl Config {
+    pub fn new(
+        listen: String,
+        db_path: PathBuf,
+        upstream_map: HashMap<UpstreamId, Upstream>,
+    ) -> Result<Self, Report> {
+        let mut upstreams = upstream_map.iter().collect::<Vec<_>>();
+
+        if upstreams.is_empty() {
+            bail!("config must contain at least one upstream");
+        }
+
+        let priorities = upstreams
+            .iter()
+            .map(|it| it.1.order)
+            .collect::<HashSet<_>>();
+        if priorities.len() != upstreams.len() {
+            bail!("upstream priorities must be unique");
+        }
+
+        upstreams.sort_unstable_by_key(|it| it.1.order);
+
+        let coldest = upstreams.pop();
+        if let Some((name, val)) = coldest
+            && let Some(max_age) = val.max_age
+        {
+            return Err(report!("the coldest upstream must not have max_age set")
+                .attach(format!("upstream: {name:?}"))
+                .attach(format!("max_age: {max_age:?}")));
+        }
+
+        // Verify all others have a max age
+        for (name, val) in &upstreams {
+            if val.max_age.is_none() {
+                return Err(
+                    report!("all upstreams except the coldest one must have max_age set")
+                        .attach(format!("upstream: {name:?}")),
+                );
+            }
+        }
+
+        // Verify that hotter upstreams have smaller max_age than colder upstreams, otherwise
+        // migration is hard.
+        for window in upstreams.windows(2) {
+            let hotter_name = &window[0].0;
+            let colder_name = &window[1].0;
+            let hotter = &window[0].1;
+            let colder = &window[1].1;
+
+            let hotter_age = hotter.max_age.unwrap();
+            let colder_age = colder.max_age.unwrap();
+            let age_compare = hotter_age.compare((colder_age, &Zoned::now()))?;
+
+            if age_compare != Ordering::Less {
+                return Err(report!(
+                    "hotter upstream must have smaller max_age than colder upstream"
+                )
+                .attach(format!(
+                    "hotter upstream: {} (order {})",
+                    hotter_name, hotter.order
+                ))
+                .attach(format!("hotter max_age: {}", hotter_age))
+                .attach(format!(
+                    "colder upstream: {} (order {})",
+                    colder_name, colder.order
+                ))
+                .attach(format!("colder max_age: {}", colder_age)));
+            }
+        }
+
+        Ok(Self {
+            listen,
+            db_path,
+            upstreams: upstream_map,
+            _prevent_construction: PhantomData,
+        })
+    }
+
     pub fn hottest_upstream(&self) -> &Upstream {
         self.upstreams
             .values()
@@ -122,7 +201,6 @@ struct RawUpstream {
 
 pub fn load(path: &Path) -> Result<Config, Report> {
     let raw: RawConfig = toml_utils::load_from_file(path).context("failed to load config")?;
-    check_upstreams(&raw)?;
 
     let parsed_upstreams = raw
         .upstreams
@@ -142,78 +220,5 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         })
         .collect();
 
-    Ok(Config {
-        listen: raw.listen,
-        db_path: raw.db_path,
-        upstreams: parsed_upstreams,
-    })
-}
-
-fn check_upstreams(raw: &RawConfig) -> Result<(), Report> {
-    let mut upstreams = raw.upstreams.iter().collect::<Vec<_>>();
-
-    if upstreams.is_empty() {
-        bail!("config must contain at least one upstream");
-    }
-
-    let priorities = raw
-        .upstreams
-        .iter()
-        .map(|it| it.1.order)
-        .collect::<HashSet<_>>();
-    if priorities.len() != raw.upstreams.len() {
-        bail!("upstream priorities must be unique");
-    }
-
-    upstreams.sort_unstable_by_key(|it| it.1.order);
-
-    let coldest = upstreams.pop();
-    if let Some((name, val)) = coldest
-        && let Some(max_age) = val.max_age
-    {
-        return Err(report!("the coldest upstream must not have max_age set")
-            .attach(format!("upstream: {name:?}"))
-            .attach(format!("max_age: {max_age:?}")));
-    }
-
-    // Verify all others have a max age
-    for (name, val) in &upstreams {
-        if val.max_age.is_none() {
-            return Err(
-                report!("all upstreams except the coldest one must have max_age set")
-                    .attach(format!("upstream: {name:?}")),
-            );
-        }
-    }
-
-    // Verify that hotter upstreams have smaller max_age than colder upstreams, otherwise
-    // migration is hard.
-    for window in upstreams.windows(2) {
-        let hotter_name = &window[0].0;
-        let colder_name = &window[1].0;
-        let hotter = &window[0].1;
-        let colder = &window[1].1;
-
-        let hotter_age = hotter.max_age.unwrap();
-        let colder_age = colder.max_age.unwrap();
-        let age_compare = hotter_age.compare((colder_age, &Zoned::now()))?;
-
-        if age_compare != Ordering::Less {
-            return Err(
-                report!("hotter upstream must have smaller max_age than colder upstream")
-                    .attach(format!(
-                        "hotter upstream: {} (order {})",
-                        hotter_name, hotter.order
-                    ))
-                    .attach(format!("hotter max_age: {}", hotter_age))
-                    .attach(format!(
-                        "colder upstream: {} (order {})",
-                        colder_name, colder.order
-                    ))
-                    .attach(format!("colder max_age: {}", colder_age)),
-            );
-        }
-    }
-
-    Ok(())
+    Config::new(raw.listen, raw.db_path, parsed_upstreams)
 }

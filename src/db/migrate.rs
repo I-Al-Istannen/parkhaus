@@ -4,7 +4,7 @@ use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use sqlx::{SqliteConnection, query, query_as};
 
-pub(super) async fn get_objects_in_range(
+pub(super) async fn get_objects_not_in_range(
     con: &mut SqliteConnection,
     upstream: &UpstreamId,
     start: Timestamp,
@@ -16,7 +16,7 @@ pub(super) async fn get_objects_in_range(
         r#"
         SELECT bucket, key, last_modified
         FROM objects
-        WHERE assigned_upstream = ? AND last_modified >= ? AND last_modified <= ?
+        WHERE assigned_upstream = ? AND (last_modified < ? OR last_modified > ?)
         "#,
         upstream,
         start_ms,

@@ -35,6 +35,10 @@ impl<'a> SortedUpstreams<'a> {
             upstreams: sorted_upstreams,
         }
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &'a Upstream> {
+        self.upstreams.iter().copied()
+    }
 }
 
 pub async fn migration_task(config: Config, db: Database, shutdown: CancellationToken) {
@@ -44,7 +48,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             tokio::time::sleep(Duration::from_mins(5)).await;
 
             debug!("Computing pending migrations");
-            if let Err(error) = compute_pending(&config, &db).await {
+            if let Err(error) = compute_pending(&config, &db, Zoned::now()).await {
                 error!(%error, "Failed to compute new pending migrations");
             }
             match execute_pending(&config, &db).await {
@@ -76,8 +80,8 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
     )
 }
 
-async fn compute_pending(config: &Config, db: &Database) -> Result<(), Report> {
-    let pending = get_pending_migrations(config, db)
+async fn compute_pending(config: &Config, db: &Database, now: Zoned) -> Result<(), Report> {
+    let pending = get_pending_migrations(config, db, now)
         .await
         .context("failed to retrieve pending migrations")?;
     db.add_all_pending(&pending)
@@ -102,18 +106,26 @@ async fn execute_pending(config: &Config, db: &Database) -> Result<Vec<Report>, 
 pub async fn get_pending_migrations(
     config: &Config,
     db: &Database,
+    now: Zoned,
 ) -> Result<Vec<PendingMigration>, Report> {
-    let now = Zoned::now();
     let sorted_upstreams = SortedUpstreams::new(now.clone(), config.upstreams.values());
 
     let mut all_actions = Vec::new();
+    let mut last_time_start = None;
+    for upstream in sorted_upstreams.iter() {
+        // out out out | store store store | out out out
+        //             ^                   ^
+        //             |                   |
+        //     max age of this upstream    |
+        //     (time_start)        max age of previous upstream (time_end)
+        let time_start = upstream
+            .max_age
+            .map(|it| (&now - it).timestamp())
+            .unwrap_or(Timestamp::MIN);
+        let time_end = last_time_start.unwrap_or(now.timestamp());
 
-    for upstream in config.upstreams.values() {
-        let Some(max_age) = upstream.max_age else {
-            continue;
-        };
         let actions = db
-            .get_objects_in_range(&upstream.name, Timestamp::MIN, (&now - max_age).timestamp())
+            .get_objects_not_in_range(&upstream.name, time_start, time_end)
             .await
             .context("get objects in migration time range")
             .attach(format!("upstream: {}", upstream.name))?
@@ -140,6 +152,7 @@ pub async fn get_pending_migrations(
             .attach(format!("upstream: {}", upstream.name))?;
 
         all_actions.extend(actions);
+        last_time_start = Some(time_start);
     }
 
     Ok(all_actions)
@@ -299,4 +312,196 @@ async fn update_pending_state(
         .attach(format!("old upstream: {source}"))
         .attach(format!("new state: {state}"))
         .map_err(Report::into_dynamic)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_pending_migrations;
+    use crate::config::{AddressingStyle, Config, S3Secret, Upstream, UpstreamId};
+    use crate::data::{S3Object, S3ObjectId};
+    use crate::db::Database;
+    use derive_more::Display;
+    use jiff::{Span, Unit, Zoned};
+    use rand::prelude::IndexedRandom;
+    use rand::rngs::StdRng;
+    use rand::{Rng, RngExt, SeedableRng, rng};
+    use rootcause::{Report, bail};
+    use std::collections::{HashMap, HashSet};
+    use std::ops::{Range, Sub};
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+    enum Tier {
+        Hot,
+        Warm,
+        Cold,
+    }
+
+    impl Tier {
+        fn max_age(&self) -> Option<Span> {
+            match self {
+                Self::Hot => Some(Span::new().hours(2)),
+                Self::Warm => Some(Span::new().hours(5)),
+                Self::Cold => None,
+            }
+        }
+
+        fn age_as_hour_range(&self) -> Range<f64> {
+            match self {
+                Self::Hot => 0f64..2f64,
+                Self::Warm => 2.1f64..5.0f64,
+                Self::Cold => 5.1f64..12.0f64,
+            }
+        }
+
+        fn all() -> [Self; 3] {
+            [Self::Hot, Self::Warm, Self::Cold]
+        }
+    }
+
+    impl TryFrom<&str> for Tier {
+        type Error = Report;
+
+        fn try_from(value: &str) -> Result<Self, Self::Error> {
+            match value {
+                "Hot" => Ok(Self::Hot),
+                "Warm" => Ok(Self::Warm),
+                "Cold" => Ok(Self::Cold),
+                _ => bail!("Unknown tier: '{value}'"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_pending_migrations_randomized_ages_match_expected_targets() -> Result<(), Report> {
+        let db = Database::in_memory().await?;
+
+        let seed = rng().next_u64();
+        println!("seed: {seed}");
+        let mut rng = StdRng::seed_from_u64(seed);
+        let now = Zoned::now();
+
+        let mut expected = HashSet::new();
+        let mut obj_map = HashMap::new();
+        for source_tier in Tier::all() {
+            let source_id = UpstreamId(source_tier.to_string());
+            for index in 0..120 {
+                let tier = Tier::all()
+                    .choose(&mut rng)
+                    .copied()
+                    .expect("tier choices must not be empty");
+                let object = random_object_for_tier(&mut rng, &now, source_id.clone(), tier, index);
+                obj_map.insert(object.id.clone(), object.clone());
+                db.record_creation(&object).await?;
+
+                if source_tier != tier {
+                    expected.insert((source_id.clone(), UpstreamId(tier.to_string()), object.id));
+                }
+            }
+        }
+
+        let pending = get_pending_migrations(&test_config()?, &db, now.clone()).await?;
+        let got = pending
+            .into_iter()
+            .map(|pending| {
+                (
+                    pending.source_upstream,
+                    pending.target_upstream,
+                    pending.object,
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        println!("GOT");
+        print_migrations(&now, &obj_map, &got)?;
+        println!("EXPECTED");
+        print_migrations(&now, &obj_map, &expected)?;
+
+        assert_eq!(got, expected);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    fn random_object_for_tier(
+        rng: &mut StdRng,
+        now: &Zoned,
+        source: UpstreamId,
+        tier: Tier,
+        index: usize,
+    ) -> S3Object {
+        let age_hours = rng.random_range(tier.age_as_hour_range());
+        let age_seconds = (age_hours * 3600.0) as i64;
+
+        S3Object {
+            id: S3ObjectId {
+                bucket: "test".to_owned(),
+                key: format!("{}-{}-{index}", source, random_key(rng)),
+            },
+            assigned_upstream: source,
+            last_modified: (now - Span::new().seconds(age_seconds)).timestamp(),
+        }
+    }
+
+    fn random_key(rng: &mut StdRng) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        (0..16)
+            .map(|_| {
+                let idx = rng.random_range(0..ALPHABET.len());
+                ALPHABET[idx] as char
+            })
+            .collect()
+    }
+
+    fn test_config() -> Result<Config, Report> {
+        let new_upstream = |id: UpstreamId, order: usize, max_age: Option<Span>| {
+            Ok::<Upstream, Report>(Upstream {
+                name: id,
+                order,
+                base_url: format!("http://127.0.0.1:900{order}").parse()?,
+                addressing_style: AddressingStyle::Path,
+                max_age,
+                s3_access_key: "test".to_owned(),
+                s3_secret: S3Secret("test".to_owned()),
+                region: "test".to_owned(),
+            })
+        };
+
+        let mut upstreams = HashMap::new();
+        for (index, tier) in Tier::all().iter().enumerate() {
+            let id = UpstreamId(tier.to_string());
+            upstreams.insert(id.clone(), new_upstream(id, index + 1, tier.max_age())?);
+        }
+
+        Config::new(
+            "127.0.0.1:0".to_owned(),
+            Path::new("/tmp/").to_path_buf(),
+            upstreams,
+        )
+    }
+
+    fn print_migrations(
+        now: &Zoned,
+        obj_map: &HashMap<S3ObjectId, S3Object>,
+        migrations: &HashSet<(UpstreamId, UpstreamId, S3ObjectId)>,
+    ) -> Result<(), Report> {
+        for (source, target, obj) in migrations {
+            println!(
+                "{obj:>40}  |  {source:<5} -> {target:<5} {:>5.2} | {} / {}",
+                now.timestamp()
+                    .sub(obj_map.get(obj).unwrap().last_modified)
+                    .total(Unit::Hour)?,
+                Tier::try_from(source.0.as_str())?
+                    .max_age()
+                    .map(|x| format!("{}h", x.get_hours()))
+                    .unwrap_or("None".to_string()),
+                Tier::try_from(target.0.as_str())?
+                    .max_age()
+                    .map(|x| format!("{}h", x.get_hours()))
+                    .unwrap_or("None".to_string()),
+            );
+        }
+
+        Ok(())
+    }
 }

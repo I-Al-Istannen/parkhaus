@@ -5,7 +5,9 @@ use crate::data::{MigrationState, PendingMigration, S3Object, S3ObjectId, Upstre
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,10 +18,31 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 #[derive(Debug, Clone)]
 pub struct Database {
     con: Arc<RwLock<Pool<Sqlite>>>,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl Database {
+    pub async fn in_memory() -> Result<Self, Report> {
+        // See https://github.com/launchbadge/sqlx/issues/2510#issuecomment-2254646669
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(
+                SqliteConnectOptions::default()
+                    .foreign_keys(true)
+                    .read_only(false)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .pragma("temp_store", "memory")
+                    .pragma("mmap_size", "30000000000")
+                    .in_memory(true),
+            )
+            .await?;
+
+        Self::new_impl(pool, None).await
+    }
+
     pub async fn new(path: &Path) -> Result<Self, Report> {
         let pool = SqlitePool::connect_with(
             SqliteConnectOptions::default()
@@ -35,6 +58,10 @@ impl Database {
         )
         .await?;
 
+        Self::new_impl(pool, Some(path.to_path_buf())).await
+    }
+
+    async fn new_impl(pool: Pool<Sqlite>, path: Option<PathBuf>) -> Result<Self, Report> {
         sqlx::migrate!().run(&pool).await?;
 
         // This might duplicate the database according to the docs:
@@ -49,7 +76,7 @@ impl Database {
 
         Ok(Self {
             con: Arc::new(RwLock::new(pool)),
-            path: path.to_owned(),
+            path,
         })
     }
 
@@ -99,14 +126,14 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_objects_in_range(
+    pub async fn get_objects_not_in_range(
         &self,
         upstream: &UpstreamId,
         start: Timestamp,
         end: Timestamp,
     ) -> Result<Vec<(S3ObjectId, Timestamp)>, Report> {
         let con = self.read().await;
-        migrate::get_objects_in_range(
+        migrate::get_objects_not_in_range(
             &mut *con.acquire().await.context("acquire con")?,
             upstream,
             start,
@@ -190,15 +217,17 @@ impl Database {
         // Close the existing connection to ensure it does not block cleanup
         self.write().await.close().await;
 
-        // Clean up WAL files. This should happen above but sqlx does not correctly close sqlite
-        // See: https://github.com/launchbadge/sqlx/issues/2249
-        SqliteConnectOptions::default()
-            .journal_mode(SqliteJournalMode::Wal)
-            .filename(&self.path)
-            .connect()
-            .await?
-            .close()
-            .await?;
+        if let Some(path) = self.path.as_ref() {
+            // Clean up WAL files. This should happen above but sqlx does not correctly close sqlite
+            // See: https://github.com/launchbadge/sqlx/issues/2249
+            SqliteConnectOptions::default()
+                .journal_mode(SqliteJournalMode::Wal)
+                .filename(path)
+                .connect()
+                .await?
+                .close()
+                .await?;
+        }
 
         Ok(())
     }

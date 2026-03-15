@@ -3,7 +3,7 @@ use derive_more::Display;
 use serde::Serialize;
 use std::fmt::Display;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct S3ObjectId {
     pub bucket: String,
     pub key: String,
