@@ -316,21 +316,27 @@ async fn update_pending_state(
 
 #[cfg(test)]
 mod tests {
-    use super::get_pending_migrations;
+    use super::{execute_pending_migrations, get_pending_migrations};
     use crate::config::{AddressingStyle, Config, S3Secret, Upstream, UpstreamId};
     use crate::data::{S3Object, S3ObjectId};
     use crate::db::Database;
+    use crate::s3_client::client::{ObjectInfo, S3Client};
+    use crate::testing::garage::GarageInstance;
     use derive_more::Display;
     use jiff::{Span, Unit, Zoned};
     use rand::prelude::IndexedRandom;
     use rand::rngs::StdRng;
     use rand::{Rng, RngExt, SeedableRng, rng};
+    use reqwest::Client;
     use rootcause::{Report, bail};
     use std::collections::{HashMap, HashSet};
+    use std::io::Cursor;
     use std::ops::{Range, Sub};
     use std::path::Path;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::OnceCell;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display)]
     enum Tier {
         Hot,
         Warm,
@@ -338,6 +344,14 @@ mod tests {
     }
 
     impl Tier {
+        fn order(&self) -> usize {
+            match self {
+                Self::Hot => 1,
+                Self::Warm => 2,
+                Self::Cold => 3,
+            }
+        }
+
         fn max_age(&self) -> Option<Span> {
             match self {
                 Self::Hot => Some(Span::new().hours(2)),
@@ -370,6 +384,73 @@ mod tests {
                 _ => bail!("Unknown tier: '{value}'"),
             }
         }
+    }
+
+    static GARAGE_HOT: OnceCell<GarageInstance> = OnceCell::const_new();
+    static GARAGE_WARM: OnceCell<GarageInstance> = OnceCell::const_new();
+    static GARAGE_COLD: OnceCell<GarageInstance> = OnceCell::const_new();
+
+    #[derive(Debug, Clone)]
+    struct SeededObject {
+        id: S3ObjectId,
+        expected: Tier,
+        payload: Vec<u8>,
+    }
+
+    struct TierBackend {
+        upstream: Upstream,
+        client: S3Client,
+    }
+
+    #[ctor::dtor]
+    fn shutdown_garages() {
+        [
+            GARAGE_HOT.get().and_then(GarageInstance::take_container),
+            GARAGE_WARM.get().and_then(GarageInstance::take_container),
+            GARAGE_COLD.get().and_then(GarageInstance::take_container),
+        ]
+        .into_iter()
+        .flatten()
+        .for_each(GarageInstance::drop_in_new_runtime);
+    }
+
+    async fn garage_for_tier(tier: Tier) -> Result<&'static GarageInstance, Report> {
+        match tier {
+            Tier::Hot => GARAGE_HOT.get_or_try_init(GarageInstance::start).await,
+            Tier::Warm => GARAGE_WARM.get_or_try_init(GarageInstance::start).await,
+            Tier::Cold => GARAGE_COLD.get_or_try_init(GarageInstance::start).await,
+        }
+    }
+
+    async fn setup_tier_backend(tier: Tier) -> Result<TierBackend, Report> {
+        let garage = garage_for_tier(tier).await?;
+
+        let bucket = "test";
+        let bucket_id = garage.create_bucket(bucket).await?;
+        let (key_id, secret) = garage.create_key(&format!("e2e-{}", tier)).await?;
+        garage.allow_key_on_bucket(&bucket_id, &key_id).await?;
+
+        let client = S3Client::new(
+            Client::new(),
+            garage.s3_endpoint().clone(),
+            garage.region(),
+            &key_id,
+            &secret,
+        );
+
+        Ok(TierBackend {
+            upstream: Upstream {
+                name: UpstreamId(tier.to_string()),
+                order: tier.order(),
+                base_url: garage.s3_endpoint().clone(),
+                addressing_style: AddressingStyle::Path,
+                max_age: tier.max_age(),
+                s3_access_key: key_id,
+                s3_secret: S3Secret(secret),
+                region: garage.region().to_owned(),
+            },
+            client,
+        })
     }
 
     #[tokio::test]
@@ -421,6 +502,167 @@ mod tests {
 
         db.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(), Report> {
+        const TEST_OBJECT_COUNT: usize = 42;
+        let hot = setup_tier_backend(Tier::Hot).await?;
+        let warm = setup_tier_backend(Tier::Warm).await?;
+        let cold = setup_tier_backend(Tier::Cold).await?;
+
+        let mut upstreams = HashMap::new();
+        upstreams.insert(hot.upstream.name.clone(), hot.upstream.clone());
+        upstreams.insert(warm.upstream.name.clone(), warm.upstream.clone());
+        upstreams.insert(cold.upstream.name.clone(), cold.upstream.clone());
+        let config = Config::new(
+            "127.0.0.1:0".to_owned(),
+            Path::new("/tmp/").to_path_buf(),
+            upstreams,
+        )?;
+
+        let db = Database::in_memory().await?;
+        let seed = rng().next_u64();
+        println!("seed: {seed}");
+        let mut rng = StdRng::seed_from_u64(seed);
+        let now = Zoned::now();
+
+        let mut expected_pending = HashSet::new();
+        let mut seeded = Vec::new();
+
+        for source in Tier::all() {
+            let source_upstream = match source {
+                Tier::Hot => &hot.upstream.name,
+                Tier::Warm => &warm.upstream.name,
+                Tier::Cold => &cold.upstream.name,
+            };
+            let source_client = match source {
+                Tier::Hot => &hot.client,
+                Tier::Warm => &warm.client,
+                Tier::Cold => &cold.client,
+            };
+
+            for index in 0..TEST_OBJECT_COUNT {
+                let expected_tier = Tier::all()
+                    .choose(&mut rng)
+                    .copied()
+                    .expect("tier choices must not be empty");
+                let payload_len = rng.random_range(20..120);
+                let payload = (0..payload_len)
+                    .map(|_| rng.random_range(0..=255) as u8)
+                    .collect::<Vec<_>>();
+
+                let object = random_object_for_tier(
+                    &mut rng,
+                    &now,
+                    source_upstream.clone(),
+                    expected_tier,
+                    index,
+                );
+
+                source_client
+                    .put_file(
+                        &object.id,
+                        Cursor::new(payload.clone()),
+                        payload.len() as u64,
+                    )
+                    .await?;
+                db.record_creation(&object).await?;
+
+                seeded.push(SeededObject {
+                    id: object.id.clone(),
+                    expected: expected_tier,
+                    payload,
+                });
+
+                if source != expected_tier {
+                    expected_pending.insert((
+                        source_upstream.clone(),
+                        UpstreamId(expected_tier.to_string()),
+                        object.id,
+                    ));
+                }
+            }
+        }
+
+        let pending = get_pending_migrations(&config, &db, now.clone()).await?;
+        let pending_set = pending
+            .iter()
+            .map(|it| {
+                (
+                    it.source_upstream.clone(),
+                    it.target_upstream.clone(),
+                    it.object.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(pending_set, expected_pending, "pending migrations mismatch");
+
+        db.add_all_pending(&pending).await?;
+        let errors = execute_pending_migrations(pending, &config, &db).await?;
+        assert!(errors.is_empty(), "migration execution failed: {errors:?}");
+        db.delete_finished_pending().await?;
+
+        let tier_to_keys = [
+            (
+                Tier::Hot,
+                keys_in_bucket(hot.client.list_objects("test").await?),
+            ),
+            (
+                Tier::Warm,
+                keys_in_bucket(warm.client.list_objects("test").await?),
+            ),
+            (
+                Tier::Cold,
+                keys_in_bucket(cold.client.list_objects("test").await?),
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<Tier, HashSet<String>>>();
+
+        for object in &seeded {
+            let expected_upstream = UpstreamId(object.expected.to_string());
+            assert_eq!(
+                db.get_upstream(&object.id).await?,
+                Some(expected_upstream),
+                "db assignment mismatch for {}",
+                object.id
+            );
+
+            for tier in Tier::all() {
+                let keys = tier_to_keys.get(&tier).unwrap();
+                if tier == object.expected {
+                    assert!(keys.contains(&object.id.key));
+                } else {
+                    assert!(!keys.contains(&object.id.key));
+                }
+            }
+
+            let owner_client = match object.expected {
+                Tier::Hot => &hot.client,
+                Tier::Warm => &warm.client,
+                Tier::Cold => &cold.client,
+            };
+            let actual_payload = read_object(owner_client, &object.id).await?;
+            assert_eq!(actual_payload, object.payload);
+        }
+
+        let left_pending = db.get_pending_with_state(None).await?;
+        assert!(left_pending.is_empty());
+
+        db.close().await?;
+        Ok(())
+    }
+
+    fn keys_in_bucket(objects: Vec<ObjectInfo>) -> HashSet<String> {
+        objects.into_iter().map(|it| it.key).collect()
+    }
+
+    async fn read_object(client: &S3Client, id: &S3ObjectId) -> Result<Vec<u8>, Report> {
+        let (_, mut stream) = client.get_file(id).await?;
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).await?;
+        Ok(data)
     }
 
     fn random_object_for_tier(

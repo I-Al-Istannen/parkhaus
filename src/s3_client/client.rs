@@ -6,7 +6,6 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
 use reqwest::{Client, Method, Response, StatusCode};
-use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use serde::Deserialize;
@@ -165,40 +164,6 @@ impl S3Client {
         let bytes_stream = response.bytes_stream().map_err(std::io::Error::other);
 
         Ok((content_length, StreamReader::new(bytes_stream)))
-    }
-
-    /// Only works if the server supports the header and the object was uploaded with checksums
-    async fn get_object_sha256(&self, id: &S3ObjectId) -> Result<String, Report> {
-        let url = self.object_url(id)?;
-        let signed_headers = self.signing.sign(
-            SignRequest::now(Method::HEAD, &url)
-                .with_extra_headers(&[("x-amz-checksum-mode", "ENABLED")]),
-        )?;
-        let response = self
-            .client
-            .head(url)
-            .headers(signed_headers)
-            .send()
-            .await
-            .context("S3 request failed")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(report!("S3 returned {status}").attach(format!("object: {id:?}")));
-        }
-
-        let checksum_header = response
-            .headers()
-            .get("x-amz-checksum-sha256")
-            .context("missing checksum header")
-            .attach(format!("object: {id:?}"))?;
-        let checksum = checksum_header
-            .to_str()
-            .context("invalid checksum header value")
-            .attach(format!("header: {:?}", checksum_header))
-            .attach(format!("object: {id:?}"))?;
-
-        Ok(checksum.to_string())
     }
 
     /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
@@ -396,14 +361,7 @@ mod tests {
     #[ctor::dtor]
     fn shutdown_garage() {
         if let Some(container) = GARAGE.get().and_then(GarageInstance::take_container) {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("teardown runtime")
-                .block_on(async move {
-                    drop(container);
-                    tokio::task::yield_now().await;
-                });
+            GarageInstance::drop_in_new_runtime(container);
         }
     }
 
@@ -464,7 +422,14 @@ mod tests {
             .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
             .await?;
 
-        let actual_sha256 = client.get_object_sha256(&id).await?;
+        let mut retrieved_body = Vec::new();
+        client
+            .get_file(&id)
+            .await?
+            .1
+            .read_to_end(&mut retrieved_body)
+            .await?;
+        let actual_sha256 = STANDARD.encode(sha2::Sha256::digest(&retrieved_body));
         let expected_checksum = STANDARD.encode(sha2::Sha256::digest(payload));
 
         assert_eq!(actual_sha256, expected_checksum);
