@@ -130,6 +130,7 @@ impl Database {
     }
 
     /// Adds all migrations in a transaction (to speed up database operations).
+    /// Duplicates are silently ignored and their state is not adjusted.
     pub async fn add_all_pending(&self, migrations: &[PendingMigration]) -> Result<(), Report> {
         let con = self.write().await;
         let mut transaction = con.begin().await.context("begin transaction")?;
@@ -169,6 +170,11 @@ impl Database {
             object,
         )
         .await
+    }
+
+    pub async fn delete_finished_pending(&self) -> Result<(), Report> {
+        let con = self.write().await;
+        migrate::delete_finished_pending(&mut *con.acquire().await.context("acquire con")?).await
     }
 
     pub async fn get_pending_with_state(

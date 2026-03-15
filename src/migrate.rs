@@ -4,10 +4,17 @@ use crate::db::Database;
 use crate::s3_client::client::S3Client;
 use futures_util::StreamExt;
 use jiff::{Timestamp, Zoned};
+use rand::prelude::IndexedRandom;
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::select;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
+
+const SAMPLE_ERRORS: usize = 3;
 
 struct SortedUpstreams<'a> {
     upstreams: Vec<&'a Upstream>,
@@ -30,9 +37,71 @@ impl<'a> SortedUpstreams<'a> {
     }
 }
 
+pub async fn migration_task(config: Config, db: Database, shutdown: CancellationToken) {
+    let work = async {
+        loop {
+            // Only check sometimes :)
+            tokio::time::sleep(Duration::from_mins(5)).await;
+
+            debug!("Computing pending migrations");
+            if let Err(error) = compute_pending(&config, &db).await {
+                error!(%error, "Failed to compute new pending migrations");
+            }
+            match execute_pending(&config, &db).await {
+                Err(error) => error!(%error, "Failed to execute pending migrations"),
+                Ok(errors) => {
+                    error!(
+                        error_count = errors.len(),
+                        "Failed to perform {} migrations. Sampling {SAMPLE_ERRORS} random errors",
+                        errors.len()
+                    );
+                    for (index, error) in errors.sample(&mut rand::rng(), SAMPLE_ERRORS).enumerate()
+                    {
+                        error!(%index, %error, "Error")
+                    }
+                }
+            }
+            if let Err(error) = db.delete_finished_pending().await {
+                error!(%error, "Failed to delete finished pending migrations");
+            }
+        }
+    };
+    select!(
+        _ = work => {
+            error!("Migration task finished unexpectedly");
+        },
+        _ = shutdown.cancelled() => {
+            info!("Cancelling migration task due to imminent shutdown")
+        }
+    )
+}
+
+async fn compute_pending(config: &Config, db: &Database) -> Result<(), Report> {
+    let pending = get_pending_migrations(config, db)
+        .await
+        .context("failed to retrieve pending migrations")?;
+    db.add_all_pending(&pending)
+        .await
+        .context("failed to add pending migrations to database")?;
+
+    Ok::<(), Report>(())
+}
+
+async fn execute_pending(config: &Config, db: &Database) -> Result<Vec<Report>, Report> {
+    let pending = db
+        .get_pending_with_state(None)
+        .await
+        .context("failed to retrieve pending migrations")?;
+    let errors = execute_pending_migrations(pending, config, db)
+        .await
+        .context("failed to execute pending migrations")?;
+
+    Ok(errors)
+}
+
 pub async fn get_pending_migrations(
     config: &Config,
-    db: Database,
+    db: &Database,
 ) -> Result<Vec<PendingMigration>, Report> {
     let now = Zoned::now();
     let sorted_upstreams = SortedUpstreams::new(now.clone(), config.upstreams.values());
@@ -96,7 +165,7 @@ fn find_correct_upstream_for_object<'u>(
 pub async fn execute_pending_migrations(
     pending: Vec<PendingMigration>,
     config: &Config,
-    db: Database,
+    db: &Database,
 ) -> Result<Vec<Report>, Report> {
     let client = reqwest::Client::new();
     let upstream_to_client = config
@@ -107,7 +176,7 @@ pub async fn execute_pending_migrations(
 
     let errors = futures_util::stream::iter(pending)
         .then(|action| async {
-            execute_pending_migration(action, &upstream_to_client, db.clone())
+            execute_pending_migration(action, &upstream_to_client, db)
                 .await
                 .context("failed to execute a pending migration")
                 .into_report()
@@ -125,7 +194,7 @@ pub async fn execute_pending_migrations(
 async fn execute_pending_migration(
     action: PendingMigration,
     upstream_to_client: &HashMap<UpstreamId, S3Client>,
-    db: Database,
+    db: &Database,
 ) -> Result<(), Report> {
     let PendingMigration {
         source_upstream: source,
@@ -150,10 +219,10 @@ async fn execute_pending_migration(
         .attach(format!("object: {object}"))?;
 
     if matches!(state, MigrationState::Pending) {
-        upload_object(&db, source_client, target_client, object, source, target).await?;
+        upload_object(db, source_client, target_client, object, source, target).await?;
     }
 
-    delete_object(&db, source_client, &action).await?;
+    delete_object(db, source_client, &action).await?;
 
     Ok(())
 }

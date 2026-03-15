@@ -56,8 +56,7 @@ pub(super) async fn add_pending(
             (source_upstream, target_upstream, bucket, key, state)
         VALUES
             ($1, $2, $3, $4, $5)
-        ON CONFLICT DO UPDATE SET
-            state = $5
+        ON CONFLICT DO NOTHING
         "#,
         migration.source_upstream,
         migration.target_upstream,
@@ -128,6 +127,20 @@ pub(super) async fn delete_pending(
     .context("failed to delete pending migration")
     .attach(format!("upstream: {source_upstream}"))
     .attach(format!("object: {object}"))?;
+
+    Ok(())
+}
+
+pub(super) async fn delete_finished_pending(con: &mut SqliteConnection) -> Result<(), Report> {
+    query!(
+        r#"
+        DELETE FROM PendingMigrations
+        WHERE state = 'Finished'
+        "#
+    )
+    .execute(con)
+    .await
+    .context("failed to delete finished pending migrations")?;
 
     Ok(())
 }

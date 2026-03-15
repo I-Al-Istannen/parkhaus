@@ -13,10 +13,9 @@ mod toml_utils;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::data::S3ObjectId;
 use crate::db::Database;
 use crate::import::import;
-use crate::s3_client::client::S3Client;
+use crate::migrate::migration_task;
 use axum::Router;
 use axum::routing::any;
 use clap::{Parser, Subcommand};
@@ -25,10 +24,10 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use url::Url;
 
 type AppResult<T> = Result<T, Report>;
 
@@ -77,23 +76,6 @@ async fn run() -> AppResult<()> {
         .context("failed to initialize database")
         .attach(format!("path: {}", &config.db_path.display()))?;
 
-    let s3 = S3Client::new(
-        Client::new(),
-        Url::parse("http://localhost:9090")?,
-        "us-east-1",
-        "adsds",
-        "dsdsd",
-    );
-    s3.put_file(
-        &S3ObjectId {
-            bucket: "test-put-bucket".to_string(),
-            key: "test".to_string(),
-        },
-        "test!!".as_bytes(),
-        0,
-    )
-    .await?;
-
     let res = match cli.command {
         Command::Serve => serve(config, db.clone()).await,
         Command::Import { import_time } => import(config, db.clone(), import_time).await,
@@ -116,6 +98,14 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
                 .compact(),
         )
         .init();
+
+    let shutdown_token = CancellationToken::new();
+    // The poor man's task scheduler!
+    tokio::spawn(migration_task(
+        (*config).clone(),
+        db.clone(),
+        shutdown_token.clone(),
+    ));
 
     let app_state = AppState {
         config: Arc::clone(&config),
@@ -140,14 +130,15 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
     info!(listen = %config.listen, "proxy listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_token.clone()))
         .await
         .context("axum server failed")?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(token: CancellationToken) {
     if signal::ctrl_c().await.is_ok() {
         info!("received ctrl+c, shutting down");
+        token.cancel();
     }
 }
