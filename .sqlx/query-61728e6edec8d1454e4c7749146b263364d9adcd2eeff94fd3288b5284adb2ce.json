@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        DELETE FROM PendingMigrations\n        WHERE state = 'Finished'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "61728e6edec8d1454e4c7749146b263364d9adcd2eeff94fd3288b5284adb2ce"
+}

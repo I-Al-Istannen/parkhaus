@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT bucket, key, last_modified\n        FROM objects\n        WHERE assigned_upstream = ? AND last_modified >= ? AND last_modified <= ?\n        ",
+  "query": "\n        SELECT bucket, key, last_modified\n        FROM objects\n        WHERE assigned_upstream = ? AND (last_modified < ? OR last_modified > ?)\n        ",
   "describe": {
     "columns": [
       {
@@ -28,5 +28,5 @@
       false
     ]
   },
-  "hash": "66d247b0aa0ce72fae6ccff9ec0ba298c29b3b66fe27edcbfde10a1e640fad9a"
+  "hash": "bfde9ded41b1df4e2024608427af6698902dd4f53ad1e67ea3048be7ba9c2274"
 }
