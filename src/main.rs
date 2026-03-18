@@ -32,9 +32,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 type AppResult<T> = Result<T, Report>;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(author, version, about, arg_required_else_help = true)]
 struct Cli {
-    #[arg(long, default_value = "config.toml")]
+    #[arg(long, short)]
     config: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -45,6 +45,7 @@ struct Cli {
 enum Command {
     /// Start the proxy server.
     Serve,
+    /// Import objects from all configured upstreams into the local database.
     Import {
         /// Optional timestamp to use as the last modified time for all imported objects.
         /// If not provided, the last modified time from S3 will be used.
