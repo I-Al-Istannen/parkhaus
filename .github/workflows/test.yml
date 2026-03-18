@@ -1,0 +1,30 @@
+name: Tests
+on:
+  push:
+
+jobs:
+  run-cargo-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+      - name: Install rust
+        run: rustup update stable && rustup default stable
+
+      - name: Run tests
+        run: cargo test
+
+  run-e2e-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+      - name: Install rust
+        run: rustup update stable && rustup default stable
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build
+        run: cargo build --release
+      - name: Run test
+        run: uv run integration-tests/e2e.py
