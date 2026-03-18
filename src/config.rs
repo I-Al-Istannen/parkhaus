@@ -200,7 +200,10 @@ struct RawUpstream {
 }
 
 pub fn load(path: &Path) -> Result<Config, Report> {
-    let raw: RawConfig = toml_utils::load_from_file(path).context("failed to load config")?;
+    let raw: RawConfig = toml_utils::load_from_file(path)
+        .context("failed to load config")
+        .attach(format!("hint: tried '{}'", path.display()))
+        .attach("hint: use '--config <path>' to specify a different config file")?;
 
     let parsed_upstreams = raw
         .upstreams
