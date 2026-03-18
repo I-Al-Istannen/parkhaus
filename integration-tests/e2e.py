@@ -394,6 +394,10 @@ def render_config(temp_dir: Path, started_containers: list[Upstream]):
 @contextlib.contextmanager
 def start_backend(temp_dir: Path, config_path: Path):
     repo_root = Path(__file__).resolve().parents[1]
+
+    info("Building backend...")
+    subprocess.check_call(["cargo", "build", "--release"])
+
     logfile = temp_dir / "backend.log"
     backend_process = subprocess.Popen(
         ["cargo", "run", "--release", "--", "--config", str(config_path), "serve"],
