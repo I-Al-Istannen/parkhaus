@@ -1859,6 +1859,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "parkhaus"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "ctor",
+ "derive_more",
+ "dialoguer",
+ "futures-util",
+ "hex",
+ "hmac",
+ "jiff",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.10.0",
+ "reqwest",
+ "rootcause",
+ "rootcause-tracing",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "testcontainers",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2538,40 +2572,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s3-tiering-proxy"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "clap",
- "ctor",
- "derive_more",
- "dialoguer",
- "futures-util",
- "hex",
- "hmac",
- "jiff",
- "percent-encoding",
- "quick-xml",
- "rand 0.10.0",
- "reqwest",
- "rootcause",
- "rootcause-tracing",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "testcontainers",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-indicatif",
- "tracing-subscriber",
- "url",
-]
 
 [[package]]
 name = "same-file"
