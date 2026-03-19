@@ -10,7 +10,7 @@ use rootcause::Report;
 use rootcause::hooks::Hooks;
 use rootcause::hooks::builtin_hooks::report_formatter::DefaultReportFormatter;
 use rootcause::prelude::ResultExt;
-use rootcause_tracing::{RootcauseLayer, SpanCollector};
+use rootcause_tracing::RootcauseLayer;
 use std::sync::Arc;
 use tracing::{Instrument, Span, info, info_span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -35,7 +35,6 @@ pub async fn import(
         .init();
     Hooks::new()
         .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
-        .report_creation_hook(SpanCollector::new())
         .install()
         .context("failed to install hooks")?;
 
