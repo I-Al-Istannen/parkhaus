@@ -19,8 +19,11 @@ As of now there is no promotion rule besides editing the database, but I want
 to explore moving frequently accessed objects in the future :)
 
 <div align="center">
-  <img align="middle" src="https://github.com/I-Al-Istannen/parkhaus/blob/master/assets/architecture.svg?raw=true" height="200">
-  <!-- <img align="middle" src="assets/architecture.svg" height="200">-->
+   <picture height="200">
+     <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-dark.svg">
+     <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-light.svg">
+     <img alt="Fallback image description" src="./assets/architecture-light.svg">
+   </picture>
 </div>
 
 ## Features
@@ -50,7 +53,7 @@ to explore moving frequently accessed objects in the future :)
 
 ## Config format
 ```toml
-listen = "127.0.0.1:8080"
+listen = "0.0.0.0:8080"
 db_path = "./tiering-test.db"
 
 [upstreams.hot]                     # named hot, name is arbitrary
