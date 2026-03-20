@@ -443,6 +443,7 @@ mod tests {
             garage.region(),
             &key_id,
             &secret,
+            AddressingStyle::Path,
         );
 
         Ok(TierBackend {

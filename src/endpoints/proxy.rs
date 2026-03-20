@@ -31,7 +31,7 @@ pub async fn proxy_request(
         let bucket = req.uri().path().trim_start_matches('/');
         debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
 
-        let mut upstream_url = upstream.format_url(bucket, None);
+        let mut upstream_url = upstream.format_url(bucket, None)?;
         upstream_url.url.set_query(req.uri().query());
         return forward_request(&state, upstream, upstream_url, req, nop).await;
     }
@@ -83,7 +83,7 @@ pub async fn proxy_request(
     forward_request(
         &state,
         upstream,
-        upstream.format_url(&object_id.bucket, Some(&object_id.key)),
+        upstream.format_url(&object_id.bucket, Some(&object_id.key))?,
         req,
         on_success,
     )

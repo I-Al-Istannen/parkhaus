@@ -59,13 +59,7 @@ async fn import_upstream(
     upstream: &Upstream,
     import_time: Option<jiff::Timestamp>,
 ) -> Result<(), Report> {
-    let s3 = S3Client::new(
-        client,
-        upstream.base_url.clone(),
-        "garage",
-        &upstream.s3_access_key,
-        &upstream.s3_secret.0,
-    );
+    let s3 = S3Client::for_upstream(client, upstream);
 
     let buckets = s3.list_buckets().await?;
     let buckets_span = Span::current();
@@ -175,6 +169,7 @@ mod tests {
             garage.region(),
             &key_id,
             &key_secret,
+            AddressingStyle::Path,
         );
 
         let bucket_names = (0..5).map(|i| format!("bucket-{i}")).collect::<Vec<_>>();

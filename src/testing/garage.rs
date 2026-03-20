@@ -71,11 +71,11 @@ rpc_secret      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 [s3_api]
 s3_region    = "garage"
 api_bind_addr = "[::]:3900"
-root_domain   = ".s3.garage.localhost"
+root_domain   = ".localhost"
 
 [s3_web]
 bind_addr    = "[::]:3902"
-root_domain  = ".web.garage.localhost"
+root_domain  = ".localhost"
 index        = "index.html"
 
 [admin]
@@ -173,10 +173,6 @@ impl GarageInstance {
     /// Use this when you started the container yourself (e.g. to share it
     /// across tests with `OnceCell`).
     pub async fn init(container: ContainerAsync<Garage>) -> Result<Self, Report> {
-        let host = container
-            .get_host()
-            .await
-            .context("failed to resolve Garage host")?;
         let s3_port = container
             .get_host_port_ipv4(S3_API_PORT)
             .await
@@ -186,10 +182,10 @@ impl GarageInstance {
             .await
             .context("failed to resolve admin port")?;
 
-        let s3_endpoint: Url = format!("http://{host}:{s3_port}")
+        let s3_endpoint: Url = format!("http://localhost:{s3_port}")
             .parse()
             .context("parse s3 endpoint")?;
-        let admin_endpoint: Url = format!("http://{host}:{admin_port}")
+        let admin_endpoint: Url = format!("http://localhost:{admin_port}")
             .parse()
             .context("parse admin endpoint")?;
 

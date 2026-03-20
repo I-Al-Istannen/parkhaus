@@ -1,6 +1,6 @@
 use super::crypto::{SignRequest, SigningConfig, StreamingSignRequest};
-use crate::config::Upstream;
-use crate::data::S3ObjectId;
+use crate::config::{AddressingStyle, Upstream};
+use crate::data::{ForwardObjectUrl, S3ObjectId};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
@@ -21,6 +21,7 @@ pub struct S3Client {
     client: Client,
     signing: SigningConfig,
     endpoint: Url,
+    addressing_style: AddressingStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +38,19 @@ pub struct ObjectInfo {
 }
 
 impl S3Client {
-    pub fn new(client: Client, endpoint: Url, region: &str, key_id: &str, secret: &str) -> Self {
+    pub fn new(
+        client: Client,
+        endpoint: Url,
+        region: &str,
+        key_id: &str,
+        secret: &str,
+        addressing_style: AddressingStyle,
+    ) -> Self {
         Self {
             client,
             signing: SigningConfig::new(key_id, secret, region),
             endpoint,
+            addressing_style,
         }
     }
 
@@ -52,13 +61,14 @@ impl S3Client {
             &upstream.region,
             &upstream.s3_access_key,
             &upstream.s3_secret.0,
+            upstream.addressing_style.clone(),
         )
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Report> {
         // we just assume this is not paginated, screw it.
         let body = self
-            .signed_get(&self.endpoint, &[])
+            .signed_get(&ForwardObjectUrl::no_host(self.endpoint.clone()), &[])
             .await
             .context("failed to list buckets")?
             .text()
@@ -122,17 +132,17 @@ impl S3Client {
         data: impl AsyncRead + Unpin + Send + 'static,
         content_length: u64,
     ) -> Result<(), Report> {
-        let url = self.object_url(id)?;
+        let target = self.object_url(id)?;
 
         let (signed_headers, chunk_signer) = self
             .signing
-            .sign_streaming(StreamingSignRequest::now(&url, content_length))?;
+            .sign_streaming(StreamingSignRequest::now(&target, content_length))?;
 
         let body = reqwest::Body::wrap_stream(chunked_upload_stream(data, chunk_signer));
 
         let response = self
             .client
-            .put(url.clone())
+            .put(target.url.clone())
             .headers(signed_headers)
             .body(body)
             .send()
@@ -146,7 +156,7 @@ impl S3Client {
             return Err(report!("failed S3 request")
                 .attach("method: streaming PUT")
                 .attach(format!("status: {status}"))
-                .attach(format!("url: {url}"))
+                .attach(format!("url: {}", target.url))
                 .attach(format!("response body: {text}")));
         }
 
@@ -169,17 +179,19 @@ impl S3Client {
     /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
     /// `true` if it was deleted.
     pub async fn delete_file(&self, id: &S3ObjectId) -> Result<bool, Report> {
-        let url = self.object_url(id)?;
-        let signed_headers = self.signing.sign(SignRequest::now(Method::DELETE, &url))?;
+        let target = self.object_url(id)?;
+        let signed_headers = self
+            .signing
+            .sign(SignRequest::now(Method::DELETE, &target))?;
         let response = self
             .client
-            .delete(url)
+            .delete(target.url.clone())
             .headers(signed_headers)
             .send()
             .await
             .context("DELETE request failed")
             .attach(format!("object: {id}"))
-            .attach(format!("url: {}", self.endpoint))?;
+            .attach(format!("url: {}", target.url))?;
 
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
@@ -198,15 +210,16 @@ impl S3Client {
 
     async fn signed_request(
         &self,
-        url: &Url,
+        target: &ForwardObjectUrl,
         method: Method,
         extra_headers: &[(&str, &str)],
     ) -> Result<Response, Report> {
         // S3 SigV4 signed GET with an explicit payload hash header.
         // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+        let url = &target.url;
         let signed_headers = self
             .signing
-            .sign(SignRequest::now(method.clone(), url).with_extra_headers(extra_headers))?;
+            .sign(SignRequest::now(method.clone(), target).with_extra_headers(extra_headers))?;
         let response = self
             .client
             .request(method.clone(), url.clone())
@@ -234,10 +247,11 @@ impl S3Client {
 
     async fn signed_get(
         &self,
-        url: &Url,
+        target: &ForwardObjectUrl,
         extra_headers: &[(&str, &str)],
     ) -> Result<Response, Report> {
-        self.signed_request(url, Method::GET, extra_headers).await
+        self.signed_request(target, Method::GET, extra_headers)
+            .await
     }
 
     /// https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
@@ -245,11 +259,11 @@ impl S3Client {
         &self,
         bucket: &str,
         continuation_token: &Option<String>,
-    ) -> Result<Url, Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(bucket);
+    ) -> Result<ForwardObjectUrl, Report> {
+        let mut target = self
+            .addressing_style
+            .format_bucket_url(&self.endpoint, bucket)?;
+        let url = &mut target.url;
 
         // V2 api
         url.query_pairs_mut().append_pair("list-type", "2");
@@ -259,16 +273,13 @@ impl S3Client {
         }
         url.query_pairs_mut().append_pair("max-keys", "1000");
 
-        Ok(url)
+        Ok(target)
     }
 
-    fn object_url(&self, id: &S3ObjectId) -> Result<Url, Report> {
-        let mut url = self.endpoint.clone();
-        url.path_segments_mut()
-            .map_err(|_| report!("endpoint URL cannot be a base URL"))?
-            .push(&id.bucket)
-            .extend(id.key.split('/'));
-        Ok(url)
+    fn object_url(&self, id: &S3ObjectId) -> Result<ForwardObjectUrl, Report> {
+        self.addressing_style
+            .format_url(&self.endpoint, &id.bucket, Some(&id.key))
+            .map_err(Report::into_dynamic)
     }
 }
 
@@ -352,6 +363,7 @@ async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 mod tests {
     use super::*;
     use crate::testing::garage::GarageInstance;
+    use rootcause::option_ext::OptionExt;
     use std::collections::BTreeMap;
     use std::io::Cursor;
     use tokio::sync::OnceCell;
@@ -379,6 +391,14 @@ mod tests {
 
     /// Create a bucket + key with full permissions, return a ready-to-use client.
     async fn setup_bucket(g: &GarageInstance, bucket: &str) -> Result<S3Client, Report> {
+        setup_bucket_with_style(g, bucket, AddressingStyle::Path).await
+    }
+
+    async fn setup_bucket_with_style(
+        g: &GarageInstance,
+        bucket: &str,
+        style: AddressingStyle,
+    ) -> Result<S3Client, Report> {
         let bucket_id = g.create_bucket(bucket).await?;
         let (key_id, secret) = g.create_key(bucket).await?;
         g.allow_key_on_bucket(&bucket_id, &key_id).await?;
@@ -388,6 +408,7 @@ mod tests {
             g.region(),
             &key_id,
             &secret,
+            style,
         ))
     }
 
@@ -434,8 +455,11 @@ mod tests {
 
         assert_eq!(actual_sha256, expected_checksum);
 
-        let get_url = client.object_url(&id)?;
-        let body = client.signed_get(&get_url, &[]).await?.text().await?;
+        let body = client
+            .signed_get(&client.object_url(&id)?, &[])
+            .await?
+            .text()
+            .await?;
         assert_eq!(body, "Hello, chunked S3 upload!");
         Ok(())
     }
@@ -483,13 +507,13 @@ mod tests {
             .put_file(&id, Cursor::new(payload.clone()), payload.len() as u64)
             .await?;
 
-        let get_url = client.object_url(&id)?;
+        let target = client.object_url(&id)?;
         let signed_headers = client
             .signing
-            .sign(SignRequest::now(Method::GET, &get_url))?;
+            .sign(SignRequest::now(Method::GET, &target))?;
         let resp = client
             .client
-            .get(get_url)
+            .get(target.url)
             .headers(signed_headers)
             .send()
             .await?;
@@ -512,9 +536,48 @@ mod tests {
 
         client.put_file(&id, Cursor::new(vec![]), 0).await?;
 
-        let get_url = client.object_url(&id)?;
-        let body = client.signed_get(&get_url, &[]).await?.text().await?;
+        let target = client.object_url(&id)?;
+        let body = client.signed_get(&target, &[]).await?.text().await?;
         assert_eq!(body, "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_virtual_hosted_put_get_and_list() -> Result<(), Report> {
+        let g = garage().await?;
+        let bucket = bucket_name("test-virtual-hosted-put-get-and-list");
+        let client = setup_bucket_with_style(g, &bucket, AddressingStyle::VirtualHosted).await?;
+
+        let payload = b"virtual hosted upload";
+        let id = S3ObjectId {
+            bucket: bucket.clone(),
+            key: "nested/file.txt".into(),
+        };
+
+        client
+            .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+            .await?;
+
+        let target = client.object_url(&id)?;
+        let get_url = target.url;
+        let host_header = target.host_header;
+        assert_eq!(get_url.path(), "/nested/file.txt");
+        let expected_host = format!(
+            "{}.{}",
+            bucket,
+            g.s3_endpoint()
+                .host_str()
+                .context("missing S3 endpoint host")?
+        );
+        assert_eq!(host_header.as_deref(), Some(expected_host.as_str()));
+
+        let mut body = Vec::new();
+        client.get_file(&id).await?.1.read_to_end(&mut body).await?;
+        assert_eq!(body, payload);
+
+        let objects = client.list_objects(&bucket).await?;
+        assert!(objects.iter().any(|it| it.key == id.key));
+
         Ok(())
     }
 
@@ -538,6 +601,7 @@ mod tests {
             g.region(),
             &key_id,
             &secret,
+            AddressingStyle::Path,
         );
 
         let bucket_names = client
@@ -631,16 +695,51 @@ mod tests {
             g.region(),
             "dummy-key",
             "dummy-secret",
+            AddressingStyle::Path,
         );
-        let url = client.list_objects_url("bucket-name", &Some("next token/+".to_string()))?;
+        let target = client.list_objects_url("bucket-name", &Some("next token/+".to_string()))?;
+        let url = target.url;
+        let host_header = target.host_header;
 
         assert_eq!(url.path(), "/bucket-name");
+        assert_eq!(host_header, None);
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
         assert_eq!(query.get("list-type"), Some(&"2".to_string()));
         assert_eq!(
             query.get("continuation-token"),
             Some(&"next token/+".to_string())
         );
+        assert_eq!(query.get("max-keys"), Some(&"1000".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_url_virtual_hosted() -> Result<(), Report> {
+        let g = garage().await?;
+        let client = S3Client::new(
+            Client::new(),
+            g.s3_endpoint().clone(),
+            g.region(),
+            "dummy-key",
+            "dummy-secret",
+            AddressingStyle::VirtualHosted,
+        );
+
+        let target = client.list_objects_url("bucket-name", &None)?;
+        let url = target.url;
+        let host_header = target.host_header;
+
+        assert_eq!(url.path(), "/");
+        let expected_host = format!(
+            "bucket-name.{}",
+            g.s3_endpoint()
+                .host_str()
+                .context("missing S3 endpoint host")?
+        );
+        assert_eq!(host_header.as_deref(), Some(expected_host.as_str()));
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        assert_eq!(query.get("list-type"), Some(&"2".to_string()));
         assert_eq!(query.get("max-keys"), Some(&"1000".to_string()));
 
         Ok(())

@@ -1,3 +1,4 @@
+use crate::data::ForwardObjectUrl;
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -119,25 +120,25 @@ impl ChunkSigner {
 
 pub struct SignRequest<'a> {
     method: Method,
-    url: &'a Url,
+    target: &'a ForwardObjectUrl,
     payload_hash: &'a str,
     current_time: Timestamp,
     extra_headers: &'a [(&'a str, &'a str)],
 }
 
 impl<'a> SignRequest<'a> {
-    pub fn new(method: Method, url: &'a Url, current_time: Timestamp) -> Self {
+    pub fn new(method: Method, target: &'a ForwardObjectUrl, current_time: Timestamp) -> Self {
         Self {
             method,
-            url,
+            target,
             payload_hash: EMPTY_SHA256,
             current_time,
             extra_headers: &[],
         }
     }
 
-    pub fn now(method: Method, url: &'a Url) -> Self {
-        Self::new(method, url, Timestamp::now())
+    pub fn now(method: Method, target: &'a ForwardObjectUrl) -> Self {
+        Self::new(method, target, Timestamp::now())
     }
 
     pub fn with_payload_hash(mut self, payload_hash: &'a str) -> Self {
@@ -152,22 +153,26 @@ impl<'a> SignRequest<'a> {
 }
 
 pub struct StreamingSignRequest<'a> {
-    url: &'a Url,
+    target: &'a ForwardObjectUrl,
     decoded_content_length: u64,
     current_time: Timestamp,
 }
 
 impl<'a> StreamingSignRequest<'a> {
-    pub fn new(url: &'a Url, decoded_content_length: u64, current_time: Timestamp) -> Self {
+    pub fn new(
+        target: &'a ForwardObjectUrl,
+        decoded_content_length: u64,
+        current_time: Timestamp,
+    ) -> Self {
         Self {
-            url,
+            target,
             decoded_content_length,
             current_time,
         }
     }
 
-    pub fn now(url: &'a Url, decoded_content_length: u64) -> Self {
-        Self::new(url, decoded_content_length, Timestamp::now())
+    pub fn now(target: &'a ForwardObjectUrl, decoded_content_length: u64) -> Self {
+        Self::new(target, decoded_content_length, Timestamp::now())
     }
 }
 
@@ -202,7 +207,7 @@ impl SigningConfig {
     ) -> Result<(HeaderMap, ChunkSigner), Report> {
         let decoded_len_str = request.decoded_content_length.to_string();
         let signed = self.sign_impl(
-            SignRequest::new(Method::PUT, request.url, request.current_time)
+            SignRequest::new(Method::PUT, request.target, request.current_time)
                 .with_payload_hash(STREAMING_PAYLOAD_TRAILER_HASH)
                 .with_extra_headers(&[
                     ("content-encoding", "aws-chunked"),
@@ -227,17 +232,23 @@ impl SigningConfig {
         let amz_date = request.current_time.strftime("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = request.current_time.strftime("%Y%m%d").to_string();
 
-        let host = request.url.host_str().context("URL must have a host")?;
-
-        // Include the origin if it is not the default port for the scheme
-        let host_header = match request.url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
+        let host_header = if let Some(host_header) = &request.target.host_header {
+            host_header.to_owned()
+        } else {
+            let host = request
+                .target
+                .url
+                .host_str()
+                .context("URL must have a host")?;
+            match request.target.url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            }
         };
 
         let (canonical_request, signed_headers) = build_canonical_request(
             request.method.as_str(),
-            request.url,
+            &request.target.url,
             &host_header,
             &amz_date,
             request.payload_hash,
@@ -545,7 +556,8 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
+        let target = ForwardObjectUrl::no_host(url.clone());
+        let signed = signing.sign(SignRequest::new(Method::GET, &target, ts))?;
 
         assert_eq!(
             signed.get("host").context("expected host header")?,
@@ -581,7 +593,8 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
+        let target = ForwardObjectUrl::no_host(url.clone());
+        let signed = signing.sign(SignRequest::new(Method::GET, &target, ts))?;
 
         assert!(
             !signed
@@ -604,11 +617,29 @@ host;x-amz-content-sha256;x-amz-date
         let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
         let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
 
-        let signed = signing.sign(SignRequest::new(Method::GET, &url, ts))?;
+        let target = ForwardObjectUrl::no_host(url.clone());
+        let signed = signing.sign(SignRequest::new(Method::GET, &target, ts))?;
 
         assert_eq!(
             signed.get("host").context("expected host header")?,
             "localhost:9000"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sign_with_explicit_host_override() -> Result<(), Report> {
+        let url = Url::parse("https://localhost:9000/bucket")?;
+        let ts: Timestamp = EXAMPLE_AMZ_DATE.parse()?;
+        let signing = SigningConfig::new(EXAMPLE_KEY_ID, EXAMPLE_SECRET, EXAMPLE_REGION);
+        let target = ForwardObjectUrl::with_host(url.clone(), "bucket.s3.local".to_string());
+
+        let signed = signing.sign(SignRequest::new(Method::GET, &target, ts))?;
+
+        assert_eq!(
+            signed.get("host").context("expected host header")?,
+            "bucket.s3.local"
         );
 
         Ok(())

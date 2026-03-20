@@ -24,6 +24,60 @@ pub enum AddressingStyle {
     VirtualHostedResolveDns,
 }
 
+impl AddressingStyle {
+    pub fn format_url(
+        &self,
+        base_url: &Url,
+        bucket: &str,
+        key: Option<&str>,
+    ) -> Result<ForwardObjectUrl, Report> {
+        let mut url = base_url.clone();
+        let host = base_url.host_str().ok_or_else(|| {
+            report!("base URL must have a host").attach(format!("url: {base_url}"))
+        })?;
+        let host = format!("{bucket}.{host}");
+        let mut segments = url.path_segments_mut().map_err(|()| {
+            report!("base URL cannot be cannot-be-a-base").attach(format!("url: {base_url}"))
+        })?;
+
+        Ok(match self {
+            Self::Path => {
+                segments.push(bucket);
+                if let Some(key) = key {
+                    segments.extend(key.split('/'));
+                }
+                drop(segments);
+                ForwardObjectUrl::no_host(url)
+            }
+            Self::VirtualHosted => {
+                if let Some(key) = key {
+                    segments.extend(key.split('/'));
+                }
+                drop(segments);
+                ForwardObjectUrl::with_host(url, host)
+            }
+            Self::VirtualHostedResolveDns => {
+                if let Some(key) = key {
+                    segments.extend(key.split('/'));
+                }
+                drop(segments);
+                url.set_host(Some(&host)).map_err(|err| {
+                    report!("failed to set virtual hosted endpoint").attach(format!("error: {err}"))
+                })?;
+                ForwardObjectUrl::no_host(url)
+            }
+        })
+    }
+
+    pub fn format_bucket_url(
+        &self,
+        base_url: &Url,
+        bucket: &str,
+    ) -> Result<ForwardObjectUrl, Report> {
+        self.format_url(base_url, bucket, None)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: String,
@@ -154,39 +208,9 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn format_url(&self, bucket: &str, key: Option<&str>) -> ForwardObjectUrl {
-        let mut url = self.base_url.clone();
-        let host = url.host_str().expect("base URL can't be cannot-be-a-base");
-        let host = format!("{}.{}", bucket, host);
-
-        match self.addressing_style {
-            AddressingStyle::Path => {
-                url.path_segments_mut()
-                    .expect("base URL can't be cannot-be-a-base")
-                    .push(bucket);
-                if let Some(key) = key {
-                    url.path_segments_mut().unwrap().push(key);
-                }
-                ForwardObjectUrl::no_host(url)
-            }
-            AddressingStyle::VirtualHosted => {
-                if let Some(key) = key {
-                    url.path_segments_mut()
-                        .expect("base URL can't be cannot-be-a-base")
-                        .push(key);
-                }
-                ForwardObjectUrl::with_host(url, host)
-            }
-            AddressingStyle::VirtualHostedResolveDns => {
-                url.set_host(Some(&host)).expect("failed to set host");
-                if let Some(key) = key {
-                    url.path_segments_mut()
-                        .expect("base URL can't be cannot-be-a-base")
-                        .push(key);
-                }
-                ForwardObjectUrl::no_host(url)
-            }
-        }
+    pub fn format_url(&self, bucket: &str, key: Option<&str>) -> Result<ForwardObjectUrl, Report> {
+        self.addressing_style
+            .format_url(&self.base_url, bucket, key)
     }
 
     pub fn is_too_old(&self, now: &Zoned, last_modified: Timestamp) -> bool {
