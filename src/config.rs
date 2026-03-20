@@ -177,7 +177,7 @@ impl Config {
     pub fn coldest_upstream(&self) -> &Upstream {
         self.upstreams
             .values()
-            .min_by_key(|u| u.order)
+            .max_by_key(|u| u.order)
             .expect("config must contain at least one upstream")
     }
 }
@@ -198,6 +198,7 @@ impl Debug for S3Secret {
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub name: UpstreamId,
+    /// The order of the upstream, where smaller numbers are hotter.
     pub order: usize,
     pub base_url: Url,
     pub addressing_style: AddressingStyle,
