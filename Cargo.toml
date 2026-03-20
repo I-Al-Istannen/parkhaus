@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.8"
+axum-prometheus = { version = "0.10.0", features = ["prometheus"] }
 base64 = "0.22.1"
 clap = { version = "4.5.60", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["full"] }

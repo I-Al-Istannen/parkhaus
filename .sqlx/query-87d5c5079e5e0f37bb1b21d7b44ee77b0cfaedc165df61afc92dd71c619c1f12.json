@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT\n            source_upstream, target_upstream, bucket, key, state as \"state: MigrationState\"\n        FROM PendingMigrations",
+  "query": "\n        SELECT\n            source_upstream, target_upstream, bucket, key, state as \"state: MigrationState\"\n        FROM PendingMigrations\n        WHERE (state = $1) OR ($1 IS NULL)\n        ",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       false,
@@ -40,5 +40,5 @@
       false
     ]
   },
-  "hash": "a327b2402c16d2fd91ae4761d50ed3036d192a07da28c76cfdeea6339227caf1"
+  "hash": "87d5c5079e5e0f37bb1b21d7b44ee77b0cfaedc165df61afc92dd71c619c1f12"
 }

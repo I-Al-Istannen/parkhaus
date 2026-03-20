@@ -29,6 +29,12 @@ pub enum MigrationState {
     Finished,
 }
 
+impl MigrationState {
+    pub fn all() -> &'static [Self] {
+        &[Self::Pending, Self::CopiedToTarget, Self::Finished]
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingMigration {
     pub object: S3ObjectId,

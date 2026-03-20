@@ -1,7 +1,9 @@
 use crate::config::{Config, Upstream};
 use crate::data::{MigrationState, PendingMigration, S3ObjectId, UpstreamId};
 use crate::db::Database;
+use crate::metrics::{COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL};
 use crate::s3_client::client::S3Client;
+use axum_prometheus::metrics::counter;
 use futures_util::StreamExt;
 use jiff::{Timestamp, Zoned};
 use rand::prelude::IndexedRandom;
@@ -69,6 +71,8 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             if let Err(error) = db.delete_finished_pending().await {
                 error!(%error, "Failed to delete finished pending migrations");
             }
+
+            counter!(COUNTER_MIGRATION_RUNS_TOTAL).increment(1);
         }
     };
     select!(
@@ -237,6 +241,8 @@ async fn execute_pending_migration(
     }
 
     delete_object(db, source_client, &action).await?;
+
+    counter!(COUNTER_MIGRATED_OBJECTS_TOTAL).increment(1);
 
     Ok(())
 }
@@ -518,6 +524,7 @@ mod tests {
         upstreams.insert(cold.upstream.name.clone(), cold.upstream.clone());
         let config = Config::new(
             "127.0.0.1:0".to_owned(),
+            None,
             Path::new("/tmp/").to_path_buf(),
             upstreams,
         )?;
@@ -718,6 +725,7 @@ mod tests {
 
         Config::new(
             "127.0.0.1:0".to_owned(),
+            None,
             Path::new("/tmp/").to_path_buf(),
             upstreams,
         )

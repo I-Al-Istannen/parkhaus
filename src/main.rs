@@ -4,6 +4,7 @@ mod db;
 mod endpoints;
 mod error;
 mod import;
+mod metrics;
 mod migrate;
 mod s3_client;
 #[cfg(test)]
@@ -13,17 +14,23 @@ mod toml_utils;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::Config;
+use crate::data::MigrationState;
 use crate::db::Database;
 use crate::import::import;
+use crate::metrics::{GAUGE_PENDING_ACTIONS, initialize_metrics};
 use crate::migrate::migration_task;
 use axum::Router;
-use axum::routing::any;
+use axum::routing::{any, get};
+use axum_prometheus::metrics::gauge;
+use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
+use axum_prometheus::{GenericMetricLayer, Handle, PrometheusMetricLayer};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
-use tokio::signal;
+use tokio::{join, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -56,7 +63,7 @@ enum Command {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<config::Config>,
+    pub config: Arc<Config>,
     pub db: Database,
     pub http: Client,
 }
@@ -88,7 +95,7 @@ async fn run() -> AppResult<()> {
     res
 }
 
-async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
+async fn serve(config: Arc<Config>, db: Database) -> AppResult<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -101,6 +108,33 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
         .init();
 
     let shutdown_token = CancellationToken::new();
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
+    let main_server = start_main_server(
+        config.clone(),
+        db.clone(),
+        prometheus_layer,
+        shutdown_token.clone(),
+    );
+    let metrics_server =
+        start_metric_server(config.clone(), db, metric_handle, shutdown_token.clone());
+
+    initialize_metrics();
+
+    let (a, b, _) = join!(
+        main_server,
+        metrics_server,
+        shutdown_signal(shutdown_token.clone())
+    );
+    a?;
+    b
+}
+
+async fn start_main_server(
+    config: Arc<Config>,
+    db: Database,
+    prometheus_layer: GenericMetricLayer<'static, PrometheusHandle, Handle>,
+    shutdown_token: CancellationToken,
+) -> Result<(), Report> {
     // The poor man's task scheduler!
     tokio::spawn(migration_task(
         (*config).clone(),
@@ -119,7 +153,8 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
     let app = Router::new()
         .route("/", any(endpoints::proxy_request))
         .route("/{*path}", any(endpoints::proxy_request))
-        .with_state(app_state);
+        .with_state(app_state)
+        .layer(prometheus_layer);
 
     let listener = TcpListener::bind(&config.listen)
         .await
@@ -127,10 +162,55 @@ async fn serve(config: Arc<config::Config>, db: Database) -> AppResult<()> {
     info!(listen = %config.listen, "proxy listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_token.clone()))
+        .with_graceful_shutdown(shutdown_token.cancelled_owned())
         .await
-        .context("axum server failed")?;
-    Ok(())
+        .context("axum server failed")
+        .map_err(Report::into_dynamic)
+}
+
+async fn start_metric_server(
+    config: Arc<Config>,
+    database: Database,
+    metric_handle: PrometheusHandle,
+    shutdown_token: CancellationToken,
+) -> Result<(), Report> {
+    let Some(listen) = &config.metrics_listen else {
+        info!("metrics server disabled (no 'metrics_listen' configured)");
+        return Ok(());
+    };
+    let listener = TcpListener::bind(listen)
+        .await
+        .context("failed to bind listen socket")?;
+    info!(listen = %listen, "metrics server listening");
+
+    axum::serve(
+        listener,
+        Router::new().route(
+            "/metrics",
+            get(|| async move {
+                // Initialize all to zero so they have a value even if there are none pending
+                metrics::reset_pending_migrations_gauge(&config);
+
+                for state in MigrationState::all() {
+                    if let Ok(pending) = database.get_pending_per_upstream(Some(*state)).await {
+                        for (source, target, actions) in pending {
+                            gauge!(GAUGE_PENDING_ACTIONS,
+                                "source" => source.0.clone(),
+                                "target" => target.0.clone(),
+                                "state" => state.to_string()
+                            )
+                            .set(actions as f64);
+                        }
+                    }
+                }
+                metric_handle.render()
+            }),
+        ),
+    )
+    .with_graceful_shutdown(shutdown_token.cancelled_owned())
+    .await
+    .context("axum metrics server failed")
+    .map_err(Report::into_dynamic)
 }
 
 async fn shutdown_signal(token: CancellationToken) {

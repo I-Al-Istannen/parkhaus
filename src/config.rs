@@ -26,6 +26,7 @@ pub enum AddressingStyle {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: String,
+    pub metrics_listen: Option<String>,
     pub db_path: PathBuf,
     pub upstreams: HashMap<UpstreamId, Upstream>,
     _prevent_construction: PhantomData<String>,
@@ -34,6 +35,7 @@ pub struct Config {
 impl Config {
     pub fn new(
         listen: String,
+        metrics_listen: Option<String>,
         db_path: PathBuf,
         upstream_map: HashMap<UpstreamId, Upstream>,
     ) -> Result<Self, Report> {
@@ -103,6 +105,7 @@ impl Config {
 
         Ok(Self {
             listen,
+            metrics_listen,
             db_path,
             upstreams: upstream_map,
             _prevent_construction: PhantomData,
@@ -184,6 +187,7 @@ impl Upstream {
 #[derive(Clone, Deserialize)]
 struct RawConfig {
     pub listen: String,
+    pub metrics_listen: Option<String>,
     pub db_path: PathBuf,
     pub upstreams: HashMap<String, RawUpstream>,
 }
@@ -223,5 +227,10 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         })
         .collect();
 
-    Config::new(raw.listen, raw.db_path, parsed_upstreams)
+    Config::new(
+        raw.listen,
+        raw.metrics_listen,
+        raw.db_path,
+        parsed_upstreams,
+    )
 }

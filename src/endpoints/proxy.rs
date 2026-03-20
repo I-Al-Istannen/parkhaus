@@ -3,10 +3,15 @@ use crate::config::{Upstream, UpstreamId};
 use crate::data::{S3Object, S3ObjectId};
 use crate::db::Database;
 use crate::error::TierError;
+use crate::metrics::{
+    COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
+    COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
+};
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use axum_prometheus::metrics::counter;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use tracing::{debug, warn};
@@ -48,10 +53,19 @@ pub async fn proxy_request(
         .get_upstream(&object_id)
         .await
         .context("failed to get upstream for object")?
-        .and_then(|it| state.config.upstreams.get(&it))
+        .and_then(|it| {
+            counter!(COUNTER_UPSTREAM_FORWARDS_TOTAL,
+                "upstream" => it.0.clone(),
+                "method" => req.method().to_string()
+            )
+            .increment(1);
+            state.config.upstreams.get(&it)
+        })
         // default to the coldest upstream
         .unwrap_or_else(|| {
             let coldest = state.config.coldest_upstream();
+            counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => req.method().to_string())
+                .increment(1);
             debug!(
                 ?object_id,
                 %coldest.name,
@@ -169,6 +183,8 @@ fn record_successful_request(
         let obj_id_clone = obj_id.clone();
         let recording = async move {
             if req_method == Method::PUT {
+                counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                    .increment(1);
                 db.record_creation(&S3Object {
                     id: obj_id_clone.clone(),
                     assigned_upstream: upstream_name,
@@ -178,6 +194,8 @@ fn record_successful_request(
                 .context("failed to record creation")
                 .attach(format!("object: {obj_id_clone:?}"))?;
             } else if req_method == Method::DELETE {
+                counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                    .increment(1);
                 db.delete_object(&obj_id_clone)
                     .await
                     .context("failed to record deletion")

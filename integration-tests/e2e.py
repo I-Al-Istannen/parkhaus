@@ -28,11 +28,13 @@ from testcontainers.core.generic import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 
 BACKEND_PORT = 6321
+METRICS_PORT = 6322
 BUCKET_NAME = "test-bucket"
 DB_PATH = "db.sqlite3"
 
 CONFIG_TEMPLATE = """
 listen = "127.0.0.1:{{backend_port}}"
+metrics_listen = "127.0.0.1:{{metrics_port}}"
 db_path = "{{db_path}}"
 
 {{upstreams}}
@@ -383,9 +385,11 @@ def render_config(temp_dir: Path, started_containers: list[Upstream]):
 
         upstreams.append(upstream_config)
 
-    config = CONFIG_TEMPLATE.replace(
-        "{{db_path}}", f"{temp_dir.absolute()}/{DB_PATH}"
-    ).replace("{{backend_port}}", str(BACKEND_PORT))
+    config = (
+        CONFIG_TEMPLATE.replace("{{db_path}}", f"{temp_dir.absolute()}/{DB_PATH}")
+        .replace("{{backend_port}}", str(BACKEND_PORT))
+        .replace("{{metrics_port}}", str(METRICS_PORT))
+    )
     config = config.replace("{{upstreams}}", "\n\n".join(upstreams))
 
     return config

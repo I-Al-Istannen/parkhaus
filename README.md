@@ -54,6 +54,7 @@ to explore moving frequently accessed objects in the future :)
 ## Config format
 ```toml
 listen = "0.0.0.0:8080"
+metrics_listen = "0.0.0.0:8081"     # optional, disabled if unset (serves at `/metrics`)
 db_path = "./tiering-test.db"
 
 [upstreams.hot]                     # named hot, name is arbitrary

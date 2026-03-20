@@ -154,7 +154,10 @@ pub(super) async fn get_pending_with_state(
         r#"
         SELECT
             source_upstream, target_upstream, bucket, key, state as "state: MigrationState"
-        FROM PendingMigrations"#,
+        FROM PendingMigrations
+        WHERE (state = $1) OR ($1 IS NULL)
+        "#,
+        state
     )
     .map(PendingMigration::from)
     .fetch_all(con)
@@ -163,6 +166,32 @@ pub(super) async fn get_pending_with_state(
     .attach(format!("state: {:?}", state))?;
 
     Ok(res)
+}
+
+pub(super) async fn get_pending_per_upstream(
+    con: &mut SqliteConnection,
+    state: Option<MigrationState>,
+) -> Result<Vec<(UpstreamId, UpstreamId, usize)>, Report> {
+    query!(
+        r#"
+        SELECT source_upstream, target_upstream, COUNT(*) as count
+        FROM PendingMigrations
+        WHERE (state = $1) OR ($1 IS NULL)
+        GROUP BY source_upstream, target_upstream
+        "#,
+        state
+    )
+    .map(|it| {
+        (
+            UpstreamId(it.source_upstream),
+            UpstreamId(it.target_upstream),
+            it.count as usize,
+        )
+    })
+    .fetch_all(con)
+    .await
+    .context("failed to get pending migrations")
+    .map_err(Report::into_dynamic)
 }
 
 #[derive(Debug, Clone)]

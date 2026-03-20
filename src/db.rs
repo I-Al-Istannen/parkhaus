@@ -213,6 +213,15 @@ impl Database {
             .await
     }
 
+    pub async fn get_pending_per_upstream(
+        &self,
+        state: Option<MigrationState>,
+    ) -> Result<Vec<(UpstreamId, UpstreamId, usize)>, Report> {
+        let con = self.read().await;
+        migrate::get_pending_per_upstream(&mut *con.acquire().await.context("acquire con")?, state)
+            .await
+    }
+
     pub async fn close(self) -> Result<(), Report> {
         // Close the existing connection to ensure it does not block cleanup
         self.write().await.close().await;
