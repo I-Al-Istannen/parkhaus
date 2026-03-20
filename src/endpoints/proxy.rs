@@ -1,6 +1,6 @@
 use crate::AppState;
 use crate::config::{Upstream, UpstreamId};
-use crate::data::{S3Object, S3ObjectId};
+use crate::data::{ForwardObjectUrl, S3Object, S3ObjectId};
 use crate::db::Database;
 use crate::error::TierError;
 use crate::metrics::{
@@ -15,7 +15,6 @@ use axum_prometheus::metrics::counter;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use tracing::{debug, warn};
-use url::Url;
 
 const fn nop() {}
 
@@ -29,10 +28,11 @@ pub async fn proxy_request(
     if req.uri().path().chars().filter(|&it| it == '/').count() == 1 {
         // bucket-specific operation, nothing for us to track
         let upstream = state.config.hottest_upstream();
-        debug!(%original_uri, method=%req.method(), "handling bucket-level request for URL");
-        let mut upstream_url = upstream.base_url.clone();
-        upstream_url.set_query(req.uri().query());
-        upstream_url.set_path(original_uri.path());
+        let bucket = req.uri().path().trim_start_matches('/');
+        debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
+
+        let mut upstream_url = upstream.format_url(bucket, None);
+        upstream_url.url.set_query(req.uri().query());
         return forward_request(&state, upstream, upstream_url, req, nop).await;
     }
 
@@ -83,7 +83,7 @@ pub async fn proxy_request(
     forward_request(
         &state,
         upstream,
-        upstream.format_url(&object_id),
+        upstream.format_url(&object_id.bucket, Some(&object_id.key)),
         req,
         on_success,
     )
@@ -93,11 +93,18 @@ pub async fn proxy_request(
 async fn forward_request(
     state: &AppState,
     upstream: &Upstream,
-    target: Url,
+    target: ForwardObjectUrl,
     in_req: Request,
     on_success: impl FnOnce(),
 ) -> Result<Response, TierError> {
-    let mut out_req = state.http.request(in_req.method().clone(), target.clone());
+    let mut out_req = state
+        .http
+        .request(in_req.method().clone(), target.url.clone());
+
+    if let Some(host_header) = &target.host_header {
+        out_req = out_req.header(reqwest::header::HOST, host_header);
+    }
+
     for (name, val) in in_req.headers() {
         if is_hop_by_hop_header(name) {
             continue;

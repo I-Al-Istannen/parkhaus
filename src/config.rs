@@ -1,5 +1,5 @@
 use super::toml_utils;
-use crate::data::S3ObjectId;
+use crate::data::ForwardObjectUrl;
 use cmp::Ordering;
 use derive_more::{Display, From};
 use jiff::{Timestamp, Zoned};
@@ -21,6 +21,7 @@ use url::Url;
 pub enum AddressingStyle {
     Path,
     VirtualHosted,
+    VirtualHostedResolveDns,
 }
 
 #[derive(Debug, Clone)]
@@ -153,24 +154,37 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn format_url(&self, s3object_id: &S3ObjectId) -> Url {
+    pub fn format_url(&self, bucket: &str, key: Option<&str>) -> ForwardObjectUrl {
         let mut url = self.base_url.clone();
+        let host = url.host_str().expect("base URL can't be cannot-be-a-base");
+        let host = format!("{}.{}", bucket, host);
+
         match self.addressing_style {
             AddressingStyle::Path => {
                 url.path_segments_mut()
                     .expect("base URL can't be cannot-be-a-base")
-                    .push(&s3object_id.bucket)
-                    .push(&s3object_id.key);
-                url
+                    .push(bucket);
+                if let Some(key) = key {
+                    url.path_segments_mut().unwrap().push(key);
+                }
+                ForwardObjectUrl::no_host(url)
             }
             AddressingStyle::VirtualHosted => {
-                let host = url.host_str().expect("base URL can't be cannot-be-a-base");
-                let host = format!("{}.{}", s3object_id.bucket, host);
+                if let Some(key) = key {
+                    url.path_segments_mut()
+                        .expect("base URL can't be cannot-be-a-base")
+                        .push(key);
+                }
+                ForwardObjectUrl::with_host(url, host)
+            }
+            AddressingStyle::VirtualHostedResolveDns => {
                 url.set_host(Some(&host)).expect("failed to set host");
-                url.path_segments_mut()
-                    .expect("base URL can't be cannot-be-a-base")
-                    .push(&s3object_id.key);
-                url
+                if let Some(key) = key {
+                    url.path_segments_mut()
+                        .expect("base URL can't be cannot-be-a-base")
+                        .push(key);
+                }
+                ForwardObjectUrl::no_host(url)
             }
         }
     }

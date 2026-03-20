@@ -1,7 +1,8 @@
 pub(crate) use crate::config::UpstreamId;
 use derive_more::Display;
 use serde::Serialize;
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct S3ObjectId {
@@ -10,7 +11,7 @@ pub struct S3ObjectId {
 }
 
 impl Display for S3ObjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.bucket, self.key)
     }
 }
@@ -41,4 +42,35 @@ pub struct PendingMigration {
     pub source_upstream: UpstreamId,
     pub target_upstream: UpstreamId,
     pub state: MigrationState,
+}
+
+pub struct ForwardObjectUrl {
+    pub url: Url,
+    pub host_header: Option<String>,
+}
+
+impl Display for ForwardObjectUrl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(host_header) = &self.host_header {
+            write!(f, "{} (host: {})", self.url, host_header)
+        } else {
+            write!(f, "{}", self.url)
+        }
+    }
+}
+
+impl ForwardObjectUrl {
+    pub fn no_host(url: Url) -> Self {
+        Self {
+            url,
+            host_header: None,
+        }
+    }
+
+    pub fn with_host(url: Url, host_header: String) -> Self {
+        Self {
+            url,
+            host_header: Some(host_header),
+        }
+    }
 }
