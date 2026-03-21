@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::config::{Upstream, UpstreamId};
+use crate::config::{Config, Upstream, UpstreamId};
 use crate::data::{ForwardObjectUrl, S3Object, S3ObjectId};
 use crate::db::Database;
 use crate::error::TierError;
@@ -62,17 +62,7 @@ pub async fn proxy_request(
             state.config.upstreams.get(&it)
         })
         // default to the coldest upstream
-        .unwrap_or_else(|| {
-            let coldest = state.config.coldest_upstream();
-            counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => req.method().to_string())
-                .increment(1);
-            debug!(
-                ?object_id,
-                %coldest.name,
-                "object not found in database, defaulting to coldest upstream"
-            );
-            coldest
-        });
+        .unwrap_or_else(|| get_fallback_upstream(&object_id, &state.config, &req));
 
     let on_success = record_successful_request(
         req.method().clone(),
@@ -88,6 +78,28 @@ pub async fn proxy_request(
         on_success,
     )
     .await
+}
+
+fn get_fallback_upstream<'a>(
+    object_id: &'_ S3ObjectId,
+    config: &'a Config,
+    request: &'_ Request,
+) -> &'a Upstream {
+    let coldest = if is_creation(request.method()) {
+        config.hottest_upstream()
+    } else {
+        config.coldest_upstream()
+    };
+
+    counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => request.method().to_string())
+        .increment(1);
+    debug!(
+        ?object_id,
+        %coldest.name,
+        "object not found in database, defaulting upstream"
+    );
+
+    coldest
 }
 
 async fn forward_request(
@@ -189,7 +201,7 @@ fn record_successful_request(
     move || {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
-            if req_method == Method::PUT {
+            if is_creation(&req_method) {
                 counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
                 db.record_creation(&S3Object {
@@ -200,7 +212,7 @@ fn record_successful_request(
                 .await
                 .context("failed to record creation")
                 .attach(format!("object: {obj_id_clone:?}"))?;
-            } else if req_method == Method::DELETE {
+            } else if is_delete(&req_method) {
                 counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
                 db.delete_object(&obj_id_clone)
@@ -221,4 +233,12 @@ fn record_successful_request(
             }
         });
     }
+}
+
+fn is_creation(method: &Method) -> bool {
+    method == Method::PUT
+}
+
+fn is_delete(method: &Method) -> bool {
+    method == Method::DELETE
 }

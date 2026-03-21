@@ -323,6 +323,50 @@ def warn(message: str, *, level: int = 0) -> None:
     _log("[bold yellow]\\[WARN][/]", message, level=level)
 
 
+def test_get_unknown_defaults_to_coldest_upstream(
+    test_data: TestData,
+) -> None:
+    info("Testing GET defaults to coldest_upstream for unknown objects...", level=2)
+
+    # Create a test object and upload it only to the cold upstream
+    unknown_object = S3TestObject.new_random("unknown-object")
+    test_data.cold.client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=unknown_object.key,
+        Body=unknown_object.content,
+    )
+    info("Uploaded unknown object to cold upstream only", level=4)
+
+    # Verify the object is NOT found in hot or warm upstreams
+    hot_keys = test_data.hot.get_object_keys()
+    warm_keys = test_data.warm.get_object_keys()
+    cold_keys = test_data.cold.get_object_keys()
+
+    assert unknown_object.key not in hot_keys, (
+        "Unknown object should not be in hot tier"
+    )
+    assert unknown_object.key not in warm_keys, (
+        "Unknown object should not be in warm tier"
+    )
+    assert unknown_object.key in cold_keys, "Unknown object should be in cold tier"
+    info("Verified object is only in cold upstream", level=4)
+
+    # Make a GET request through the proxy for the unknown object
+    response = test_data.backend.client.get_object(
+        Bucket=BUCKET_NAME,
+        Key=unknown_object.key,
+    )
+    retrieved_content = response.get("Body").read()
+
+    assert retrieved_content == unknown_object.content, (
+        "Retrieved content should match original content for unknown object"
+    )
+    info(
+        "Successfully retrieved unknown object through proxy from coldest upstream",
+        level=4,
+    )
+
+
 def main() -> None:
     info("Starting test...")
 
@@ -348,6 +392,12 @@ def main() -> None:
 
             info("Verifying all objects are in the hot tier initially...", level=2)
             test_data.assert_all_hot()
+
+            info(
+                "Testing proxy defaults to coldest_upstream for unknown objects...",
+                level=2,
+            )
+            test_get_unknown_defaults_to_coldest_upstream(test_data)
 
             for randomize_round in range(3):
                 info(f"Randomizing object tiers (round {randomize_round + 1}/3)")
@@ -436,20 +486,21 @@ def start_backend(temp_dir: Path, config_path: Path):
         aws_access_key_id="test",
         aws_secret_access_key="test",
     )
-    yield Backend(
-        backend_process,
-        client,
-        temp_dir / DB_PATH,
-        sqlite3.connect(temp_dir / DB_PATH),
-    )
-
-    if backend_process.poll() is None:
-        backend_process.terminate()
-        try:
-            backend_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            warn("Backend did not terminate in time, killing it")
-            backend_process.kill()
+    try:
+        yield Backend(
+            backend_process,
+            client,
+            temp_dir / DB_PATH,
+            sqlite3.connect(temp_dir / DB_PATH),
+        )
+    finally:
+        if backend_process.poll() is None:
+            backend_process.terminate()
+            try:
+                backend_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                warn("Backend did not terminate in time, killing it")
+                backend_process.kill()
 
 
 if __name__ == "__main__":
