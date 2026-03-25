@@ -2,9 +2,8 @@
   description = "A suite for testing compiler submissions";
 
   inputs = {
-    naersk.url = "github:nix-community/naersk";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    naersk.inputs.nixpkgs.follows = "nixpkgs";
+    crane.url = "github:ipetkov/crane";
     gitignore.url = "github:hercules-ci/gitignore.nix";
     gitignore.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
@@ -16,7 +15,7 @@
       self,
       gitignore,
       nixpkgs,
-      naersk,
+      crane,
       treefmt-nix,
     }:
     let
@@ -27,37 +26,45 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          naersk' = pkgs.callPackage naersk { };
+          craneLib = crane.mkLib pkgs;
           inherit (gitignore.lib) gitignoreFilterWith;
+          pname = "parkhaus";
 
-          build-naersk = naersk'.buildPackage {
-            version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
-            src = pkgs.lib.cleanSourceWith {
-              filter = gitignoreFilterWith {
-                basePath = ./.;
-                extraRules = ''
-                  /.github/
-                  /assets
-                  /README.md
-                '';
+          build-crane =
+            craneLib.buildPackage {
+              inherit pname;
+              version = (pkgs.lib.importTOML ./Cargo.toml).workspace.package.version;
+              doCheck = false;
+
+              src = pkgs.lib.cleanSourceWith {
+                filter = gitignoreFilterWith {
+                  basePath = ./.;
+                  extraRules = ''
+                    /.github/
+                    /assets
+                    /README.md
+                  '';
+                };
+                src = ./.;
               };
-              src = ./.;
+            }
+            // {
+              meta.mainProgram = pname;
             };
-          };
         in
         rec {
           default = parkhaus;
           parkhaus =
-            pkgs.runCommand "parkhaus" { } ''
+            pkgs.runCommand pname { } ''
               mkdir -p $out/bin
-              cp ${build-naersk}/bin/parkhaus $out/bin
+              cp ${pkgs.lib.getExe build-crane} $out/bin
             ''
             // {
-              meta.mainProgram = "parkhaus";
+              meta.mainProgram = pname;
             };
           docker = pkgs.dockerTools.buildLayeredImage {
-            name = "parkhaus";
-            tag = build-naersk.version;
+            name = pname;
+            tag = build-crane.version;
 
             contents = [
               pkgs.cacert

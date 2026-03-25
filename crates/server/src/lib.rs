@@ -1,15 +1,13 @@
-mod config;
-mod data;
-mod db;
-mod endpoints;
-mod error;
-mod import;
-mod metrics;
-mod migrate;
-mod s3_client;
-#[cfg(test)]
-mod testing;
-mod toml_utils;
+pub mod config;
+pub mod data;
+pub mod db;
+pub mod endpoints;
+pub mod error;
+pub mod import;
+pub mod metrics;
+pub mod migrate;
+pub mod s3_client;
+pub mod toml_utils;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,8 +66,7 @@ pub struct AppState {
     pub http: Client,
 }
 
-#[tokio::main]
-async fn main() {
+pub async fn main() {
     if let Err(error) = run().await {
         eprintln!("Application error: {error}");
         std::process::exit(1);

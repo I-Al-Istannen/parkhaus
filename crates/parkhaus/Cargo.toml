@@ -1,0 +1,11 @@
+[package]
+name = "parkhaus"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+server = { version = "0.1.0", path = "../server" }
+tokio = { version = "1.50.0", features = ["full"] }
+
+[lints]
+workspace = true
