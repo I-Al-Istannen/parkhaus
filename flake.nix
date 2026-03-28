@@ -85,7 +85,7 @@
               # The config uses the local timezone
               Env = [ "TZDIR=${pkgs.tzdata}/share/zoneinfo" ];
 
-              Expose = {
+              ExposedPorts = {
                 "8080/tcp" = { };
               };
             };
