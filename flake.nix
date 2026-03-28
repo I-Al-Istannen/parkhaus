@@ -88,6 +88,10 @@
               ExposedPorts = {
                 "8080/tcp" = { };
               };
+
+              Labels = {
+                "lighthouse.base" = "ghcr.io/i-al-istannen/parkhaus:latest";
+              };
             };
           };
         }
