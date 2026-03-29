@@ -54,8 +54,8 @@ to explore moving frequently accessed objects in the future :)
 ## Config format
 ```toml
 listen = "0.0.0.0:8080"
-metrics_listen = "0.0.0.0:8081"     # optional, disabled if unset (serves at `/metrics`)
-db_path = "./tiering-test.db"
+metrics_listen = "127.0.0.1:8081"     # optional, disabled if unset (serves at `/metrics`)
+db_path = "/data/parkhaus.db"
 
 [upstreams.hot]                     # named hot, name is arbitrary
 order = 1                           # smallest one is the hottest
