@@ -258,13 +258,13 @@ pub fn load(path: &Path) -> Result<Config, Report> {
                 base_url: raw.base_url,
                 addressing_style: raw.addressing_style,
                 max_age: raw.max_age,
-                s3_access_key: raw.s3_access_key,
-                s3_secret: S3Secret(raw.s3_secret),
+                s3_access_key: maybe_env(raw.s3_access_key)?,
+                s3_secret: S3Secret(maybe_env(raw.s3_secret)?),
                 region: raw.region,
             };
-            (UpstreamId(name), upstream)
+            Ok((UpstreamId(name), upstream))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>, Report>>()?;
 
     Config::new(
         raw.listen,
@@ -272,4 +272,15 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         raw.db_path,
         parsed_upstreams,
     )
+}
+
+fn maybe_env(value: String) -> Result<String, Report> {
+    let Some((_, env_var)) = value.split_once("env:") else {
+        return Ok(value);
+    };
+    std::env::var(env_var)
+        .context("failed to detect env variable")
+        .attach("hint: value starts with 'env:', so it is expected to be an env variable")
+        .attach(format!("env variable: `{env_var}`"))
+        .map_err(Report::into_dynamic)
 }

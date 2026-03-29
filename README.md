@@ -52,6 +52,13 @@ to explore moving frequently accessed objects in the future :)
    you configure in your application.**
 
 ## Config format
+
+You can interpolate environment variables (e.g. for secret keys) by using
+`env:name` as the value. For example, `s3_secret = "env:S3_SECRET"` reads the
+`s3_secret` field from the `S3_SECRET` environment variable.
+
+#### Full config
+
 ```toml
 listen = "0.0.0.0:8080"
 metrics_listen = "127.0.0.1:8081"     # optional, disabled if unset (serves at `/metrics`)
