@@ -52,9 +52,16 @@ jobs:
         echo "IMG=$(docker load --quiet < result | sed -E 's/.+?: (.+)/\1/g')" >> $GITHUB_ENV
     - name: Push docker images
       run: |
-        docker tag "$IMG" ghcr.io/i-al-istannen/parkhaus:latest
         docker tag "$IMG" ghcr.io/i-al-istannen/parkhaus:$GITHUB_SHA
         docker tag "$IMG" ghcr.io/i-al-istannen/parkhaus:${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+
+        # Tag with version and latest if a tag was pushed
+        if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          docker tag "$IMG" ghcr.io/i-al-istannen/parkhaus:$TAG_NAME
+          docker tag "$IMG" ghcr.io/i-al-istannen/parkhaus:latest
+        fi
+
         docker rmi "$IMG"
         docker push --all-tags ghcr.io/i-al-istannen/parkhaus
     - name: Upload store to attic
