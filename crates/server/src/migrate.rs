@@ -134,6 +134,7 @@ async fn get_pending_migrations_for_bucket(
             .context("get objects in migration time range")
             .attach(format!("upstream: {}", upstream.name))?
             .into_iter()
+            .filter(|(obj, _)| obj.bucket == bucket)
             .map(|(object, last_modified)| {
                 Ok(PendingMigration {
                     source_upstream: upstream.name.clone(),

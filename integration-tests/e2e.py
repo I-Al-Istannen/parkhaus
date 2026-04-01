@@ -8,6 +8,7 @@
 # ]
 # ///
 
+import argparse
 import contextlib
 import random
 import sqlite3
@@ -105,9 +106,12 @@ class Upstream:
     tier: Tier
     container: DockerContainer
     client: S3Client
+    buckets: list[str]
 
     @staticmethod
-    def create(tier: Tier, container: DockerContainer) -> "Upstream":
+    def create(
+        tier: Tier, container: DockerContainer, buckets: list[str]
+    ) -> "Upstream":
         client = boto3.client(
             "s3",
             endpoint_url=f"http://localhost:{container.get_exposed_port(9090)}",
@@ -115,15 +119,26 @@ class Upstream:
             aws_secret_access_key="test",
         )
         client.create_bucket(Bucket=BUCKET_NAME)
+        for bucket in buckets:
+            if bucket != BUCKET_NAME:
+                client.create_bucket(Bucket=bucket)
 
         return Upstream(
             tier=tier,
             container=container,
             client=client,
+            buckets=buckets,
         )
 
     def get_object_keys(self) -> list[str]:
-        response = self.client.list_objects_v2(Bucket=BUCKET_NAME)
+        all_keys = []
+        for bucket in self.buckets:
+            keys = self.get_object_keys_bucket(bucket)
+            all_keys.extend(keys)
+        return all_keys
+
+    def get_object_keys_bucket(self, bucket: str) -> list[str]:
+        response = self.client.list_objects_v2(Bucket=bucket)
         return [cast(str, obj.get("Key")) for obj in response.get("Contents", [])]
 
 
@@ -141,7 +156,7 @@ class Backend:
             (
                 timey,
                 object.key,
-                BUCKET_NAME,
+                object.bucket,
             ),
         )
         self.sqlite_connection.commit()
@@ -196,18 +211,20 @@ class Backend:
 @dataclass
 class S3TestObject:
     key: str
+    bucket: str
     content: bytes
     age_seconds: int
     tier: Tier
 
     @staticmethod
-    def new_random(key: str) -> "S3TestObject":
+    def new_random(key: str, bucket: str) -> "S3TestObject":
         import random
 
         payload_length = random.randint(1, 1024 * 1024)  # Up to 1 MiB
         random_bytes = random.randbytes(payload_length)
         return S3TestObject(
             key=key,
+            bucket=bucket,
             content=random_bytes,
             age_seconds=0,
             tier=Tier.HOT,
@@ -221,6 +238,7 @@ class TestData:
     hot: Upstream
     warm: Upstream
     cold: Upstream
+    buckets_stop_at_warm: set[str]
 
     def all_keys(self) -> list[str]:
         return [obj.key for obj in self.objects]
@@ -247,6 +265,10 @@ class TestData:
             obj.age_seconds = new_age
             self.backend.update_object_age(obj)
 
+            # We should not migrate this further
+            if obj.tier == Tier.COLD and obj.bucket in self.buckets_stop_at_warm:
+                obj.tier = Tier.WARM
+
     def assert_tiers_match(self):
         upstream_keys = {
             "hot": set(self.hot.get_object_keys()),
@@ -259,22 +281,22 @@ class TestData:
             for tier in Tier.all():
                 if obj.key in upstream_keys[tier.value]:
                     assert tier == obj.tier, (
-                        f"Object {obj.key} is in the {tier.value} tier but expected to be in {obj.tier.value} tier"
+                        f"Object {obj.bucket}/{obj.key} is in the {tier.value} tier but expected to be in {obj.tier.value} tier with age {obj.age_seconds}s"
                     )
 
             from_backend = (
-                self.backend.client.get_object(Bucket=BUCKET_NAME, Key=obj.key)
+                self.backend.client.get_object(Bucket=obj.bucket, Key=obj.key)
                 .get("Body")
                 .read()
             )
             from_upstream = (
                 self._upstream_for(obj.tier)
-                .client.get_object(Bucket=BUCKET_NAME, Key=obj.key)
+                .client.get_object(Bucket=obj.bucket, Key=obj.key)
                 .get("Body")
                 .read()
             )
             assert obj.content == from_backend == from_upstream, (
-                f"Object content mismatch for {obj.key}"
+                f"Object content mismatch for {obj.bucket}/{obj.key}"
             )
 
     def _upstream_for(self, tier: Tier) -> Upstream:
@@ -288,21 +310,30 @@ class TestData:
 
     @staticmethod
     def create_and_upload(
-        backend: Backend, hot: Upstream, warm: Upstream, cold: Upstream, count: int
+        backend: Backend,
+        hot: Upstream,
+        warm: Upstream,
+        cold: Upstream,
+        buckets: list[str],
+        buckets_stop_at_warm: set[str],
+        count: int,
     ) -> "TestData":
         objects = []
         for index in track(
             range(count), description="Uploading test objects...", transient=True
         ):
-            object = S3TestObject.new_random(f"object-{index}")
+            object = S3TestObject.new_random(
+                f"object-{index}",
+                bucket=random.choice(buckets),
+            )
             backend.client.put_object(
-                Bucket=BUCKET_NAME,
+                Bucket=object.bucket,
                 Key=object.key,
                 Body=object.content,
             )
             objects.append(object)
 
-        return TestData(objects, backend, hot, warm, cold)
+        return TestData(objects, backend, hot, warm, cold, buckets_stop_at_warm)
 
 
 def _log(kind: str, message: str, *, level: int = 0) -> None:
@@ -325,13 +356,14 @@ def warn(message: str, *, level: int = 0) -> None:
 
 def test_get_unknown_defaults_to_coldest_upstream(
     test_data: TestData,
+    bucket: str,
 ) -> None:
     info("Testing GET defaults to coldest_upstream for unknown objects...", level=2)
 
     # Create a test object and upload it only to the cold upstream
-    unknown_object = S3TestObject.new_random("unknown-object")
+    unknown_object = S3TestObject.new_random("unknown-object", bucket)
     test_data.cold.client.put_object(
-        Bucket=BUCKET_NAME,
+        Bucket=bucket,
         Key=unknown_object.key,
         Body=unknown_object.content,
     )
@@ -353,7 +385,7 @@ def test_get_unknown_defaults_to_coldest_upstream(
 
     # Make a GET request through the proxy for the unknown object
     response = test_data.backend.client.get_object(
-        Bucket=BUCKET_NAME,
+        Bucket=bucket,
         Key=unknown_object.key,
     )
     retrieved_content = response.get("Body").read()
@@ -367,8 +399,15 @@ def test_get_unknown_defaults_to_coldest_upstream(
     )
 
 
-def main() -> None:
+def main(test_tier_by_bucket: bool) -> None:
     info("Starting test...")
+
+    buckets = (
+        [f"bucket-{i}" for i in range(10)] if test_tier_by_bucket else [BUCKET_NAME]
+    )
+    buckets_stop_at_warm = (
+        set(random.sample(buckets, k=5)) if test_tier_by_bucket else set()
+    )
 
     info("Creating S3Mock upstreams...")
     with (
@@ -378,17 +417,20 @@ def main() -> None:
         TemporaryDirectory(prefix="tiering-e2e-") as temp_dir_str,
     ):
         info("Initializing upstreams...", level=2)
-        hot = Upstream.create(Tier.HOT, hot_container)
-        warm = Upstream.create(Tier.WARM, warm_container)
-        cold = Upstream.create(Tier.COLD, cold_container)
+        hot = Upstream.create(Tier.HOT, hot_container, buckets)
+        warm = Upstream.create(Tier.WARM, warm_container, buckets)
+        cold = Upstream.create(Tier.COLD, cold_container, buckets)
         temp_dir = Path(temp_dir_str)
 
-        config = render_config(temp_dir, [hot, warm, cold])
+        config = render_config(temp_dir, [hot, warm, cold], buckets_stop_at_warm)
         config_path = temp_dir / "config.toml"
         config_path.write_text(config)
+        print(config)
         with start_backend(temp_dir, config_path) as backend:
             info("Uploading test data...")
-            test_data = TestData.create_and_upload(backend, hot, warm, cold, count=500)
+            test_data = TestData.create_and_upload(
+                backend, hot, warm, cold, buckets, buckets_stop_at_warm, count=500
+            )
 
             info("Verifying all objects are in the hot tier initially...", level=2)
             test_data.assert_all_hot()
@@ -397,7 +439,7 @@ def main() -> None:
                 "Testing proxy defaults to coldest_upstream for unknown objects...",
                 level=2,
             )
-            test_get_unknown_defaults_to_coldest_upstream(test_data)
+            test_get_unknown_defaults_to_coldest_upstream(test_data, buckets[0])
 
             for randomize_round in range(3):
                 info(f"Randomizing object tiers (round {randomize_round + 1}/3)")
@@ -418,7 +460,11 @@ def create_s3mock_container() -> DockerContainer:
     )
 
 
-def render_config(temp_dir: Path, started_containers: list[Upstream]):
+def render_config(
+    temp_dir: Path,
+    started_containers: list[Upstream],
+    buckets_stop_at_warm: set[str],
+) -> str:
     upstreams = []
     for upstream in started_containers:
         port = upstream.container.get_exposed_port(9090)
@@ -431,7 +477,15 @@ def render_config(temp_dir: Path, started_containers: list[Upstream]):
             .replace("{{s3_region}}", "us-east-1")
         )
         if upstream.tier.max_age_seconds() is not None:
-            upstream_config += f'max_age = "{upstream.tier.max_age_seconds()}s"'
+            if upstream.tier == Tier.WARM and buckets_stop_at_warm:
+                upstream_config += f"""max_age = {{
+  fallback = "{upstream.tier.max_age_seconds()}s",
+  per_bucket = {{
+    {", ".join(f'"{bucket}" = "forever"' for bucket in buckets_stop_at_warm)}
+  }}
+}}"""
+            else:
+                upstream_config += f'max_age = "{upstream.tier.max_age_seconds()}s"'
 
         upstreams.append(upstream_config)
 
@@ -504,4 +558,16 @@ def start_backend(temp_dir: Path, config_path: Path):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        prog="e2e tests",
+        description="End-to-end tests for the tiering functionality of the S3 proxy",
+    )
+    parser.add_argument(
+        "TIER_BY_BUCKET",
+        help="Whether to test tiering by bucket (instead of by object age). \
+            This will create multiple buckets and configure some of them to stop at the warm tier.",
+    )
+    args = parser.parse_args()
+    test_tier_by_bucket = args.TIER_BY_BUCKET.lower() in ("true", "1", "yes")
+    info(f"Running tests with tiering by bucket set to {test_tier_by_bucket}")
+    main(test_tier_by_bucket)
