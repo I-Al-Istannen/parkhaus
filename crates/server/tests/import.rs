@@ -4,7 +4,7 @@ use crate::common::garage::GarageInstance;
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use server::config::{AddressingStyle, S3Secret, Upstream, UpstreamId};
+use server::config::{AddressingStyle, AgeLimits, S3Secret, Upstream, UpstreamId};
 use server::data::S3ObjectId;
 use server::db::Database;
 use server::import::import_upstream;
@@ -41,7 +41,7 @@ async fn test_import_buckets() -> Result<(), Report> {
         base_url: garage.s3_endpoint().clone(),
         region: garage.region().to_string(),
         addressing_style: AddressingStyle::Path,
-        max_age: None,
+        age_limits: AgeLimits::no_limits(),
         s3_access_key: key_id.clone(),
         s3_secret: S3Secret(key_secret.clone()),
     };

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT DISTINCT bucket FROM objects",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "115fcc32ebe405f623f28b385ffed25baba74d55697b315b50db295fc4d6d260"
+}

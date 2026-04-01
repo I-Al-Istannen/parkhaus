@@ -9,6 +9,14 @@ pub mod migrate;
 pub mod s3_client;
 pub mod toml_utils;
 
+// cargos integration test setup really is something (not good)
+#[cfg(test)]
+use ctor as _;
+#[cfg(test)]
+use serde_json as _;
+#[cfg(test)]
+use testcontainers as _;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

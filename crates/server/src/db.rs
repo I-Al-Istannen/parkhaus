@@ -9,6 +9,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -220,6 +221,11 @@ impl Database {
         let con = self.read().await;
         migrate::get_pending_per_upstream(&mut *con.acquire().await.context("acquire con")?, state)
             .await
+    }
+
+    pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {
+        let con = self.read().await;
+        objects::get_all_buckets(&mut *con.acquire().await.context("acquire con")?).await
     }
 
     pub async fn close(self) -> Result<(), Report> {

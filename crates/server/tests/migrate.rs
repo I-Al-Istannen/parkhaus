@@ -8,17 +8,18 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng, rng};
 use reqwest::Client;
 use rootcause::{Report, bail};
+use server::config::{AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId};
+use server::data::{S3Object, S3ObjectId};
+use server::db::Database;
+use server::migrate::{execute_pending_migrations, get_pending_migrations};
+use server::s3_client::client::{ObjectInfo, S3Client};
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::ops::{Range, Sub};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
-use server::config::{AddressingStyle, Config, S3Secret, Upstream, UpstreamId};
-use server::data::{S3Object, S3ObjectId};
-use server::db::Database;
-use server::migrate::{execute_pending_migrations, get_pending_migrations};
-use server::s3_client::client::{ObjectInfo, S3Client};
 
 mod common;
 
@@ -38,11 +39,11 @@ impl Tier {
         }
     }
 
-    fn max_age(&self) -> Option<Span> {
+    fn max_age(&self) -> AgeLimits {
         match self {
-            Self::Hot => Some(Span::new().hours(2)),
-            Self::Warm => Some(Span::new().hours(5)),
-            Self::Cold => None,
+            Self::Hot => AgeLimits::Uniform(Span::new().hours(2).into()),
+            Self::Warm => AgeLimits::Uniform(Span::new().hours(5).into()),
+            Self::Cold => AgeLimits::no_limits(),
         }
     }
 
@@ -131,7 +132,7 @@ async fn setup_tier_backend(tier: Tier) -> Result<TierBackend, Report> {
             order: tier.order(),
             base_url: garage.s3_endpoint().clone(),
             addressing_style: AddressingStyle::Path,
-            max_age: tier.max_age(),
+            age_limits: tier.max_age(),
             s3_access_key: key_id,
             s3_secret: S3Secret(secret),
             region: garage.region().to_owned(),
@@ -198,15 +199,15 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
     let warm = setup_tier_backend(Tier::Warm).await?;
     let cold = setup_tier_backend(Tier::Cold).await?;
 
-    let mut upstreams = HashMap::new();
-    upstreams.insert(hot.upstream.name.clone(), hot.upstream.clone());
-    upstreams.insert(warm.upstream.name.clone(), warm.upstream.clone());
-    upstreams.insert(cold.upstream.name.clone(), cold.upstream.clone());
     let config = Config::new(
         "127.0.0.1:0".to_owned(),
         None,
         Path::new("/tmp/").to_path_buf(),
-        upstreams,
+        vec![
+            hot.upstream.clone(),
+            warm.upstream.clone(),
+            cold.upstream.clone(),
+        ],
     )?;
 
     let db = Database::in_memory().await?;
@@ -384,23 +385,23 @@ fn random_key(rng: &mut StdRng) -> String {
 }
 
 fn test_config() -> Result<Config, Report> {
-    let new_upstream = |id: UpstreamId, order: usize, max_age: Option<Span>| {
+    let new_upstream = |id: UpstreamId, order: usize, max_age: AgeLimits| {
         Ok::<Upstream, Report>(Upstream {
             name: id,
             order,
             base_url: format!("http://127.0.0.1:900{order}").parse()?,
             addressing_style: AddressingStyle::Path,
-            max_age,
+            age_limits: max_age,
             s3_access_key: "test".to_owned(),
             s3_secret: S3Secret("test".to_owned()),
             region: "test".to_owned(),
         })
     };
 
-    let mut upstreams = HashMap::new();
+    let mut upstreams = Vec::new();
     for (index, tier) in Tier::all().iter().enumerate() {
         let id = UpstreamId(tier.to_string());
-        upstreams.insert(id.clone(), new_upstream(id, index + 1, tier.max_age())?);
+        upstreams.push(new_upstream(id, index + 1, tier.max_age())?);
     }
 
     Config::new(
@@ -422,16 +423,35 @@ fn print_migrations(
             now.timestamp()
                 .sub(obj_map.get(obj).unwrap().last_modified)
                 .total(Unit::Hour)?,
-            Tier::try_from(source.0.as_str())?
-                .max_age()
-                .map(|x| format!("{}h", x.get_hours()))
-                .unwrap_or("None".to_string()),
-            Tier::try_from(target.0.as_str())?
-                .max_age()
-                .map(|x| format!("{}h", x.get_hours()))
-                .unwrap_or("None".to_string()),
+            format_age_limits(Tier::try_from(source.0.as_str())?.max_age()),
+            format_age_limits(Tier::try_from(target.0.as_str())?.max_age())
         );
     }
 
     Ok(())
+}
+
+fn format_age_limits<T: Borrow<AgeLimits>>(age: T) -> String {
+    match age.borrow() {
+        AgeLimits::Uniform(max) => format_max_age(max),
+        AgeLimits::PerBucket {
+            fallback,
+            per_bucket,
+        } => format!(
+            "fallback={}, {}",
+            format_max_age(fallback),
+            per_bucket
+                .iter()
+                .map(|(bucket, max)| format!("{}={}", bucket, format_max_age(max)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn format_max_age(max_age: &MaxAge) -> String {
+    match max_age {
+        MaxAge::Forever => "forever".to_owned(),
+        MaxAge::Limited(max) => format!("{}h", max.get_hours()),
+    }
 }

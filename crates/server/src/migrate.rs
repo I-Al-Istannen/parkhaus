@@ -5,6 +5,7 @@ use crate::metrics::{COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTA
 use crate::s3_client::client::S3Client;
 use axum_prometheus::metrics::counter;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use jiff::{Timestamp, Zoned};
 use rand::prelude::IndexedRandom;
 use rootcause::Report;
@@ -17,31 +18,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 const SAMPLE_ERRORS: usize = 3;
-
-struct SortedUpstreams<'a> {
-    upstreams: Vec<&'a Upstream>,
-}
-impl<'a> SortedUpstreams<'a> {
-    pub fn new(now: Zoned, upstreams: impl Iterator<Item = &'a Upstream>) -> Self {
-        let mut sorted_upstreams = upstreams.into_iter().collect::<Vec<_>>();
-        sorted_upstreams.sort_unstable_by(|a, b| match (a.max_age, b.max_age) {
-            (Some(a_age), Some(b_age)) => a_age
-                .compare((b_age, &now))
-                .expect("failed to compare dates"),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
-
-        Self {
-            upstreams: sorted_upstreams,
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &'a Upstream> {
-        self.upstreams.iter().copied()
-    }
-}
 
 pub async fn migration_task(config: Config, db: Database, shutdown: CancellationToken) {
     let work = async {
@@ -113,18 +89,41 @@ pub async fn get_pending_migrations(
     db: &Database,
     now: Zoned,
 ) -> Result<Vec<PendingMigration>, Report> {
-    let sorted_upstreams = SortedUpstreams::new(now.clone(), config.upstreams.values());
+    Ok(join_all(
+        db.get_all_buckets()
+            .await?
+            .iter()
+            .map(|it| get_pending_migrations_for_bucket(it, config, db, now.clone())),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<Vec<_>>, Report>>()
+    .context("failed to retrieve pending migrations")?
+    .into_iter()
+    .flatten()
+    .collect())
+}
 
+async fn get_pending_migrations_for_bucket(
+    bucket: &str,
+    config: &Config,
+    db: &Database,
+    now: Zoned,
+) -> Result<Vec<PendingMigration>, Report> {
+    let sorted_upstreams = config.upstreams_in_order();
     let mut all_actions = Vec::new();
     let mut last_time_start = None;
-    for upstream in sorted_upstreams.iter() {
+
+    for upstream in &sorted_upstreams {
         // out out out | store store store | out out out
         //             ^                   ^
         //             |                   |
         //     max age of this upstream    |
         //     (time_start)        max age of previous upstream (time_end)
         let time_start = upstream
-            .max_age
+            .age_limits
+            .get_max_age(bucket)
+            .limit()
             .map(|it| (&now - it).timestamp())
             .unwrap_or(Timestamp::MIN);
         let time_end = last_time_start.unwrap_or(now.timestamp());
@@ -139,10 +138,11 @@ pub async fn get_pending_migrations(
                 Ok(PendingMigration {
                     source_upstream: upstream.name.clone(),
                     target_upstream: find_correct_upstream_for_object(
+                        bucket,
                         &now,
                         &object,
                         last_modified,
-                        sorted_upstreams.upstreams.as_slice(),
+                        sorted_upstreams.as_slice(),
                     )
                     .context("failed to find target upstream for object")
                     .attach(format!("object: {}/{}", object.bucket, object.key))?
@@ -164,6 +164,7 @@ pub async fn get_pending_migrations(
 }
 
 fn find_correct_upstream_for_object<'u>(
+    bucket: &str,
     now: &Zoned,
     object: &'_ S3ObjectId,
     last_modified: Timestamp,
@@ -171,7 +172,7 @@ fn find_correct_upstream_for_object<'u>(
 ) -> Result<&'u Upstream, Report> {
     sorted_upstreams
         .iter()
-        .find(|upstream| !upstream.is_too_old(now, last_modified))
+        .find(|upstream| upstream.age_is_within_limits(bucket, now, last_modified))
         .copied()
         .context("object is too old for all upstreams")
         .attach(format!("object: {}/{}", object.bucket, object.key))

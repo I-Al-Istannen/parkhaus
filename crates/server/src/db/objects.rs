@@ -133,3 +133,14 @@ pub(super) async fn set_upstream(
 
     Ok(())
 }
+
+pub(super) async fn get_all_buckets(
+    con: &mut SqliteConnection,
+) -> Result<std::collections::HashSet<String>, Report> {
+    let rows = query!("SELECT DISTINCT bucket FROM objects")
+        .fetch_all(con)
+        .await
+        .context("failed to fetch buckets")?;
+
+    Ok(rows.into_iter().map(|row| row.bucket).collect())
+}
