@@ -364,6 +364,10 @@ pub fn load(path: &Path) -> Result<Config, Report> {
         .attach(format!("hint: tried '{}'", path.display()))
         .attach("hint: use '--config <path>' to specify a different config file")?;
 
+    from_raw(raw)
+}
+
+fn from_raw(raw: RawConfig) -> Result<Config, Report> {
     let parsed_upstreams = raw
         .upstreams
         .into_iter()
@@ -402,7 +406,10 @@ fn maybe_env(value: String) -> Result<String, Report> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream};
+    use crate::config::{
+        AddressingStyle, AgeLimits, Config, MaxAge, RawConfig, RawUpstream, S3Secret, Upstream,
+        from_raw,
+    };
     use crate::data::UpstreamId;
     use jiff::Span;
     use rootcause::Report;
@@ -540,5 +547,76 @@ mod tests {
             create_upstream(3, AgeLimits::no_limits()),
         ]);
         assert!(res.is_ok(), "Expected ok, got {}", res.err().unwrap());
+    }
+
+    #[test]
+    fn test_env_interpolation_fails() {
+        let res = from_raw(RawConfig {
+            listen: "127.0.0.1".to_string(),
+            metrics_listen: None,
+            db_path: PathBuf::default(),
+            upstreams: vec![(
+                "test".to_string(),
+                RawUpstream {
+                    order: 1,
+                    base_url: "http://localhost:3000".parse().unwrap(),
+                    addressing_style: AddressingStyle::Path,
+                    max_age: None,
+                    s3_access_key: "env:NON_EXISTENT_ENV_VAR".to_string(),
+                    s3_secret: "env:NON_EXISTENT_ENV_VAR".to_string(),
+                    region: "garage".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert!(res.is_err(), "Expected err, got {:?}", res);
+        assert!(format!("{:?}", res.unwrap_err()).contains("NON_EXISTENT_ENV_VAR"));
+    }
+
+    #[test]
+    fn test_env_interpolation() {
+        let (var_key, var_val) = std::env::vars().next().unwrap();
+        let res = from_raw(RawConfig {
+            listen: "127.0.0.1".to_string(),
+            metrics_listen: None,
+            db_path: PathBuf::default(),
+            upstreams: vec![(
+                "test".to_string(),
+                RawUpstream {
+                    order: 1,
+                    base_url: "http://localhost:3000".parse().unwrap(),
+                    addressing_style: AddressingStyle::Path,
+                    max_age: None,
+                    s3_access_key: format!("env:{var_key}"),
+                    s3_secret: format!("env:{var_key}"),
+                    region: "garage".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        assert!(res.is_ok(), "Expected ok, got {}", res.unwrap_err());
+        assert_eq!(
+            res.as_ref()
+                .unwrap()
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .s3_access_key,
+            var_val
+        );
+        assert_eq!(
+            res.as_ref()
+                .unwrap()
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .s3_secret
+                .0,
+            var_val
+        );
     }
 }
