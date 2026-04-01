@@ -70,14 +70,9 @@ pub async fn proxy_request(
         state.db.clone(),
         upstream.name.clone(),
     );
-    forward_request(
-        &state,
-        upstream,
-        upstream.format_url(&object_id.bucket, Some(&object_id.key))?,
-        req,
-        on_success,
-    )
-    .await
+    let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
+    target_url.url.set_query(req.uri().query());
+    forward_request(&state, upstream, target_url, req, on_success).await
 }
 
 fn get_fallback_upstream<'a>(
