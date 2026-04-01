@@ -106,7 +106,8 @@ async fn forward_request(
 ) -> Result<Response, TierError> {
     let mut out_req = state
         .http
-        .request(in_req.method().clone(), target.url.clone());
+        .request(in_req.method().clone(), target.url.clone())
+        .header(HeaderName::from_static("x-tiering-proxy"), "parkhaus");
 
     if let Some(host_header) = &target.host_header {
         out_req = out_req.header(reqwest::header::HOST, host_header);
