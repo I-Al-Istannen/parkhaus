@@ -4,10 +4,9 @@ use crate::db::Database;
 use crate::metrics::{COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL};
 use crate::s3_client::client::S3Client;
 use axum_prometheus::metrics::counter;
-use futures_util::StreamExt;
 use futures_util::future::join_all;
 use jiff::{Timestamp, Zoned};
-use rand::prelude::IndexedRandom;
+use rand::prelude::SliceRandom;
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
@@ -17,7 +16,7 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-const SAMPLE_ERRORS: usize = 3;
+const SAMPLE_ERRORS: usize = 50;
 
 pub async fn migration_task(config: Config, db: Database, shutdown: CancellationToken) {
     let work = async {
@@ -31,18 +30,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             }
             match execute_pending(&config, &db).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
-                Ok(errors) if errors.is_empty() => {}
-                Ok(errors) => {
-                    error!(
-                        error_count = errors.len(),
-                        "Failed to perform {} migrations. Sampling {SAMPLE_ERRORS} random errors",
-                        errors.len()
-                    );
-                    for (index, error) in errors.sample(&mut rand::rng(), SAMPLE_ERRORS).enumerate()
-                    {
-                        error!(%index, %error, "Error")
-                    }
-                }
+                Ok(errors) => error!(error_count = errors, "Failed to perform migrations",),
             }
             if let Err(error) = db.delete_finished_pending().await {
                 error!(%error, "Failed to delete finished pending migrations");
@@ -72,7 +60,7 @@ async fn compute_pending(config: &Config, db: &Database, now: Zoned) -> Result<(
     Ok::<(), Report>(())
 }
 
-async fn execute_pending(config: &Config, db: &Database) -> Result<Vec<Report>, Report> {
+async fn execute_pending(config: &Config, db: &Database) -> Result<usize, Report> {
     let pending = db
         .get_pending_with_state(None)
         .await
@@ -186,7 +174,7 @@ pub async fn execute_pending_migrations(
     pending: Vec<PendingMigration>,
     config: &Config,
     db: &Database,
-) -> Result<Vec<Report>, Report> {
+) -> Result<usize, Report> {
     debug!(count = pending.len(), "Executing pending migrations");
 
     let client = reqwest::Client::new();
@@ -196,21 +184,39 @@ pub async fn execute_pending_migrations(
         .map(|it| (it.name.clone(), S3Client::for_upstream(client.clone(), it)))
         .collect::<HashMap<_, _>>();
 
-    let errors = futures_util::stream::iter(pending)
-        .then(|action| async {
-            execute_pending_migration(action, &upstream_to_client, db)
-                .await
-                .context("failed to execute a pending migration")
-                .into_report()
-        })
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|it| it.into_dynamic())
-        .collect::<Vec<_>>();
+    let mut errors_printed = 0;
+    let mut errors = Vec::new();
+    let mut total_errors = 0;
 
-    Ok(errors)
+    for action in pending {
+        let res = execute_pending_migration(action, &upstream_to_client, db)
+            .await
+            .context("failed to execute a pending migration")
+            .into_report();
+        let sample_selected = rand::random_range(0..100) == 1;
+        match res {
+            Err(e) if errors_printed < SAMPLE_ERRORS && sample_selected => {
+                error!(%e, "Failed to execute pending migration");
+                errors_printed += 1;
+                total_errors += 1;
+            }
+            Err(e) => {
+                errors.push(e.into_dynamic());
+                total_errors += 1;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    errors.shuffle(&mut rand::rng());
+    while errors_printed < SAMPLE_ERRORS
+        && let Some(report) = errors.pop()
+    {
+        error!(%report, "Failed to execute pending migration");
+        errors_printed += 1;
+    }
+
+    Ok(total_errors)
 }
 
 async fn execute_pending_migration(

@@ -289,7 +289,7 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
 
     db.add_all_pending(&pending).await?;
     let errors = execute_pending_migrations(pending, &config, &db).await?;
-    assert!(errors.is_empty(), "migration execution failed: {errors:?}");
+    assert_eq!(0, errors, "migration execution failed: {errors:?}");
     db.delete_finished_pending().await?;
 
     let tier_to_keys = [
