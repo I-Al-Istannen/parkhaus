@@ -3,6 +3,7 @@ mod logging;
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId};
 use crate::db::Database;
+use crate::error::ReqwestErrorFormatter;
 use crate::import::logging::{bar_progress_style, logger_config};
 use crate::s3_client::client::{BucketInfo, S3Client};
 use reqwest::Client;
@@ -35,6 +36,7 @@ pub async fn import(
         .init();
     Hooks::new()
         .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
+        .context_formatter::<reqwest::Error, _>(ReqwestErrorFormatter)
         .install()
         .context("failed to install hooks")?;
 

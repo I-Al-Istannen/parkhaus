@@ -1,6 +1,9 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use rootcause::Report;
+use rootcause::handlers::{ContextFormattingStyle, FormattingFunction};
+use rootcause::hooks::context_formatter::ContextFormatterHook;
+use rootcause::markers::{Dynamic, Local, Uncloneable};
+use rootcause::{Report, ReportRef};
 use tracing::warn;
 
 pub struct TierError {
@@ -30,6 +33,22 @@ impl<T: ?Sized> From<Report<T>> for TierError {
     fn from(report: Report<T>) -> Self {
         Self {
             report: report.into_dynamic(),
+        }
+    }
+}
+
+pub struct ReqwestErrorFormatter;
+
+impl ContextFormatterHook<reqwest::Error> for ReqwestErrorFormatter {
+    fn preferred_context_formatting_style(
+        &self,
+        _report: ReportRef<'_, Dynamic, Uncloneable, Local>,
+        report_formatting_function: FormattingFunction,
+    ) -> ContextFormattingStyle {
+        ContextFormattingStyle {
+            function: report_formatting_function,
+            follow_source: true,
+            follow_source_depth: None,
         }
     }
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::data::MigrationState;
 use crate::db::Database;
+use crate::error::ReqwestErrorFormatter;
 use crate::import::import;
 use crate::metrics::{GAUGE_PENDING_ACTIONS, initialize_metrics};
 use crate::migrate::migration_task;
@@ -34,6 +35,7 @@ use axum_prometheus::{GenericMetricLayer, Handle, PrometheusMetricLayer};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 use rootcause::Report;
+use rootcause::hooks::Hooks;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
 use tokio::{join, signal};
@@ -111,6 +113,11 @@ async fn serve(config: Arc<Config>, db: Database) -> AppResult<()> {
                 .compact(),
         )
         .init();
+
+    Hooks::new()
+        .context_formatter::<reqwest::Error, _>(ReqwestErrorFormatter)
+        .install()
+        .context("failed to install hooks")?;
 
     let shutdown_token = CancellationToken::new();
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
