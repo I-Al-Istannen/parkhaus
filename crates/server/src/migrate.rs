@@ -187,6 +187,8 @@ pub async fn execute_pending_migrations(
     config: &Config,
     db: &Database,
 ) -> Result<Vec<Report>, Report> {
+    debug!(count = pending.len(), "Executing pending migrations");
+
     let client = reqwest::Client::new();
     let upstream_to_client = config
         .upstreams
@@ -223,7 +225,22 @@ async fn execute_pending_migration(
         object,
     } = &action;
 
+    debug!(
+        from = ?source,
+        to = ?target,
+        %object,
+        ?state,
+        "Executing pending migration"
+    );
+
     if matches!(state, MigrationState::Finished) {
+        debug!(
+            from = ?source,
+            to = ?target,
+            %object,
+            ?state,
+            "Migration already finished"
+        );
         return Ok(());
     }
 
@@ -245,6 +262,13 @@ async fn execute_pending_migration(
     delete_object(db, source_client, &action).await?;
 
     counter!(COUNTER_MIGRATED_OBJECTS_TOTAL).increment(1);
+    debug!(
+        from = ?source,
+        to = ?target,
+        %object,
+        ?state,
+        "Finished migration"
+    );
 
     Ok(())
 }
@@ -257,6 +281,7 @@ async fn upload_object(
     source: &UpstreamId,
     target: &UpstreamId,
 ) -> Result<(), Report> {
+    debug!(source = ?source, target = ?target, %object, "Uploading object");
     let (size, data) = source_client
         .get_file(object)
         .await
@@ -270,6 +295,7 @@ async fn upload_object(
         .context("failed to upload file")
         .attach(format!("object upstream: {target}"))
         .attach(format!("object: {object}"))?;
+    debug!(source = ?source, target = ?target, %object, "Uploaded object");
 
     // At this point we have copied the file over, so we can adjust the upstream.
     // We also _have_ to adjust it, as we then delete the file and failures during
@@ -282,6 +308,7 @@ async fn upload_object(
         .attach(format!("new upstream: {target}"))?;
     // If this update fails we do the whole copy again, but that is fine.
     update_pending_state(db, source, object, MigrationState::CopiedToTarget).await?;
+    debug!(source = ?source, target = ?target, %object, "Updated database after upload");
 
     Ok(())
 }
@@ -291,6 +318,12 @@ async fn delete_object(
     source_client: &S3Client,
     action: &PendingMigration,
 ) -> Result<(), Report> {
+    debug!(
+        source = ?action.source_upstream,
+        target = ?action.target_upstream,
+        object = %action.object,
+        "Deleting object"
+    );
     // This will just return false and succeed if the file is already gone
     source_client
         .delete_file(&action.object)
@@ -299,13 +332,29 @@ async fn delete_object(
         .attach(format!("old upstream: {}", &action.source_upstream))
         .attach(format!("new upstream: {}", &action.target_upstream))
         .attach(format!("object: {}", &action.object))?;
-    update_pending_state(
+
+    debug!(
+        source = ?action.source_upstream,
+        target = ?action.target_upstream,
+        object = %action.object,
+        "Deleted object"
+    );
+
+    let result = update_pending_state(
         db,
         &action.source_upstream,
         &action.object,
         MigrationState::Finished,
     )
-    .await
+    .await;
+    debug!(
+        source = ?action.source_upstream,
+        target = ?action.target_upstream,
+        object = %action.object,
+        "Updated database after deleting object"
+    );
+
+    result
 }
 
 async fn update_pending_state(
