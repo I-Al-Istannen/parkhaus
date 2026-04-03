@@ -201,6 +201,7 @@ pub async fn execute_pending_migrations(
                 total_errors += 1;
             }
             Err(e) => {
+                debug!(%e, "Failed to execute pending migration");
                 errors.push(e.into_dynamic());
                 total_errors += 1;
             }
