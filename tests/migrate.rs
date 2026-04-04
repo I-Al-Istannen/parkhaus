@@ -3,13 +3,12 @@
 use common::garage::GarageInstance;
 use derive_more::Display;
 use jiff::{Span, Unit, Zoned};
-use parkhaus::config::{
-    AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId,
-};
+use parkhaus::config::{AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId};
 use parkhaus::data::{S3Object, S3ObjectId};
 use parkhaus::db::Database;
-use parkhaus::migrate::{compute_pending_migrations, execute_migrations};
-use parkhaus::s3_client::client::{ObjectInfo, S3Client};
+use parkhaus::s3::client::{ObjectInfo, S3Client};
+use parkhaus::s3::types::AddressingStyle;
+use parkhaus::server::migrate::{compute_pending_migrations, execute_migrations};
 use rand::prelude::IndexedRandom;
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng, rng};

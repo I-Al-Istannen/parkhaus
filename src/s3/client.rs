@@ -1,6 +1,7 @@
 use super::crypto::{SignRequest, SigningConfig, StreamingSignRequest};
-use crate::config::{AddressingStyle, Upstream};
-use crate::data::{ForwardObjectUrl, S3ObjectId};
+use crate::config::Upstream;
+use crate::data::S3ObjectId;
+use crate::s3::types::{AddressingStyle, ForwardObjectUrl};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
@@ -419,8 +420,7 @@ struct ChecksumXml {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::AddressingStyle;
-    use crate::s3_client::client::S3Client;
+    use crate::s3::client::{AddressingStyle, S3Client};
     use reqwest::Client;
     use rootcause::Report;
     use std::collections::BTreeMap;

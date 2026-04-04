@@ -1,4 +1,4 @@
-use crate::data::ForwardObjectUrl;
+use crate::s3::types::ForwardObjectUrl;
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};

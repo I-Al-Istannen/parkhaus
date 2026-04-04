@@ -4,7 +4,7 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::{SqliteConnection, query, query_as};
 
-pub(super) async fn get_objects_not_in_range(
+pub(crate) async fn get_objects_not_in_range(
     con: &mut SqliteConnection,
     upstream: &UpstreamId,
     start: Timestamp,
@@ -46,7 +46,7 @@ pub(super) async fn get_objects_not_in_range(
     Ok(objects)
 }
 
-pub(super) async fn add_or_update_in_flight(
+pub(crate) async fn add_or_update_in_flight(
     con: &mut SqliteConnection,
     migration: &InFlightMigration,
 ) -> Result<(), Report> {
@@ -75,7 +75,7 @@ pub(super) async fn add_or_update_in_flight(
     Ok(())
 }
 
-pub(super) async fn delete_in_flight(
+pub(crate) async fn delete_in_flight(
     con: &mut SqliteConnection,
     source_upstream: &UpstreamId,
     object: &S3ObjectId,
@@ -98,7 +98,7 @@ pub(super) async fn delete_in_flight(
     Ok(())
 }
 
-pub(super) async fn get_in_flight(
+pub(crate) async fn get_in_flight(
     con: &mut SqliteConnection,
 ) -> Result<Vec<InFlightMigration>, Report> {
     query_as!(

@@ -1,10 +1,10 @@
+use super::metrics::{
+    COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL, GAUGE_PENDING_ACTIONS,
+};
 use crate::config::{Config, Upstream};
 use crate::data::{InFlightMigration, MigrationState, PendingMigration, S3ObjectId, UpstreamId};
 use crate::db::Database;
-use crate::metrics::{
-    COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL, GAUGE_PENDING_ACTIONS,
-};
-use crate::s3_client::client::S3Client;
+use crate::s3::client::S3Client;
 use axum_prometheus::metrics::{counter, gauge};
 use futures_util::future::join_all;
 use jiff::{Timestamp, Zoned};

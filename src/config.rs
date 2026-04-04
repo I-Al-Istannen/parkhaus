@@ -1,5 +1,4 @@
-use super::toml_utils;
-use crate::data::ForwardObjectUrl;
+use crate::s3::types::{AddressingStyle, ForwardObjectUrl};
 use cmp::Ordering;
 use derive_more::{Display, From};
 use jiff::{Timestamp, Zoned};
@@ -10,74 +9,12 @@ use serde::Serialize;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 use sqlx::Type;
-use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::{cmp, fs};
 use url::Url;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AddressingStyle {
-    Path,
-    VirtualHosted,
-    VirtualHostedResolveDns,
-}
-
-impl AddressingStyle {
-    pub fn format_url(
-        &self,
-        base_url: &Url,
-        bucket: &str,
-        key: Option<&str>,
-    ) -> Result<ForwardObjectUrl, Report> {
-        let mut url = base_url.clone();
-        let host = base_url.host_str().ok_or_else(|| {
-            report!("base URL must have a host").attach(format!("url: {base_url}"))
-        })?;
-        let host = format!("{bucket}.{host}");
-        let mut segments = url.path_segments_mut().map_err(|()| {
-            report!("base URL cannot be cannot-be-a-base").attach(format!("url: {base_url}"))
-        })?;
-
-        Ok(match self {
-            Self::Path => {
-                segments.push(bucket);
-                if let Some(key) = key {
-                    segments.extend(key.split('/'));
-                }
-                drop(segments);
-                ForwardObjectUrl::no_host(url)
-            }
-            Self::VirtualHosted => {
-                if let Some(key) = key {
-                    segments.extend(key.split('/'));
-                }
-                drop(segments);
-                ForwardObjectUrl::with_host(url, host)
-            }
-            Self::VirtualHostedResolveDns => {
-                if let Some(key) = key {
-                    segments.extend(key.split('/'));
-                }
-                drop(segments);
-                url.set_host(Some(&host)).map_err(|err| {
-                    report!("failed to set virtual hosted endpoint").attach(format!("error: {err}"))
-                })?;
-                ForwardObjectUrl::no_host(url)
-            }
-        })
-    }
-
-    pub fn format_bucket_url(
-        &self,
-        base_url: &Url,
-        bucket: &str,
-    ) -> Result<ForwardObjectUrl, Report> {
-        self.format_url(base_url, bucket, None)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -359,7 +296,10 @@ struct RawUpstream {
 }
 
 pub fn load(path: &Path) -> Result<Config, Report> {
-    let raw: RawConfig = toml_utils::load_from_file(path)
+    let text =
+        fs::read_to_string(path).context(format!("failed reading data at {}", path.display()))?;
+    let raw: RawConfig = toml::from_str(&text)
+        .map_err(|e| pretty_toml_error(path, &text, e))
         .context("failed to load config")
         .attach(format!("hint: tried '{}'", path.display()))
         .attach("hint: use '--config <path>' to specify a different config file")?;
@@ -402,6 +342,30 @@ fn maybe_env(value: String) -> Result<String, Report> {
         .attach("hint: value starts with 'env:', so it is expected to be an env variable")
         .attach(format!("env variable: `{env_var}`"))
         .map_err(Report::into_dynamic)
+}
+
+fn pretty_toml_error(path: &Path, raw: &str, error: toml::de::Error) -> Report<String> {
+    let mut summary = format!("failed to parse TOML config at {}", path.display());
+
+    if let Some(span) = error.span() {
+        let (line, column) = byte_offset_to_line_col(raw, span.start);
+        summary.push_str(&format!(" (line {line}, column {column})"));
+    }
+
+    report!(summary).attach(error.message().to_string())
+}
+
+fn byte_offset_to_line_col(input: &str, offset: usize) -> (usize, usize) {
+    let bounded = offset.min(input.len());
+    let prefix = input.get(..bounded).unwrap_or(input);
+
+    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map_or(1, |it| it.chars().count() + 1);
+
+    (line, column)
 }
 
 #[cfg(test)]

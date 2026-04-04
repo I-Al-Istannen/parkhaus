@@ -3,9 +3,9 @@
 use crate::common::garage::GarageInstance;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use parkhaus::config::AddressingStyle;
 use parkhaus::data::S3ObjectId;
-use parkhaus::s3_client::client::{CHUNK_SIZE, S3Client};
+use parkhaus::s3::client::{CHUNK_SIZE, S3Client};
+use parkhaus::s3::types::AddressingStyle;
 use reqwest::Client;
 use rootcause::Report;
 use sha2::Digest;

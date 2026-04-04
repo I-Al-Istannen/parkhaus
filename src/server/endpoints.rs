@@ -1,17 +1,19 @@
-use crate::AppState;
-use crate::config::{Config, Upstream, UpstreamId};
-use crate::data::{ForwardObjectUrl, S3Object, S3ObjectId};
+use crate::config::{Config, Upstream};
+use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use crate::db::Database;
 use crate::error::TierError;
-use crate::metrics::{
+use crate::s3::types::ForwardObjectUrl;
+use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
+use crate::server::state::AppState;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
+use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use tracing::{debug, warn};

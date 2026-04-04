@@ -1,6 +1,61 @@
 #![allow(unused_crate_dependencies)]
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use parkhaus::db::Database;
+use parkhaus::{cli, config};
+use rootcause::Report;
+use rootcause::prelude::ResultExt;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, arg_required_else_help = true)]
+struct Cli {
+    #[arg(long, short)]
+    config: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// A lightweight and transparent S3 proxy server implementing object tiering.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Start the proxy server.
+    Serve,
+    /// Import objects from all configured upstreams into the local database.
+    Import {
+        /// Optional timestamp to use as the last modified time for all imported objects.
+        /// If not provided, the last modified time from S3 will be used.
+        #[arg(long)]
+        import_time: Option<jiff::Timestamp>,
+    },
+}
+
 #[tokio::main]
 async fn main() {
-    parkhaus::main().await;
+    if let Err(error) = run().await {
+        eprintln!("Application error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Report> {
+    let cli = Cli::parse();
+    let config = Arc::new(config::load(&cli.config)?);
+    let db = Database::new(&config.db_path)
+        .await
+        .context("failed to initialize database")
+        .attach(format!("path: {}", &config.db_path.display()))?;
+
+    let result = match cli.command {
+        Command::Serve => cli::serve::run(config, db.clone()).await,
+        Command::Import { import_time } => cli::import::run(config, db.clone(), import_time).await,
+    };
+
+    if let Err(error) = db.close().await {
+        eprintln!("Failed to close database: {error}");
+    }
+
+    result
 }

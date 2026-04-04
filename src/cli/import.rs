@@ -1,44 +1,37 @@
-mod logging;
-
+use super::logging::{
+    TierLogFormatter, bar_progress_style, env_filter, get_indicatif_layer, setup_rootcause_hooks,
+};
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId};
 use crate::db::Database;
-use crate::error::ReqwestErrorFormatter;
-use crate::import::logging::{bar_progress_style, logger_config};
-use crate::s3_client::client::{BucketInfo, S3Client};
+use crate::s3::client::{BucketInfo, S3Client};
 use reqwest::Client;
 use rootcause::Report;
-use rootcause::hooks::Hooks;
-use rootcause::hooks::builtin_hooks::report_formatter::DefaultReportFormatter;
 use rootcause::prelude::ResultExt;
 use rootcause_tracing::RootcauseLayer;
 use std::sync::Arc;
-use tracing::{Instrument, Span, info, info_span};
+use tracing::{Instrument, Span, info, info_span, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-pub async fn import(
+pub async fn run(
     config: Arc<Config>,
     db: Database,
     import_time: Option<jiff::Timestamp>,
 ) -> Result<(), Report> {
-    let indicatif_layer =
-        logging::get_indicatif_layer().context("failed to build indicatif layer")?;
-
+    let indicatif_layer = get_indicatif_layer().context("failed to build indicatif layer")?;
     tracing_subscriber::registry()
-        .with(logger_config(indicatif_layer.get_stderr_writer()))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .event_format(TierLogFormatter)
+                .with_writer(indicatif_layer.get_stderr_writer()),
+        )
         .with(RootcauseLayer)
         .with(indicatif_layer)
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with(env_filter())
         .init();
-    Hooks::new()
-        .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
-        .context_formatter::<reqwest::Error, _>(ReqwestErrorFormatter)
-        .install()
-        .context("failed to install hooks")?;
+    setup_rootcause_hooks()?;
 
     let client = Client::builder()
         .build()
@@ -54,7 +47,7 @@ pub async fn import(
     Ok(())
 }
 
-#[tracing::instrument(skip_all, fields(name = %upstream.name), name = "Importing buckets of upstream")]
+#[instrument(skip_all, fields(name = %upstream.name), name = "Importing buckets of upstream")]
 pub async fn import_upstream(
     client: Client,
     db: &Database,

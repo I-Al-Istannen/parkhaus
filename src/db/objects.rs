@@ -4,7 +4,7 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::{SqliteConnection, query, query_as};
 
-pub(super) struct DbObject {
+pub(crate) struct DbObject {
     bucket: String,
     key: String,
     assigned_upstream: UpstreamId,
@@ -31,7 +31,7 @@ impl TryFrom<DbObject> for S3Object {
     }
 }
 
-pub(super) async fn get_object(
+pub(crate) async fn get_object(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<S3Object, Report> {
@@ -48,7 +48,7 @@ pub(super) async fn get_object(
     .try_into()
 }
 
-pub(super) async fn get_upstream(
+pub(crate) async fn get_upstream(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<Option<UpstreamId>, Report> {
@@ -65,7 +65,7 @@ pub(super) async fn get_upstream(
     .map(UpstreamId))
 }
 
-pub(super) async fn delete_object(
+pub(crate) async fn delete_object(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<(), Report> {
@@ -82,7 +82,7 @@ pub(super) async fn delete_object(
     Ok(())
 }
 
-pub(super) async fn record_creation(
+pub(crate) async fn record_creation(
     con: &mut SqliteConnection,
     obj: &S3Object,
 ) -> Result<(), Report> {
@@ -110,7 +110,7 @@ pub(super) async fn record_creation(
     Ok(())
 }
 
-pub(super) async fn set_upstream(
+pub(crate) async fn set_upstream(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
     upstream: &UpstreamId,
@@ -134,7 +134,7 @@ pub(super) async fn set_upstream(
     Ok(())
 }
 
-pub(super) async fn get_all_buckets(
+pub(crate) async fn get_all_buckets(
     con: &mut SqliteConnection,
 ) -> Result<std::collections::HashSet<String>, Report> {
     let rows = query!("SELECT DISTINCT bucket FROM objects")

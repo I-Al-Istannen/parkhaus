@@ -1,15 +1,18 @@
+use crate::error::ReqwestErrorFormatter;
 use dialoguer::console::style;
 use rootcause::Report;
+use rootcause::hooks::Hooks;
+use rootcause::hooks::builtin_hooks::report_formatter::DefaultReportFormatter;
 use rootcause::prelude::ResultExt;
 use std::env;
 use tracing::Subscriber;
 use tracing::field::Visit;
+use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::style::ProgressStyle;
-use tracing_indicatif::{IndicatifLayer, IndicatifWriter};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{Layer, Registry};
 
 pub struct DimmedFieldNames;
 
@@ -97,14 +100,6 @@ pub fn get_indicatif_layer<T: Subscriber + for<'a> LookupSpan<'a>>()
         .with_span_child_prefix_symbol("↳ "))
 }
 
-pub fn logger_config(writer: IndicatifWriter) -> Box<dyn Layer<Registry> + Send + Sync> {
-    Box::new(
-        tracing_subscriber::fmt::layer()
-            .event_format(TierLogFormatter)
-            .with_writer(writer),
-    )
-}
-
 pub fn bar_progress_style() -> Result<ProgressStyle, Report> {
     let template = "{span_child_prefix} [{elapsed_precise:.bold}] {span_name:.bold.cyan} \
 {span_fields} {wide_bar:.cyan} {pos}/{len}";
@@ -120,4 +115,17 @@ pub fn spinner_style() -> Result<ProgressStyle, Report> {
     Ok(ProgressStyle::with_template(template)
         .context("failed to create progress style")?
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⢰", "⣰", "⣠", "⣄", "⣆", "⠇", "⠏", "✓"]))
+}
+
+pub fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+}
+
+pub fn setup_rootcause_hooks() -> Result<(), Report> {
+    Hooks::new()
+        .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
+        .context_formatter::<reqwest::Error, _>(ReqwestErrorFormatter)
+        .install()
+        .context("failed to install hooks")
+        .map_err(Report::into_dynamic)
 }
