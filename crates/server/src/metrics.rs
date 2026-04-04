@@ -1,6 +1,4 @@
-use crate::config::Config;
-use crate::data::MigrationState;
-use axum_prometheus::metrics::{describe_counter, describe_gauge, gauge};
+use axum_prometheus::metrics::{describe_counter, describe_gauge};
 
 pub const GAUGE_PENDING_ACTIONS: &str = "pending_actions";
 pub const COUNTER_MIGRATION_RUNS_TOTAL: &str = "migration_runs_total";
@@ -36,22 +34,4 @@ pub fn initialize_metrics() {
         COUNTER_OBJECT_DELETIONS_TOTAL,
         "Total number of object deletion requests"
     );
-}
-
-pub fn reset_pending_migrations_gauge(config: &Config) {
-    for source in config.upstreams.keys() {
-        for target in config.upstreams.keys() {
-            if source == target {
-                continue;
-            }
-            for state in MigrationState::all() {
-                gauge!(GAUGE_PENDING_ACTIONS,
-                    "source" => source.0.clone(),
-                    "target" => target.0.clone(),
-                    "state" => state.to_string()
-                )
-                .set(0.0);
-            }
-        }
-    }
 }

@@ -25,14 +25,13 @@ pub struct S3Object {
 
 #[derive(Debug, Copy, Clone, Serialize, Display, sqlx::Type)]
 pub enum MigrationState {
-    Pending,
+    Started,
     CopiedToTarget,
-    Finished,
 }
 
 impl MigrationState {
     pub fn all() -> &'static [Self] {
-        &[Self::Pending, Self::CopiedToTarget, Self::Finished]
+        &[Self::Started, Self::CopiedToTarget]
     }
 }
 
@@ -41,6 +40,11 @@ pub struct PendingMigration {
     pub object: S3ObjectId,
     pub source_upstream: UpstreamId,
     pub target_upstream: UpstreamId,
+}
+
+#[derive(Debug, Clone)]
+pub struct InFlightMigration {
+    pub pending: PendingMigration,
     pub state: MigrationState,
 }
 

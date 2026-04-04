@@ -174,13 +174,19 @@ class Backend:
         ).fetchall()
         return {row[0]: row[1] for row in res}
 
-    def pending_migrations_count(self) -> int:
-        res = self.sqlite_connection.execute(
-            "SELECT COUNT(*) FROM PendingMigrations"
-        ).fetchone()
-        return res[0]
+    def get_current_migration_run_num(self) -> int:
+        response = requests.get(f"http://localhost:{METRICS_PORT}/metrics").text
+        lines = [
+            line
+            for line in response.splitlines()
+            if line.startswith("migration_runs_total")
+        ]
+        if lines:
+            return int(lines[0].split()[-1])
+        return 0
 
     def wait_for_tier_changes(self):
+        initial_migration_run = self.get_current_migration_run_num()
         deadline = (
             time.time() + 5 * 60
         )  # 5 minutes timeout to avoid infinite loops in case of issues
@@ -200,9 +206,9 @@ class Backend:
                 error("Timed out waiting for tier changes to be processed")
                 raise TimeoutError("Timed out waiting for tier changes to be processed")
 
-        while self.pending_migrations_count() > 0:
+        while initial_migration_run == self.get_current_migration_run_num():
             info(
-                f"Waiting for pending migrations to be processed ({self.pending_migrations_count()} remaining)...",
+                f"Waiting for pending migrations to be processed (run {self.get_current_migration_run_num()})...",
                 level=4,
             )
             time.sleep(2)

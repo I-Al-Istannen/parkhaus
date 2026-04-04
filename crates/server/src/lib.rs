@@ -21,15 +21,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::data::MigrationState;
 use crate::db::Database;
 use crate::error::ReqwestErrorFormatter;
 use crate::import::import;
-use crate::metrics::{GAUGE_PENDING_ACTIONS, initialize_metrics};
+use crate::metrics::initialize_metrics;
 use crate::migrate::migration_task;
 use axum::Router;
 use axum::routing::{any, get};
-use axum_prometheus::metrics::gauge;
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use axum_prometheus::{GenericMetricLayer, Handle, PrometheusMetricLayer};
 use clap::{Parser, Subcommand};
@@ -127,8 +125,7 @@ async fn serve(config: Arc<Config>, db: Database) -> AppResult<()> {
         prometheus_layer,
         shutdown_token.clone(),
     );
-    let metrics_server =
-        start_metric_server(config.clone(), db, metric_handle, shutdown_token.clone());
+    let metrics_server = start_metric_server(config.clone(), metric_handle, shutdown_token.clone());
 
     initialize_metrics();
 
@@ -182,7 +179,6 @@ async fn start_main_server(
 
 async fn start_metric_server(
     config: Arc<Config>,
-    database: Database,
     metric_handle: PrometheusHandle,
     shutdown_token: CancellationToken,
 ) -> Result<(), Report> {
@@ -197,27 +193,7 @@ async fn start_metric_server(
 
     axum::serve(
         listener,
-        Router::new().route(
-            "/metrics",
-            get(|| async move {
-                // Initialize all to zero so they have a value even if there are none pending
-                metrics::reset_pending_migrations_gauge(&config);
-
-                for state in MigrationState::all() {
-                    if let Ok(pending) = database.get_pending_per_upstream(Some(*state)).await {
-                        for (source, target, actions) in pending {
-                            gauge!(GAUGE_PENDING_ACTIONS,
-                                "source" => source.0.clone(),
-                                "target" => target.0.clone(),
-                                "state" => state.to_string()
-                            )
-                            .set(actions as f64);
-                        }
-                    }
-                }
-                metric_handle.render()
-            }),
-        ),
+        Router::new().route("/metrics", get(|| async move { metric_handle.render() })),
     )
     .with_graceful_shutdown(shutdown_token.cancelled_owned())
     .await

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        DELETE FROM InFlightMigrations\n        WHERE source_upstream = $1 AND bucket = $2 AND key = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "7ce043a143a85e8fb2cff1b7059b5664d488c26e7c4f0f3898afa633a2190090"
+}

@@ -1,7 +1,7 @@
 mod migrate;
 mod objects;
 
-use crate::data::{MigrationState, PendingMigration, S3Object, S3ObjectId, UpstreamId};
+use crate::data::{InFlightMigration, S3Object, S3ObjectId, UpstreamId};
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
@@ -159,40 +159,25 @@ impl Database {
 
     /// Adds all migrations in a transaction (to speed up database operations).
     /// Duplicates are silently ignored and their state is not adjusted.
-    pub async fn add_all_pending(&self, migrations: &[PendingMigration]) -> Result<(), Report> {
-        let con = self.write().await;
-        let mut transaction = con.begin().await.context("begin transaction")?;
-        for migration in migrations {
-            migrate::add_pending(&mut transaction, migration).await?;
-        }
-        transaction.commit().await?;
-
-        Ok(())
-    }
-
-    pub async fn set_pending_state(
+    pub async fn upsert_in_flight_migration(
         &self,
-        source_upstream: &UpstreamId,
-        object: &S3ObjectId,
-        state: MigrationState,
+        migration: &InFlightMigration,
     ) -> Result<(), Report> {
         let con = self.write().await;
-        migrate::set_pending_state(
+        migrate::add_or_update_in_flight(
             &mut *con.acquire().await.context("acquire con")?,
-            source_upstream,
-            object,
-            state,
+            migration,
         )
         .await
     }
 
-    pub async fn delete_pending(
+    pub async fn delete_in_flight(
         &self,
         source_upstream: &UpstreamId,
         object: &S3ObjectId,
     ) -> Result<(), Report> {
         let con = self.write().await;
-        migrate::delete_pending(
+        migrate::delete_in_flight(
             &mut *con.acquire().await.context("acquire con")?,
             source_upstream,
             object,
@@ -200,27 +185,9 @@ impl Database {
         .await
     }
 
-    pub async fn delete_finished_pending(&self) -> Result<(), Report> {
-        let con = self.write().await;
-        migrate::delete_finished_pending(&mut *con.acquire().await.context("acquire con")?).await
-    }
-
-    pub async fn get_pending_with_state(
-        &self,
-        state: Option<MigrationState>,
-    ) -> Result<Vec<PendingMigration>, Report> {
+    pub async fn get_in_flight(&self) -> Result<Vec<InFlightMigration>, Report> {
         let con = self.read().await;
-        migrate::get_pending_with_state(&mut *con.acquire().await.context("acquire con")?, state)
-            .await
-    }
-
-    pub async fn get_pending_per_upstream(
-        &self,
-        state: Option<MigrationState>,
-    ) -> Result<Vec<(UpstreamId, UpstreamId, usize)>, Report> {
-        let con = self.read().await;
-        migrate::get_pending_per_upstream(&mut *con.acquire().await.context("acquire con")?, state)
-            .await
+        migrate::get_in_flight(&mut *con.acquire().await.context("acquire con")?).await
     }
 
     pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {

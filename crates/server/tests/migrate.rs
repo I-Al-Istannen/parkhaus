@@ -11,7 +11,7 @@ use rootcause::{Report, bail};
 use server::config::{AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId};
 use server::data::{S3Object, S3ObjectId};
 use server::db::Database;
-use server::migrate::{execute_pending_migrations, get_pending_migrations};
+use server::migrate::{compute_pending_migrations, execute_migrations};
 use server::s3_client::client::{ObjectInfo, S3Client};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -169,7 +169,7 @@ async fn get_pending_migrations_randomized_ages_match_expected_targets() -> Resu
         }
     }
 
-    let pending = get_pending_migrations(&test_config()?, &db, now.clone()).await?;
+    let pending = compute_pending_migrations(&test_config()?, &db, now.clone()).await?;
     let got = pending
         .into_iter()
         .map(|pending| {
@@ -274,7 +274,7 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         }
     }
 
-    let pending = get_pending_migrations(&config, &db, now.clone()).await?;
+    let pending = compute_pending_migrations(&config, &db, now.clone()).await?;
     let pending_set = pending
         .iter()
         .map(|it| {
@@ -287,10 +287,8 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         .collect::<HashSet<_>>();
     assert_eq!(pending_set, expected_pending, "pending migrations mismatch");
 
-    db.add_all_pending(&pending).await?;
-    let errors = execute_pending_migrations(pending, &config, &db).await?;
+    let errors = execute_migrations(pending, Vec::new(), &config, &db).await?;
     assert_eq!(0, errors, "migration execution failed: {errors:?}");
-    db.delete_finished_pending().await?;
 
     let tier_to_keys = [
         (
@@ -336,8 +334,8 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         assert_eq!(actual_payload, object.payload);
     }
 
-    let left_pending = db.get_pending_with_state(None).await?;
-    assert!(left_pending.is_empty());
+    let left_in_flight = db.get_in_flight().await?;
+    assert!(left_in_flight.is_empty());
 
     db.close().await?;
     Ok(())

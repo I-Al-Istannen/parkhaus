@@ -1,7 +1,7 @@
-use crate::data::{MigrationState, PendingMigration, S3ObjectId, UpstreamId};
+use crate::data::{InFlightMigration, MigrationState, PendingMigration, S3ObjectId, UpstreamId};
 use jiff::Timestamp;
+use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use rootcause::{Report, report};
 use sqlx::{SqliteConnection, query, query_as};
 
 pub(super) async fn get_objects_not_in_range(
@@ -46,148 +46,70 @@ pub(super) async fn get_objects_not_in_range(
     Ok(objects)
 }
 
-pub(super) async fn add_pending(
+pub(super) async fn add_or_update_in_flight(
     con: &mut SqliteConnection,
-    migration: &PendingMigration,
+    migration: &InFlightMigration,
 ) -> Result<(), Report> {
+    let pending = &migration.pending;
     query!(
         r#"
-        INSERT INTO PendingMigrations
+        INSERT INTO InFlightMigrations
             (source_upstream, target_upstream, bucket, key, state)
         VALUES
             ($1, $2, $3, $4, $5)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT DO UPDATE SET
+            state = EXCLUDED.state,
+            target_upstream = EXCLUDED.target_upstream
         "#,
-        migration.source_upstream,
-        migration.target_upstream,
-        migration.object.bucket,
-        migration.object.key,
+        pending.source_upstream,
+        pending.target_upstream,
+        pending.object.bucket,
+        pending.object.key,
         migration.state
     )
     .execute(con)
     .await
-    .context("failed to add pending migration")
+    .context("failed to add or update in-flight migration")
     .attach(format!("migration: {:?}", migration))?;
 
     Ok(())
 }
 
-pub(super) async fn set_pending_state(
-    con: &mut SqliteConnection,
-    source_upstream: &UpstreamId,
-    object: &S3ObjectId,
-    state: MigrationState,
-) -> Result<(), Report> {
-    let res = query!(
-        r#"
-        UPDATE PendingMigrations
-        SET state = $1
-        WHERE source_upstream = $2 AND bucket = $3 AND key = $4
-        "#,
-        state,
-        source_upstream,
-        object.bucket,
-        object.key
-    )
-    .execute(con)
-    .await
-    .context("failed to set pending migration state")
-    .attach(format!("upstream: {source_upstream}"))
-    .attach(format!("object: {object}"))
-    .attach(format!("new state: {state:?}"))?;
-
-    if res.rows_affected() == 0 {
-        return Err(
-            report!("failed to find existing pending migration to update")
-                .attach(format!("upstream: {source_upstream}"))
-                .attach(format!("object: {object}"))
-                .attach(format!("new state: {state:?}")),
-        );
-    }
-
-    Ok(())
-}
-
-pub(super) async fn delete_pending(
+pub(super) async fn delete_in_flight(
     con: &mut SqliteConnection,
     source_upstream: &UpstreamId,
     object: &S3ObjectId,
 ) -> Result<(), Report> {
     query!(
         r#"
-        DELETE FROM PendingMigrations
-               WHERE
-                   source_upstream = $1 AND bucket = $2 AND key = $3 "#,
+        DELETE FROM InFlightMigrations
+        WHERE source_upstream = $1 AND bucket = $2 AND key = $3
+        "#,
         source_upstream,
         object.bucket,
         object.key
     )
     .execute(con)
     .await
-    .context("failed to delete pending migration")
+    .context("failed to delete in-flight migration")
     .attach(format!("upstream: {source_upstream}"))
     .attach(format!("object: {object}"))?;
 
     Ok(())
 }
 
-pub(super) async fn delete_finished_pending(con: &mut SqliteConnection) -> Result<(), Report> {
-    query!(
-        r#"
-        DELETE FROM PendingMigrations
-        WHERE state = 'Finished'
-        "#
-    )
-    .execute(con)
-    .await
-    .context("failed to delete finished pending migrations")?;
-
-    Ok(())
-}
-
-pub(super) async fn get_pending_with_state(
+pub(super) async fn get_in_flight(
     con: &mut SqliteConnection,
-    state: Option<MigrationState>,
-) -> Result<Vec<PendingMigration>, Report> {
-    let res = query_as!(
-        DbPendingMigration,
+) -> Result<Vec<InFlightMigration>, Report> {
+    query_as!(
+        DbInFlightMigration,
         r#"
         SELECT
             source_upstream, target_upstream, bucket, key, state as "state: MigrationState"
-        FROM PendingMigrations
-        WHERE (state = $1) OR ($1 IS NULL)
-        "#,
-        state
+        FROM InFlightMigrations
+        "#
     )
-    .map(PendingMigration::from)
-    .fetch_all(con)
-    .await
-    .context("failed to get pending migrations")
-    .attach(format!("state: {:?}", state))?;
-
-    Ok(res)
-}
-
-pub(super) async fn get_pending_per_upstream(
-    con: &mut SqliteConnection,
-    state: Option<MigrationState>,
-) -> Result<Vec<(UpstreamId, UpstreamId, usize)>, Report> {
-    query!(
-        r#"
-        SELECT source_upstream, target_upstream, COUNT(*) as count
-        FROM PendingMigrations
-        WHERE (state = $1) OR ($1 IS NULL)
-        GROUP BY source_upstream, target_upstream
-        "#,
-        state
-    )
-    .map(|it| {
-        (
-            UpstreamId(it.source_upstream),
-            UpstreamId(it.target_upstream),
-            it.count as usize,
-        )
-    })
+    .map(InFlightMigration::from)
     .fetch_all(con)
     .await
     .context("failed to get pending migrations")
@@ -195,7 +117,7 @@ pub(super) async fn get_pending_per_upstream(
 }
 
 #[derive(Debug, Clone)]
-struct DbPendingMigration {
+struct DbInFlightMigration {
     bucket: String,
     key: String,
     source_upstream: UpstreamId,
@@ -203,15 +125,17 @@ struct DbPendingMigration {
     state: MigrationState,
 }
 
-impl From<DbPendingMigration> for PendingMigration {
-    fn from(value: DbPendingMigration) -> Self {
+impl From<DbInFlightMigration> for InFlightMigration {
+    fn from(value: DbInFlightMigration) -> Self {
         Self {
-            object: S3ObjectId {
-                bucket: value.bucket,
-                key: value.key,
+            pending: PendingMigration {
+                object: S3ObjectId {
+                    bucket: value.bucket,
+                    key: value.key,
+                },
+                source_upstream: value.source_upstream,
+                target_upstream: value.target_upstream,
             },
-            source_upstream: value.source_upstream,
-            target_upstream: value.target_upstream,
             state: value.state,
         }
     }

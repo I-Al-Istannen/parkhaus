@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO InFlightMigrations\n            (source_upstream, target_upstream, bucket, key, state)\n        VALUES\n            ($1, $2, $3, $4, $5)\n        ON CONFLICT DO UPDATE SET\n            state = EXCLUDED.state,\n            target_upstream = EXCLUDED.target_upstream\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "7e8de48c11d35ce5f4eea7c10807d972010c079b2e764231494e73f50ea60057"
+}
