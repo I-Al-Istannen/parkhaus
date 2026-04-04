@@ -3,11 +3,11 @@
 use crate::common::garage::GarageInstance;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use parkhaus::config::AddressingStyle;
+use parkhaus::data::S3ObjectId;
+use parkhaus::s3_client::client::{CHUNK_SIZE, S3Client};
 use reqwest::Client;
 use rootcause::Report;
-use server::config::AddressingStyle;
-use server::data::S3ObjectId;
-use server::s3_client::client::{CHUNK_SIZE, S3Client};
 use sha2::Digest;
 use std::io::Cursor;
 use tokio::io::AsyncReadExt;

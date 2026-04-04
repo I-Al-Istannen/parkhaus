@@ -33,7 +33,7 @@
           build-crane =
             craneLib.buildPackage {
               inherit pname;
-              version = (pkgs.lib.importTOML ./Cargo.toml).workspace.package.version;
+              version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
               doCheck = false;
 
               src = pkgs.lib.cleanSourceWith {

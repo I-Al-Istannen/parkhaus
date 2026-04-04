@@ -1972,8 +1972,35 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "parkhaus"
 version = "0.1.0"
 dependencies = [
- "server",
+ "axum",
+ "axum-prometheus",
+ "base64 0.22.1",
+ "clap",
+ "ctor",
+ "derive_more",
+ "dialoguer",
+ "futures-util",
+ "hex",
+ "hmac",
+ "jiff",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.10.0",
+ "reqwest",
+ "rootcause",
+ "rootcause-tracing",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "testcontainers",
  "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2882,41 +2909,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-prometheus",
- "base64 0.22.1",
- "clap",
- "ctor",
- "derive_more",
- "dialoguer",
- "futures-util",
- "hex",
- "hmac",
- "jiff",
- "percent-encoding",
- "quick-xml",
- "rand 0.10.0",
- "reqwest",
- "rootcause",
- "rootcause-tracing",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "testcontainers",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-indicatif",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]

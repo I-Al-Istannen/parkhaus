@@ -2,13 +2,13 @@
 
 use crate::common::garage::GarageInstance;
 use jiff::Timestamp;
+use parkhaus::config::{AddressingStyle, AgeLimits, S3Secret, Upstream, UpstreamId};
+use parkhaus::data::S3ObjectId;
+use parkhaus::db::Database;
+use parkhaus::import::import_upstream;
+use parkhaus::s3_client::client::S3Client;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use server::config::{AddressingStyle, AgeLimits, S3Secret, Upstream, UpstreamId};
-use server::data::S3ObjectId;
-use server::db::Database;
-use server::import::import_upstream;
-use server::s3_client::client::S3Client;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Duration;

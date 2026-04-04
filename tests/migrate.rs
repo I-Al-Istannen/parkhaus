@@ -3,16 +3,18 @@
 use common::garage::GarageInstance;
 use derive_more::Display;
 use jiff::{Span, Unit, Zoned};
+use parkhaus::config::{
+    AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId,
+};
+use parkhaus::data::{S3Object, S3ObjectId};
+use parkhaus::db::Database;
+use parkhaus::migrate::{compute_pending_migrations, execute_migrations};
+use parkhaus::s3_client::client::{ObjectInfo, S3Client};
 use rand::prelude::IndexedRandom;
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng, rng};
 use reqwest::Client;
 use rootcause::{Report, bail};
-use server::config::{AddressingStyle, AgeLimits, Config, MaxAge, S3Secret, Upstream, UpstreamId};
-use server::data::{S3Object, S3ObjectId};
-use server::db::Database;
-use server::migrate::{compute_pending_migrations, execute_migrations};
-use server::s3_client::client::{ObjectInfo, S3Client};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
