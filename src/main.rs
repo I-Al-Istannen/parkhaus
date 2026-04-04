@@ -1,13 +1,12 @@
 #![allow(unused_crate_dependencies)]
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use clap::{Parser, Subcommand};
 use parkhaus::db::Database;
 use parkhaus::{cli, config};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, arg_required_else_help = true)]
