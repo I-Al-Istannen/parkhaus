@@ -1,7 +1,10 @@
 mod migrate;
 mod objects;
 
-use crate::data::{InFlightMigration, S3Object, S3ObjectId, UpstreamId};
+pub use self::objects::TierRuleEnv;
+use crate::data::{
+    InFlightMigration, PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId,
+};
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
@@ -193,6 +196,18 @@ impl Database {
     pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {
         let con = self.read().await;
         objects::get_all_buckets(&mut *con.acquire().await.context("acquire con")?).await
+    }
+
+    pub async fn get_pending_migrations_for_rule(
+        &self,
+        rule: &TieringRule,
+    ) -> Result<Vec<PendingMigration>, Report> {
+        let con = self.read().await;
+        objects::get_pending_migrations_for_rule(
+            &mut *con.acquire().await.context("acquire con")?,
+            rule,
+        )
+        .await
     }
 
     pub async fn close(self) -> Result<(), Report> {

@@ -1,4 +1,5 @@
 pub(crate) use crate::config::UpstreamId;
+use crate::policy::tier_rule::TieringRuleQuery;
 use derive_more::Display;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
@@ -45,4 +46,10 @@ pub struct PendingMigration {
 pub struct InFlightMigration {
     pub pending: PendingMigration,
     pub state: MigrationState,
+}
+
+#[derive(Debug, Clone)]
+pub struct TieringRule {
+    pub query: TieringRuleQuery,
+    pub to: UpstreamId,
 }

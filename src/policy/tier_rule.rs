@@ -1,40 +1,6 @@
-use crate::policy::expr::{Env, Expr, Operator, Type, Typechecked};
+use crate::db::TierRuleEnv;
+use crate::policy::expr::{Expr, Operator, Typechecked};
 use jiff::Zoned;
-use sqlx::query::Query;
-use sqlx::{Database, Sqlite};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TierRuleEnv;
-
-impl TierRuleEnv {
-    fn synthesize_variable_sql(name: &str, now_var: &str) -> String {
-        match name {
-            "age" => format!("({now_var} - last_modified)"),
-            "bucket" => "bucket".to_string(),
-            "object" => "(bucket || '/' || key)".to_string(),
-            "key" => "key".to_string(),
-            "size" => todo!(),
-            _ => unreachable!("Unknown variable: {}", name),
-        }
-    }
-
-    fn format_now(now: &Zoned) -> i64 {
-        now.timestamp().as_millisecond()
-    }
-}
-
-impl Env for TierRuleEnv {
-    fn get_var(name: &str) -> Option<Type> {
-        match name {
-            "age" => Some(Type::Number),
-            "bucket" => Some(Type::String),
-            "object" => Some(Type::String),
-            "key" => Some(Type::String),
-            "size" => Some(Type::Number),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum SqlArgument {
@@ -101,37 +67,17 @@ impl SqlBuilder {
 }
 
 #[derive(Debug, Clone)]
-pub struct SqlQuery {
-    sql: String,
-    arguments: Vec<SqlArgument>,
+pub struct TieringRuleQuery {
+    pub condition: String,
+    pub arguments: Vec<SqlArgument>,
 }
 
-impl SqlQuery {
-    pub fn to_where_clause(&self) -> &str {
-        &self.sql
-    }
-
-    #[allow(single_use_lifetimes)] // I do not see a way around it?
-    pub fn bind<'query, 'slf: 'query>(
-        &'slf self,
-        mut query: Query<'query, Sqlite, <Sqlite as Database>::Arguments<'query>>,
-    ) -> Query<'query, Sqlite, <Sqlite as Database>::Arguments<'query>> {
-        for arg in &self.arguments {
-            query = match arg {
-                SqlArgument::String(str) => query.bind(str),
-                SqlArgument::Number(num) => query.bind(num),
-            };
-        }
-        query
-    }
-}
-
-pub fn to_sql(expr: Expr<Typechecked<TierRuleEnv>>, now: &Zoned) -> SqlQuery {
+pub fn to_sql(expr: Expr<Typechecked<TierRuleEnv>>, now: &Zoned) -> TieringRuleQuery {
     let mut builder = SqlBuilder::new(now);
     let sql = builder.add_expr(&expr);
 
-    SqlQuery {
-        sql,
+    TieringRuleQuery {
+        condition: sql,
         arguments: builder.arguments,
     }
 }

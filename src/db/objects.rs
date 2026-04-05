@@ -1,10 +1,48 @@
-use crate::data::{S3Object, S3ObjectId, UpstreamId};
-use jiff::Timestamp;
+use crate::data::{PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId};
+use crate::policy::expr::{Env, Type};
+use crate::policy::tier_rule::SqlArgument;
+use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use sqlx::{SqliteConnection, query, query_as};
+use sqlx::{FromRow, Sqlite, SqliteConnection, query, query_as};
 
-pub(crate) struct DbObject {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TierRuleEnv;
+
+impl TierRuleEnv {
+    pub fn synthesize_variable_sql(name: &str, now_var: &str) -> String {
+        match name {
+            "age" => format!("({now_var} - last_modified)"),
+            "bucket" => "bucket".to_string(),
+            "object" => "(bucket || '/' || key)".to_string(),
+            "key" => "key".to_string(),
+            "upstream" => "assigned_upstream".to_string(),
+            "size" => todo!(),
+            _ => unreachable!("Unknown variable: {}", name),
+        }
+    }
+
+    pub fn format_now(now: &Zoned) -> i64 {
+        now.timestamp().as_millisecond()
+    }
+}
+
+impl Env for TierRuleEnv {
+    fn get_var(name: &str) -> Option<Type> {
+        match name {
+            "age" => Some(Type::Number),
+            "bucket" => Some(Type::String),
+            "object" => Some(Type::String),
+            "key" => Some(Type::String),
+            "upstream" => Some(Type::String),
+            "size" => Some(Type::Number),
+            _ => None,
+        }
+    }
+}
+
+#[derive(FromRow)]
+pub struct DbObject {
     bucket: String,
     key: String,
     assigned_upstream: UpstreamId,
@@ -31,7 +69,7 @@ impl TryFrom<DbObject> for S3Object {
     }
 }
 
-pub(crate) async fn get_object(
+pub(super) async fn get_object(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<S3Object, Report> {
@@ -48,7 +86,7 @@ pub(crate) async fn get_object(
     .try_into()
 }
 
-pub(crate) async fn get_upstream(
+pub(super) async fn get_upstream(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<Option<UpstreamId>, Report> {
@@ -65,7 +103,7 @@ pub(crate) async fn get_upstream(
     .map(UpstreamId))
 }
 
-pub(crate) async fn delete_object(
+pub(super) async fn delete_object(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
 ) -> Result<(), Report> {
@@ -82,7 +120,7 @@ pub(crate) async fn delete_object(
     Ok(())
 }
 
-pub(crate) async fn record_creation(
+pub(super) async fn record_creation(
     con: &mut SqliteConnection,
     obj: &S3Object,
 ) -> Result<(), Report> {
@@ -110,7 +148,7 @@ pub(crate) async fn record_creation(
     Ok(())
 }
 
-pub(crate) async fn set_upstream(
+pub(super) async fn set_upstream(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
     upstream: &UpstreamId,
@@ -134,7 +172,7 @@ pub(crate) async fn set_upstream(
     Ok(())
 }
 
-pub(crate) async fn get_all_buckets(
+pub(super) async fn get_all_buckets(
     con: &mut SqliteConnection,
 ) -> Result<std::collections::HashSet<String>, Report> {
     let rows = query!("SELECT DISTINCT bucket FROM objects")
@@ -143,4 +181,34 @@ pub(crate) async fn get_all_buckets(
         .context("failed to fetch buckets")?;
 
     Ok(rows.into_iter().map(|row| row.bucket).collect())
+}
+
+pub(super) async fn get_pending_migrations_for_rule(
+    con: &mut SqliteConnection,
+    rule: &TieringRule,
+) -> Result<Vec<PendingMigration>, Report> {
+    let sql = format!("SELECT * FROM Objects WHERE {}", &rule.query.condition);
+    let mut query = query_as::<Sqlite, DbObject>(&sql);
+    for arg in &rule.query.arguments {
+        query = match arg {
+            SqlArgument::String(str) => query.bind(str),
+            SqlArgument::Number(num) => query.bind(num),
+        };
+    }
+    let migrations: Vec<PendingMigration> = query
+        .fetch_all(con)
+        .await
+        .context("failed to get objects for rule")?
+        .into_iter()
+        .map(|obj| PendingMigration {
+            object: S3ObjectId {
+                bucket: obj.bucket,
+                key: obj.key,
+            },
+            source_upstream: obj.assigned_upstream,
+            target_upstream: rule.to.clone(),
+        })
+        .collect();
+
+    Ok(migrations)
 }
