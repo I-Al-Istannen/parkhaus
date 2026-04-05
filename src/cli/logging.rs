@@ -1,4 +1,5 @@
-use crate::error::ReqwestErrorFormatter;
+use crate::error::{AriadneErrorFormatter, ReqwestErrorFormatter};
+use crate::policy::expr::AnnotatedError;
 use dialoguer::console::style;
 use rootcause::Report;
 use rootcause::hooks::Hooks;
@@ -125,6 +126,7 @@ pub fn setup_rootcause_hooks() -> Result<(), Report> {
     Hooks::new()
         .report_formatter(DefaultReportFormatter::UNICODE_COLORS)
         .context_formatter::<reqwest::Error, _>(ReqwestErrorFormatter)
+        .context_formatter::<AnnotatedError, _>(AriadneErrorFormatter)
         .install()
         .context("failed to install hooks")
         .map_err(Report::into_dynamic)

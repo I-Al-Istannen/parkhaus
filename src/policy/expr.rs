@@ -8,13 +8,13 @@ use std::ops::Range;
 
 type OurErr<'src> = extra::Err<Rich<'src, char>>;
 
-pub struct AnnotatedError(pub ariadne::Report<'static, ((), Range<usize>)>);
+pub struct AnnotatedError(pub ariadne::Report<'static, ((), Range<usize>)>, String);
 
 impl AnnotatedError {
-    pub fn format(&self, source: &str) -> Result<String, Report> {
+    pub fn format(&self) -> Result<String, Report> {
         let mut out = Vec::new();
         self.0
-            .write_for_stdout(Source::from(source), &mut out)
+            .write_for_stdout(Source::from(&self.1), &mut out)
             .map_err(|_| std::fmt::Error)?;
 
         Ok(String::from_utf8_lossy(&out).to_string())
@@ -244,7 +244,8 @@ pub fn parse_expr(inp: &str) -> Result<Spanned<Expr<Raw>>, Report<AnnotatedError
                             .with_message(error.to_string())
                             .with_color(Color::Red),
                     )
-                    .finish()
+                    .finish(),
+                inp.to_string()
             )))
         }
     }
@@ -252,14 +253,15 @@ pub fn parse_expr(inp: &str) -> Result<Spanned<Expr<Raw>>, Report<AnnotatedError
 
 pub fn typecheck<E: Env + Clone>(
     expr: Spanned<Expr<Raw>>,
+    src: &str,
 ) -> Result<Expr<Typechecked<E>>, Report<AnnotatedError>> {
-    let check_inner = |e| map_expr(e, typecheck);
+    let check_inner = |e| map_expr(e, |it| typecheck(it, src));
     macro_rules! bin_op {
         ($l:expr, $r:expr, $op:ident, $l_ty:ident, $r_ty:ident, $res_ty:ident) => {
             Expr::Operator(
                 Operator::$op(
-                    check_inner($l)?.assert_typ(expr.span, Type::$l_ty)?,
-                    check_inner($r)?.assert_typ(expr.span, Type::$r_ty)?,
+                    check_inner($l)?.assert_typ(expr.span, src, Type::$l_ty)?,
+                    check_inner($r)?.assert_typ(expr.span, src, Type::$r_ty)?,
                 ),
                 Typechecked::new(Type::$res_ty),
             )
@@ -287,6 +289,7 @@ pub fn typecheck<E: Env + Clone>(
                                 .with_color(Color::Red),
                         )
                         .finish(),
+                    src.to_string()
                 )));
             }
             Expr::Operator(Operator::$op(l, r), Typechecked::new(Type::Bool))
@@ -308,6 +311,7 @@ pub fn typecheck<E: Env + Clone>(
                                 .with_color(Color::Red),
                         )
                         .finish(),
+                    src.to_string()
                 )));
             };
             Expr::Variable(var, Typechecked::new(typ))
@@ -316,11 +320,11 @@ pub fn typecheck<E: Env + Clone>(
         Expr::String(s, _) => Expr::String(s, Typechecked::new(Type::String)),
         Expr::Operator(op, _) => match op {
             Operator::Negate(r) => Expr::Operator(
-                Operator::Negate(check_inner(r)?.assert_typ(expr.span, Type::Number)?),
+                Operator::Negate(check_inner(r)?.assert_typ(expr.span, src, Type::Number)?),
                 Typechecked::new(Type::Number),
             ),
             Operator::Not(r) => Expr::Operator(
-                Operator::Negate(check_inner(r)?.assert_typ(expr.span, Type::Bool)?),
+                Operator::Negate(check_inner(r)?.assert_typ(expr.span, src, Type::Bool)?),
                 Typechecked::new(Type::Bool),
             ),
             Operator::Times(l, r) => bin_op!(l, r, Times, Number, Number, Number),
@@ -357,7 +361,12 @@ where
     Self: Sized,
 {
     fn typ(&self) -> Type;
-    fn assert_typ(self, full_span: SimpleSpan, typ: Type) -> Result<Self, Report<AnnotatedError>>;
+    fn assert_typ(
+        self,
+        full_span: SimpleSpan,
+        src: &str,
+        typ: Type,
+    ) -> Result<Self, Report<AnnotatedError>>;
 }
 
 impl<E: Clone> Typeable for Box<Spanned<Expr<Typechecked<E>>>> {
@@ -365,7 +374,12 @@ impl<E: Clone> Typeable for Box<Spanned<Expr<Typechecked<E>>>> {
         self.data().typ
     }
 
-    fn assert_typ(self, full_span: SimpleSpan, typ: Type) -> Result<Self, Report<AnnotatedError>> {
+    fn assert_typ(
+        self,
+        full_span: SimpleSpan,
+        src: &str,
+        typ: Type,
+    ) -> Result<Self, Report<AnnotatedError>> {
         if self.typ() != typ {
             return Err(report!(AnnotatedError(
                 ariadne::Report::build(ReportKind::Error, ((), full_span.into_range()))
@@ -382,6 +396,7 @@ impl<E: Clone> Typeable for Box<Spanned<Expr<Typechecked<E>>>> {
                             .with_color(Color::Red),
                     )
                     .finish(),
+                src.to_string()
             )));
         }
         Ok(self)
@@ -568,7 +583,7 @@ mod tests {
                 println!(
                     "{}",
                     e.current_context()
-                        .format(inp)
+                        .format()
                         .expect("Parsing should succeed")
                 );
                 panic!("Parsing should succeed");

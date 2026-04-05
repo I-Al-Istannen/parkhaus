@@ -1,9 +1,11 @@
+use crate::policy::expr::AnnotatedError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use rootcause::handlers::{ContextFormattingStyle, FormattingFunction};
 use rootcause::hooks::context_formatter::ContextFormatterHook;
 use rootcause::markers::{Dynamic, Local, Uncloneable};
 use rootcause::{Report, ReportRef};
+use std::fmt::Formatter;
 use tracing::warn;
 
 pub struct TierError {
@@ -50,5 +52,21 @@ impl ContextFormatterHook<reqwest::Error> for ReqwestErrorFormatter {
             follow_source: true,
             follow_source_depth: None,
         }
+    }
+}
+
+pub struct AriadneErrorFormatter;
+
+impl ContextFormatterHook<AnnotatedError> for AriadneErrorFormatter {
+    fn display(
+        &self,
+        report: ReportRef<'_, AnnotatedError, Uncloneable, Local>,
+        formatter: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        let val = report
+            .current_context()
+            .format()
+            .map_err(|_| std::fmt::Error)?;
+        formatter.write_str(&val)
     }
 }
