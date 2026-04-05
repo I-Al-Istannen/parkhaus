@@ -160,6 +160,22 @@ fn p_int<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
         })
 }
 
+fn p_time_span<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
+    let p_suffix = choice((
+        p_int()
+            .then_ignore(just('d'))
+            .map(|it| it * 1000 * 60 * 60 * 24),
+        p_int().then_ignore(just('h')).map(|it| it * 1000 * 60 * 60),
+        p_int().then_ignore(just('m')).map(|it| it * 1000 * 60),
+        p_int().then_ignore(just('s')).map(|it| it * 1000),
+    ));
+    p_suffix
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<i64>>()
+        .map(|parts| parts.iter().sum())
+}
+
 fn p_string<'src>() -> impl Parser<'src, &'src str, String, OurErr<'src>> + Clone {
     let esc = just('\\').ignore_then(any());
     choice((esc, any().filter(|it: &char| *it != '\'')))
@@ -175,8 +191,9 @@ fn p_var<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clon
 }
 
 fn p_atom<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clone {
-    p_int()
+    p_time_span()
         .map(|it| Expr::Number(it, Raw))
+        .or(p_int().map(|it| Expr::Number(it, Raw)))
         .or(p_string().map(|it| Expr::String(it, Raw)))
         .or(p_var())
 }
@@ -436,13 +453,7 @@ mod tests {
         string_regex("[a-zA-Z_][a-zA-Z0-9_]{0,8}").expect("valid identifier regex")
     }
 
-    fn integer_strategy() -> impl Strategy<Value = String> {
-        any::<i64>()
-            .prop_filter("i64::MIN is not representable", |n| *n != i64::MIN)
-            .prop_map(|n| n.to_string())
-    }
-
-    fn integer_value_strategy() -> impl Strategy<Value = i64> {
+    fn integer_strategy() -> impl Strategy<Value = i64> {
         any::<i64>().prop_filter("i64::MIN is not representable", |n| *n != i64::MIN)
     }
 
@@ -452,6 +463,45 @@ mod tests {
 
     fn string_literal_strategy() -> impl Strategy<Value = String> {
         string_content_strategy().prop_map(|content| format!("'{content}'"))
+    }
+
+    fn time_span_parts_strategy() -> impl Strategy<Value = Vec<(i64, char)>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0_i64..=365).prop_map(|value| (value, 'd')),
+                (0_i64..=24 * 31).prop_map(|value| (value, 'h')),
+                (0_i64..=60 * 24).prop_map(|value| (value, 'm')),
+                (0_i64..=60 * 60).prop_map(|value| (value, 's')),
+            ],
+            1..=4,
+        )
+    }
+
+    fn render_time_span(parts: &[(i64, char)]) -> String {
+        parts
+            .iter()
+            .map(|(value, unit)| format!("{value}{unit}"))
+            .collect::<String>()
+    }
+
+    fn time_span_to_millis(parts: &[(i64, char)]) -> i64 {
+        parts
+            .iter()
+            .map(|(value, unit)| {
+                value
+                    * match unit {
+                        'd' => 1000 * 60 * 60 * 24,
+                        'h' => 1000 * 60 * 60,
+                        'm' => 1000 * 60,
+                        's' => 1000,
+                        _ => unreachable!("time span strategy only emits known units"),
+                    }
+            })
+            .sum()
+    }
+
+    fn time_span_literal_strategy() -> impl Strategy<Value = String> {
+        time_span_parts_strategy().prop_map(|parts| render_time_span(&parts))
     }
 
     fn unary_op_strategy() -> impl Strategy<Value = &'static str> {
@@ -487,8 +537,9 @@ mod tests {
     fn expr_strategy() -> impl Strategy<Value = String> {
         let atom = prop_oneof![
             identifier_strategy(),
-            integer_strategy(),
+            integer_strategy().prop_map(|it| it.to_string()),
             string_literal_strategy(),
+            time_span_literal_strategy(),
         ];
 
         atom.prop_recursive(4, 64, 2, |inner| {
@@ -510,7 +561,7 @@ mod tests {
     fn ast_strategy() -> impl Strategy<Value = Spanned<Expr<Raw>>> {
         let atom = prop_oneof![
             identifier_strategy().prop_map(|name| spanned(Expr::Variable(name, Raw))),
-            integer_value_strategy().prop_map(|number| spanned(Expr::Number(number, Raw))),
+            integer_strategy().prop_map(|number| spanned(Expr::Number(number, Raw))),
             string_content_strategy().prop_map(|value| spanned(Expr::String(value, Raw))),
         ];
 
@@ -607,6 +658,23 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn parse_expr_accepts_generated_time_spans(span in time_span_literal_strategy()) {
+            prop_assert!(
+                parse_expr(&span).is_ok(),
+                "generated time span failed to parse: {span}"
+            );
+        }
+
+        #[test]
+        fn parse_expr_time_spans_convert_to_millis(parts in time_span_parts_strategy()) {
+            let span = render_time_span(&parts);
+            let expected = time_span_to_millis(&parts);
+            let parsed = parse_pretty(&span);
+
+            prop_assert_eq!(parsed.inner, Expr::Number(expected, Raw));
+        }
+
         #[test]
         fn parse_expr_accepts_generated_expressions(expr in expr_strategy()) {
             prop_assert!(
