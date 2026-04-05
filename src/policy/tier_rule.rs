@@ -1,11 +1,14 @@
-use crate::db::TierRuleEnv;
+use crate::db::TieringRuleEnv;
 use crate::policy::expr::{Expr, Operator, Typechecked};
 use jiff::Zoned;
 
 #[derive(Debug, Clone)]
 pub enum SqlArgument {
     String(String),
+    /// Time in seconds
+    TimeSpan(i64),
     Number(i64),
+    Bool(bool),
 }
 
 struct SqlBuilder {
@@ -19,7 +22,7 @@ impl SqlBuilder {
             arguments: Vec::new(),
             now_arg: "$1".to_string(),
         };
-        me.add_arg(SqlArgument::Number(TierRuleEnv::format_now(now)));
+        me.add_arg(SqlArgument::TimeSpan(now.timestamp().as_second()));
         me
     }
 
@@ -28,7 +31,7 @@ impl SqlBuilder {
         format!("${}", self.arguments.len())
     }
 
-    fn add_expr(&mut self, expr: &Expr<Typechecked<TierRuleEnv>>) -> String {
+    fn add_expr(&mut self, expr: &Expr<Typechecked<TieringRuleEnv>>) -> String {
         macro_rules! bin {
             ($l:expr, $r:expr, $op:literal) => {
                 format!(
@@ -41,10 +44,12 @@ impl SqlBuilder {
         }
         match expr {
             Expr::Variable(var, _) => {
-                TierRuleEnv::synthesize_variable_sql(var, &self.now_arg).to_string()
+                TieringRuleEnv::synthesize_variable_sql(var, &self.now_arg).to_string()
             }
             Expr::Number(num, _) => self.add_arg(SqlArgument::Number(*num)),
+            Expr::TimeSpan(num, _) => self.add_arg(SqlArgument::TimeSpan(*num)),
             Expr::String(str, _) => self.add_arg(SqlArgument::String(str.clone())),
+            Expr::Bool(b, _) => self.add_arg(SqlArgument::Bool(*b)),
             Expr::Operator(op, _) => match op {
                 Operator::Negate(inner) => format!("(-{})", self.add_expr(&inner.inner)),
                 Operator::Not(inner) => format!("(NOT {})", self.add_expr(&inner.inner)),
@@ -72,7 +77,7 @@ pub struct TieringRuleQuery {
     pub arguments: Vec<SqlArgument>,
 }
 
-pub fn to_sql(expr: Expr<Typechecked<TierRuleEnv>>, now: &Zoned) -> TieringRuleQuery {
+pub fn to_sql(expr: Expr<Typechecked<TieringRuleEnv>>, now: &Zoned) -> TieringRuleQuery {
     let mut builder = SqlBuilder::new(now);
     let sql = builder.add_expr(&expr);
 

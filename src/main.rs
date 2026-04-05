@@ -1,6 +1,7 @@
 #![allow(unused_crate_dependencies)]
 
 use clap::{Parser, Subcommand};
+use parkhaus::cli::logging;
 use parkhaus::db::Database;
 use parkhaus::{cli, config};
 use rootcause::Report;
@@ -40,6 +41,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Report> {
+    logging::setup_rootcause_hooks().context("failed to install error handler hooks")?;
+
     let cli = Cli::parse();
     let config = Arc::new(config::load(&cli.config)?);
     let db = Database::new(&config.db_path)

@@ -1,22 +1,22 @@
 use super::metrics::{
     COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL, GAUGE_PENDING_ACTIONS,
 };
-use crate::config::{Config, Upstream};
-use crate::data::{InFlightMigration, MigrationState, PendingMigration, S3ObjectId, UpstreamId};
+use crate::config::Config;
+use crate::data::{InFlightMigration, MigrationState, PendingMigration, UpstreamId};
 use crate::db::Database;
 use crate::s3::client::S3Client;
 use axum_prometheus::metrics::{counter, gauge};
-use futures_util::future::join_all;
-use jiff::{Timestamp, Zoned};
+use jiff::Zoned;
 use rand::prelude::SliceRandom;
 use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use std::collections::{HashMap, HashSet};
+use std::ops::Not;
 use std::time::Duration;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 const SAMPLE_ERRORS: usize = 50;
 const METRICS_STATE_PENDING: &str = "Pending";
@@ -64,95 +64,41 @@ pub async fn compute_pending_migrations(
     db: &Database,
     now: Zoned,
 ) -> Result<Vec<PendingMigration>, Report> {
-    Ok(join_all(
-        db.get_all_buckets()
-            .await?
-            .iter()
-            .map(|it| compute_pending_migrations_for_bucket(it, config, db, now.clone())),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<Vec<_>>, Report>>()
-    .context("failed to retrieve pending migrations")?
-    .into_iter()
-    .flatten()
-    .collect())
-}
+    let mut all_migrations = Vec::new();
 
-async fn compute_pending_migrations_for_bucket(
-    bucket: &str,
-    config: &Config,
-    db: &Database,
-    now: Zoned,
-) -> Result<Vec<PendingMigration>, Report> {
-    let sorted_upstreams = config.upstreams_in_order();
-    let mut all_actions = Vec::new();
-    let mut last_time_start = None;
-
-    for upstream in &sorted_upstreams {
-        // out out out | store store store | out out out
-        //             ^                   ^
-        //             |                   |
-        //     max age of this upstream    |
-        //     (time_start)        max age of previous upstream (time_end)
-        let time_start = upstream
-            .age_limits
-            .get_max_age(bucket)
-            .limit()
-            .map(|it| (&now - it).timestamp())
-            .unwrap_or(Timestamp::MIN);
-        let time_end = last_time_start.unwrap_or(now.timestamp());
-
-        let actions = db
-            .get_objects_not_in_range(&upstream.name, time_start, time_end)
+    for rule in &config.tiering_rules {
+        let pending = db
+            .get_pending_migrations_for_rule(rule, &now)
             .await
-            .context("get objects in migration time range")
-            .attach(format!("upstream: {}", upstream.name))?
-            .into_iter()
-            .filter(|(obj, _)| obj.bucket == bucket)
-            .map(|(object, last_modified)| {
-                Ok(PendingMigration {
-                    source_upstream: upstream.name.clone(),
-                    target_upstream: find_correct_upstream_for_object(
-                        bucket,
-                        &now,
-                        &object,
-                        last_modified,
-                        sorted_upstreams.as_slice(),
-                    )
-                    .context("failed to find target upstream for object")
-                    .attach(format!("object: {}/{}", object.bucket, object.key))?
-                    .name
-                    .clone(),
-                    object,
-                })
-            })
-            .collect::<Result<Vec<PendingMigration>, Report>>()
-            .context("failed to find correct upstream for some object in migration time range")
-            .attach(format!("upstream: {}", upstream.name))?;
-
-        all_actions.extend(actions);
-        last_time_start = Some(time_start);
+            .context("failed to apply rule")?;
+        all_migrations.extend(pending);
     }
 
-    Ok(all_actions)
-}
+    let mut set = HashSet::new();
+    all_migrations.retain(|migration| set.insert(migration.object.clone()));
 
-fn find_correct_upstream_for_object<'u>(
-    bucket: &str,
-    now: &Zoned,
-    object: &'_ S3ObjectId,
-    last_modified: Timestamp,
-    sorted_upstreams: &'_ [&'u Upstream],
-) -> Result<&'u Upstream, Report> {
-    sorted_upstreams
-        .iter()
-        .find(|upstream| upstream.age_is_within_limits(bucket, now, last_modified))
-        .copied()
-        .context("object is too old for all upstreams")
-        .attach(format!("object: {}/{}", object.bucket, object.key))
-        .attach(format!("last_modified: {last_modified}"))
-        .map_err(Report::into_dynamic)
+    if set.is_empty().not() {
+        debug!(
+            covered_twice=%set.len(),
+            "Overlapping rules found, covered {} objects more than once. Prioritizing first rule.",
+            set.len()
+        )
+    }
+    for object in set {
+        trace!(%object, "Covered object more than once");
+    }
+
+    // Remove migrations that don't do anything. This must be done at the end to handle this case:
+    // hot : age <= 2d
+    // warm: age <= 3d
+    // In this case an object in hot matches both, hot and warm. It currently is in hot though,
+    // but this migration _must not_ be dropped, otherwise it is migrated to warm.
+    // When in warm this happens in reverse and it is moved back up to hot, ping-ponging
+    // between the two. Therefore, we retain "bogus" no-op migrations up until we realize them here,
+    // to allow the user to write overlapping rules that work as intuitively expected.
+    all_migrations.retain(|migration| migration.target_upstream != migration.source_upstream);
+
+    Ok(all_migrations)
 }
 
 /// Executes a set of migration actions and returns all accumulated errors.

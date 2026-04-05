@@ -3455,6 +3455,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "percent-encoding",
+ "regex",
  "serde",
  "serde_urlencoded",
  "sqlx-core",

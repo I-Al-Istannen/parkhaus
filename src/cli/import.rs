@@ -1,6 +1,4 @@
-use super::logging::{
-    TierLogFormatter, bar_progress_style, env_filter, get_indicatif_layer, setup_rootcause_hooks,
-};
+use super::logging::{TierLogFormatter, bar_progress_style, env_filter, get_indicatif_layer};
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId};
 use crate::db::Database;
@@ -31,7 +29,6 @@ pub async fn run(
         .with(indicatif_layer)
         .with(env_filter())
         .init();
-    setup_rootcause_hooks()?;
 
     let client = Client::builder()
         .build()

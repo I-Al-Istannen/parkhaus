@@ -1,11 +1,11 @@
 mod migrate;
 mod objects;
 
-pub use self::objects::TierRuleEnv;
+pub use self::objects::TieringRuleEnv;
 use crate::data::{
     InFlightMigration, PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId,
 };
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::sqlite::{
@@ -21,7 +21,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    con: Arc<RwLock<Pool<Sqlite>>>,
+    pub con: Arc<RwLock<Pool<Sqlite>>>,
     path: Option<PathBuf>,
 }
 
@@ -40,7 +40,8 @@ impl Database {
                     .synchronous(SqliteSynchronous::Normal)
                     .pragma("temp_store", "memory")
                     .pragma("mmap_size", "30000000000")
-                    .in_memory(true),
+                    .in_memory(true)
+                    .with_regexp(),
             )
             .await?;
 
@@ -58,7 +59,8 @@ impl Database {
                 .synchronous(SqliteSynchronous::Normal)
                 .pragma("temp_store", "memory")
                 .pragma("mmap_size", "30000000000")
-                .filename(path),
+                .filename(path)
+                .with_regexp(),
         )
         .await?;
 
@@ -201,11 +203,13 @@ impl Database {
     pub async fn get_pending_migrations_for_rule(
         &self,
         rule: &TieringRule,
+        now: &Zoned,
     ) -> Result<Vec<PendingMigration>, Report> {
         let con = self.read().await;
         objects::get_pending_migrations_for_rule(
             &mut *con.acquire().await.context("acquire con")?,
             rule,
+            now,
         )
         .await
     }

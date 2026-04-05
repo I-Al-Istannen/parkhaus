@@ -4,6 +4,7 @@ use chumsky::prelude::*;
 use chumsky::text::TextExpected;
 use derive_more::Display;
 use rootcause::{Report, report};
+use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -106,12 +107,21 @@ impl<T: Clone> Operator<T> {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr<T: Clone> {
     Variable(String, T),
     Number(i64, T),
+    /// Time in seconds
+    TimeSpan(i64, T),
+    Bool(bool, T),
     String(String, T),
     Operator(Operator<T>, T),
+}
+
+impl<T: Clone> Display for Expr<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_debug_string())
+    }
 }
 
 impl<T: Clone> Expr<T> {
@@ -119,7 +129,9 @@ impl<T: Clone> Expr<T> {
         match self {
             Self::Variable(_, data) => data,
             Self::Number(_, data) => data,
+            Self::TimeSpan(_, data) => data,
             Self::String(_, data) => data,
+            Self::Bool(_, data) => data,
             Self::Operator(_, data) => data,
         }
     }
@@ -128,7 +140,36 @@ impl<T: Clone> Expr<T> {
         match self {
             Self::Variable(var, _) => var.clone(),
             Self::Number(num, _) => num.to_string(),
+            Self::TimeSpan(secs, _) => {
+                // subdivide out days, hours, minutes, seconds
+                let days = secs / 86400;
+                let hours = (secs % 86400) / 3600;
+                let mins = (secs % 3600) / 60;
+                let secs = secs % 60;
+                let mut s = String::new();
+                if days > 0 {
+                    s += &days.to_string();
+                    s += "d";
+                }
+                if hours > 0 {
+                    s += &hours.to_string();
+                    s += "h";
+                }
+                if mins > 0 {
+                    s += &mins.to_string();
+                    s += "m";
+                }
+                if secs > 0 {
+                    s += &secs.to_string();
+                    s += "s";
+                }
+                if s.is_empty() {
+                    s += "0s";
+                }
+                s
+            }
             Self::String(str, _) => format!("\'{}\'", str),
+            Self::Bool(bool, _) => bool.to_string(),
             Self::Operator(op, _) => op.to_debug_string(),
         }
     }
@@ -162,12 +203,10 @@ fn p_int<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
 
 fn p_time_span<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
     let p_suffix = choice((
-        p_int()
-            .then_ignore(just('d'))
-            .map(|it| it * 1000 * 60 * 60 * 24),
-        p_int().then_ignore(just('h')).map(|it| it * 1000 * 60 * 60),
-        p_int().then_ignore(just('m')).map(|it| it * 1000 * 60),
-        p_int().then_ignore(just('s')).map(|it| it * 1000),
+        p_int().then_ignore(just('d')).map(|it| it * 60 * 60 * 24),
+        p_int().then_ignore(just('h')).map(|it| it * 60 * 60),
+        p_int().then_ignore(just('m')).map(|it| it * 60),
+        p_int().then_ignore(just('s')).map(|it| it),
     ));
     p_suffix
         .repeated()
@@ -184,6 +223,10 @@ fn p_string<'src>() -> impl Parser<'src, &'src str, String, OurErr<'src>> + Clon
         .padded_by(just("'"))
 }
 
+fn p_bool<'src>() -> impl Parser<'src, &'src str, bool, OurErr<'src>> + Clone {
+    just("true").map(|_| true).or(just("false").map(|_| false))
+}
+
 fn p_var<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clone {
     text::ident()
         .map(String::from)
@@ -192,8 +235,9 @@ fn p_var<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clon
 
 fn p_atom<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clone {
     p_time_span()
-        .map(|it| Expr::Number(it, Raw))
+        .map(|it| Expr::TimeSpan(it, Raw))
         .or(p_int().map(|it| Expr::Number(it, Raw)))
+        .or(p_bool().map(|it| Expr::Bool(it, Raw)))
         .or(p_string().map(|it| Expr::String(it, Raw)))
         .or(p_var())
 }
@@ -349,7 +393,9 @@ pub fn typecheck<E: Env + Clone>(
             Expr::Variable(var, Typechecked::new(typ))
         }
         Expr::Number(num, _) => Expr::Number(num, Typechecked::new(Type::Number)),
+        Expr::TimeSpan(num, _) => Expr::TimeSpan(num, Typechecked::new(Type::Number)),
         Expr::String(s, _) => Expr::String(s, Typechecked::new(Type::String)),
+        Expr::Bool(b, _) => Expr::Bool(b, Typechecked::new(Type::Bool)),
         Expr::Operator(op, _) => match op {
             Operator::Negate(r) => Expr::Operator(
                 Operator::Negate(check_inner(r)?.assert_typ(expr.span, src, Type::Number)?),
@@ -465,6 +511,10 @@ mod tests {
         string_content_strategy().prop_map(|content| format!("'{content}'"))
     }
 
+    fn bool_literal_strategy() -> impl Strategy<Value = String> {
+        any::<bool>().prop_map(|value| value.to_string())
+    }
+
     fn time_span_parts_strategy() -> impl Strategy<Value = Vec<(i64, char)>> {
         prop::collection::vec(
             prop_oneof![
@@ -490,10 +540,10 @@ mod tests {
             .map(|(value, unit)| {
                 value
                     * match unit {
-                        'd' => 1000 * 60 * 60 * 24,
-                        'h' => 1000 * 60 * 60,
-                        'm' => 1000 * 60,
-                        's' => 1000,
+                        'd' => 60 * 60 * 24,
+                        'h' => 60 * 60,
+                        'm' => 60,
+                        's' => 1,
                         _ => unreachable!("time span strategy only emits known units"),
                     }
             })
@@ -539,6 +589,7 @@ mod tests {
             identifier_strategy(),
             integer_strategy().prop_map(|it| it.to_string()),
             string_literal_strategy(),
+            bool_literal_strategy(),
             time_span_literal_strategy(),
         ];
 
@@ -563,6 +614,9 @@ mod tests {
             identifier_strategy().prop_map(|name| spanned(Expr::Variable(name, Raw))),
             integer_strategy().prop_map(|number| spanned(Expr::Number(number, Raw))),
             string_content_strategy().prop_map(|value| spanned(Expr::String(value, Raw))),
+            any::<bool>().prop_map(|value| spanned(Expr::Bool(value, Raw))),
+            time_span_parts_strategy()
+                .prop_map(|parts| spanned(Expr::TimeSpan(time_span_to_millis(&parts), Raw))),
         ];
 
         atom.prop_recursive(4, 128, 3, |inner| {
@@ -593,7 +647,9 @@ mod tests {
         match expr {
             Expr::Variable(name, data) => Expr::Variable(name.clone(), data),
             Expr::Number(number, data) => Expr::Number(number, data),
+            Expr::TimeSpan(number, data) => Expr::TimeSpan(number, data),
             Expr::String(value, data) => Expr::String(value.clone(), data),
+            Expr::Bool(value, data) => Expr::Bool(value, data),
             Expr::Operator(Operator::Negate(rhs), data) => {
                 let rhs = normalized_spanned(*rhs);
                 match rhs.inner {
@@ -672,7 +728,7 @@ mod tests {
             let expected = time_span_to_millis(&parts);
             let parsed = parse_pretty(&span);
 
-            prop_assert_eq!(parsed.inner, Expr::Number(expected, Raw));
+            prop_assert_eq!(parsed.inner, Expr::TimeSpan(expected, Raw));
         }
 
         #[test]

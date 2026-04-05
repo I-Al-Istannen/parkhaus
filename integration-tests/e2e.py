@@ -13,17 +13,18 @@ import contextlib
 import random
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import time
 from typing import cast
 
 import boto3
 import requests
 from mypy_boto3_s3 import S3Client
 from rich import print
+from rich.markup import escape
 from rich.progress import track
 from testcontainers.core.generic import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
@@ -39,6 +40,8 @@ metrics_listen = "127.0.0.1:{{metrics_port}}"
 db_path = "{{db_path}}"
 
 {{upstreams}}
+
+{{tiering_rules}}
 """
 UPSTREAM_TEMPLATE = """
 [upstreams.{{name}}]
@@ -431,7 +434,7 @@ def main(test_tier_by_bucket: bool) -> None:
         config = render_config(temp_dir, [hot, warm, cold], buckets_stop_at_warm)
         config_path = temp_dir / "config.toml"
         config_path.write_text(config)
-        print(config)
+        print(escape(config))
         with start_backend(temp_dir, config_path) as backend:
             info("Uploading test data...")
             test_data = TestData.create_and_upload(
@@ -482,18 +485,33 @@ def render_config(
             .replace("{{s3_secret}}", "test")
             .replace("{{s3_region}}", "us-east-1")
         )
-        if upstream.tier.max_age_seconds() is not None:
-            if upstream.tier == Tier.WARM and buckets_stop_at_warm:
-                upstream_config += f"""max_age = {{
-  fallback = "{upstream.tier.max_age_seconds()}s",
-  per_bucket = {{
-    {", ".join(f'"{bucket}" = "forever"' for bucket in buckets_stop_at_warm)}
-  }}
-}}"""
-            else:
-                upstream_config += f'max_age = "{upstream.tier.max_age_seconds()}s"'
-
         upstreams.append(upstream_config)
+
+    hot_max_age_seconds = cast(int, Tier.HOT.max_age_seconds())
+    warm_max_age_seconds = cast(int, Tier.WARM.max_age_seconds())
+
+    warm_rule = f"age <= {warm_max_age_seconds}s"
+    if buckets_stop_at_warm:
+        stop_at_warm_buckets = " || ".join(
+            f"bucket == '{bucket}'" for bucket in sorted(buckets_stop_at_warm)
+        )
+        warm_rule = f"({warm_rule}) || ({stop_at_warm_buckets})"
+
+    tiering_rules = [
+        (Tier.HOT.value, f"age <= {hot_max_age_seconds}s"),
+        (Tier.WARM.value, warm_rule),
+        (Tier.COLD.value, "true"),
+    ]
+    tiering_rules_config = "\n\n".join(
+        "\n".join(
+            [
+                "[[tiering_rules]]",
+                f'to = "{to}"',
+                f'when = "{when}"',
+            ]
+        )
+        for to, when in tiering_rules
+    )
 
     config = (
         CONFIG_TEMPLATE.replace("{{db_path}}", f"{temp_dir.absolute()}/{DB_PATH}")
@@ -501,6 +519,7 @@ def render_config(
         .replace("{{metrics_port}}", str(METRICS_PORT))
     )
     config = config.replace("{{upstreams}}", "\n\n".join(upstreams))
+    config = config.replace("{{tiering_rules}}", tiering_rules_config)
 
     return config
 

@@ -1,10 +1,11 @@
 pub(crate) use crate::config::UpstreamId;
-use crate::policy::tier_rule::TieringRuleQuery;
+use crate::db::TieringRuleEnv;
+use crate::policy::expr::{Expr, Typechecked};
 use derive_more::Display;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct S3ObjectId {
     pub bucket: String,
     pub key: String,
@@ -12,7 +13,7 @@ pub struct S3ObjectId {
 
 impl Display for S3ObjectId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.bucket, self.key)
+        f.pad(&format!("{}/{}", self.bucket, self.key))
     }
 }
 
@@ -50,6 +51,6 @@ pub struct InFlightMigration {
 
 #[derive(Debug, Clone)]
 pub struct TieringRule {
-    pub query: TieringRuleQuery,
+    pub filter: Expr<Typechecked<TieringRuleEnv>>,
     pub to: UpstreamId,
 }

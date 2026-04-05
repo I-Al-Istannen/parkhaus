@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::cli::logging::{env_filter, setup_rootcause_hooks};
+use crate::cli::logging::env_filter;
 use crate::config::Config;
 use crate::db::Database;
 use crate::server::endpoints;
@@ -30,7 +30,6 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), Report> {
                 .compact(),
         )
         .init();
-    setup_rootcause_hooks()?;
 
     let shutdown_token = CancellationToken::new();
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();

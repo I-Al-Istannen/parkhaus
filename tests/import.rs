@@ -3,7 +3,7 @@
 use crate::common::garage::GarageInstance;
 use jiff::Timestamp;
 use parkhaus::cli::import::import_upstream;
-use parkhaus::config::{AgeLimits, S3Secret, Upstream, UpstreamId};
+use parkhaus::config::{S3Secret, Upstream, UpstreamId};
 use parkhaus::data::S3ObjectId;
 use parkhaus::db::Database;
 use parkhaus::s3::client::S3Client;
@@ -42,7 +42,6 @@ async fn test_import_buckets() -> Result<(), Report> {
         base_url: garage.s3_endpoint().clone(),
         region: garage.region().to_string(),
         addressing_style: AddressingStyle::Path,
-        age_limits: AgeLimits::no_limits(),
         s3_access_key: key_id.clone(),
         s3_secret: S3Secret(key_secret.clone()),
     };

@@ -1,5 +1,6 @@
 use crate::data::{PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId};
 use crate::policy::expr::{Env, Type};
+use crate::policy::tier_rule;
 use crate::policy::tier_rule::SqlArgument;
 use jiff::{Timestamp, Zoned};
 use rootcause::Report;
@@ -7,9 +8,9 @@ use rootcause::prelude::ResultExt;
 use sqlx::{FromRow, Sqlite, SqliteConnection, query, query_as};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TierRuleEnv;
+pub struct TieringRuleEnv;
 
-impl TierRuleEnv {
+impl TieringRuleEnv {
     pub fn synthesize_variable_sql(name: &str, now_var: &str) -> String {
         match name {
             "age" => format!("({now_var} - last_modified)"),
@@ -21,13 +22,9 @@ impl TierRuleEnv {
             _ => unreachable!("Unknown variable: {}", name),
         }
     }
-
-    pub fn format_now(now: &Zoned) -> i64 {
-        now.timestamp().as_millisecond()
-    }
 }
 
-impl Env for TierRuleEnv {
+impl Env for TieringRuleEnv {
     fn get_var(name: &str) -> Option<Type> {
         match name {
             "age" => Some(Type::Number),
@@ -35,7 +32,7 @@ impl Env for TierRuleEnv {
             "object" => Some(Type::String),
             "key" => Some(Type::String),
             "upstream" => Some(Type::String),
-            "size" => Some(Type::Number),
+            // "size" => Some(Type::Number), TODO: Pls do this
             _ => None,
         }
     }
@@ -186,15 +183,21 @@ pub(super) async fn get_all_buckets(
 pub(super) async fn get_pending_migrations_for_rule(
     con: &mut SqliteConnection,
     rule: &TieringRule,
+    now: &Zoned,
 ) -> Result<Vec<PendingMigration>, Report> {
-    let sql = format!("SELECT * FROM Objects WHERE {}", &rule.query.condition);
+    let rule_query = tier_rule::to_sql(rule.filter.clone(), now);
+
+    let sql = format!("SELECT * FROM Objects WHERE {}", &rule_query.condition,);
     let mut query = query_as::<Sqlite, DbObject>(&sql);
-    for arg in &rule.query.arguments {
+    for arg in &rule_query.arguments {
         query = match arg {
             SqlArgument::String(str) => query.bind(str),
             SqlArgument::Number(num) => query.bind(num),
+            SqlArgument::TimeSpan(num) => query.bind(num * 1000),
+            SqlArgument::Bool(b) => query.bind(b),
         };
     }
+
     let migrations: Vec<PendingMigration> = query
         .fetch_all(con)
         .await
