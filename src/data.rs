@@ -22,6 +22,8 @@ pub struct S3Object {
     pub id: S3ObjectId,
     pub assigned_upstream: UpstreamId,
     pub last_modified: jiff::Timestamp,
+    /// In bytes
+    pub size: u64,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Display, sqlx::Type)]

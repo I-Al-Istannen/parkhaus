@@ -33,7 +33,6 @@ pub struct BucketInfo {
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     pub key: String,
-    #[allow(unused)]
     pub size: u64,
     pub last_modified: Timestamp,
 }

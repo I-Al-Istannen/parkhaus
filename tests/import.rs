@@ -2,7 +2,7 @@
 
 use crate::common::garage::GarageInstance;
 use jiff::Timestamp;
-use parkhaus::cli::import::import_upstream;
+use parkhaus::cli::import::{ImportOptions, import_upstream};
 use parkhaus::config::{S3Secret, Upstream, UpstreamId};
 use parkhaus::data::S3ObjectId;
 use parkhaus::db::Database;
@@ -83,14 +83,23 @@ async fn test_import_buckets() -> Result<(), Report> {
 
     // Act
     let remote_time_db = Database::in_memory().await?;
-    import_upstream(reqwest_client.clone(), &remote_time_db, &upstream, None).await?;
+    import_upstream(
+        reqwest_client.clone(),
+        &remote_time_db,
+        &upstream,
+        &ImportOptions::default(),
+    )
+    .await?;
     let custom_time_db = Database::in_memory().await?;
     let target_import_time = Timestamp::from_second(0xB105_F00D)?;
     import_upstream(
         reqwest_client,
         &custom_time_db,
         &upstream,
-        Some(target_import_time),
+        &ImportOptions {
+            modify_time: Some(target_import_time),
+            ..ImportOptions::default()
+        },
     )
     .await?;
 

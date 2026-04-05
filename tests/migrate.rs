@@ -176,7 +176,8 @@ async fn get_pending_migrations_randomized_ages_match_expected_targets() -> Resu
                 .choose(&mut rng)
                 .copied()
                 .expect("tier choices must not be empty");
-            let object = random_object_for_tier(&mut rng, &now, source_id.clone(), tier, index);
+            let object =
+                random_object_for_tier(&mut rng, &now, source_id.clone(), tier, index, &[]);
             obj_map.insert(object.id.clone(), object.clone());
             db.record_creation(&object).await?;
 
@@ -265,6 +266,7 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
                 source_upstream.clone(),
                 expected_tier,
                 index,
+                &payload,
             );
 
             source_client
@@ -376,6 +378,7 @@ fn random_object_for_tier(
     source: UpstreamId,
     tier: Tier,
     index: usize,
+    payload: &[u8],
 ) -> S3Object {
     let age_hours = rng.random_range(tier.age_as_hour_range());
     let age_seconds = (age_hours * 3600.0) as i64;
@@ -387,6 +390,7 @@ fn random_object_for_tier(
         },
         assigned_upstream: source,
         last_modified: (now - Span::new().seconds(age_seconds)).timestamp(),
+        size: payload.len() as u64,
     }
 }
 

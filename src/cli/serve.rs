@@ -17,7 +17,7 @@ use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
 use tokio::{join, signal};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -30,6 +30,15 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), Report> {
                 .compact(),
         )
         .init();
+
+    if db.get_num_of_objects_without_size().await? > 0 {
+        let count = db.get_num_of_objects_without_size().await?;
+        warn!(
+            %count,
+            "Database contains objects without size. You likely want to re-run import \
+            (with --keep-modify-time)"
+        )
+    }
 
     let shutdown_token = CancellationToken::new();
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, size)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (bucket, key) DO UPDATE SET\n            assigned_upstream = excluded.assigned_upstream,\n            size = excluded.size\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "50e39c301190db42a286173600513f7ba46fc48966490e4cef3913cacb644e8b"
+}

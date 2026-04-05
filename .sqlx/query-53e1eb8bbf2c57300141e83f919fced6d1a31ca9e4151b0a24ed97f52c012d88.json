@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT * FROM objects WHERE bucket = $1 AND key = $2",
+  "query": "\n        SELECT\n            bucket, key, assigned_upstream, last_modified, size\n        FROM objects\n        WHERE bucket = $1 AND key = $2",
   "describe": {
     "columns": [
       {
@@ -22,6 +22,11 @@
         "name": "last_modified",
         "ordinal": 3,
         "type_info": "Integer"
+      },
+      {
+        "name": "size",
+        "ordinal": 4,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -31,8 +36,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "8274d235509cc2b6d6962890e6cd2f5d4d6cd88a0617332112a799b5691fbb56"
+  "hash": "53e1eb8bbf2c57300141e83f919fced6d1a31ca9e4151b0a24ed97f52c012d88"
 }

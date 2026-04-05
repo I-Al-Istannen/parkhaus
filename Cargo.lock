@@ -2164,6 +2164,7 @@ dependencies = [
  "proptest",
  "quick-xml",
  "rand 0.10.0",
+ "regex",
  "reqwest",
  "rootcause",
  "rootcause-tracing",

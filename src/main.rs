@@ -1,6 +1,7 @@
 #![allow(unused_crate_dependencies)]
 
 use clap::{Parser, Subcommand};
+use parkhaus::cli::import::ImportOptions;
 use parkhaus::cli::logging;
 use parkhaus::db::Database;
 use parkhaus::{cli, config};
@@ -24,12 +25,7 @@ enum Command {
     /// Start the proxy server.
     Serve,
     /// Import objects from all configured upstreams into the local database.
-    Import {
-        /// Optional timestamp to use as the last modified time for all imported objects.
-        /// If not provided, the last modified time from S3 will be used.
-        #[arg(long)]
-        import_time: Option<jiff::Timestamp>,
-    },
+    Import(ImportOptions),
 }
 
 #[tokio::main]
@@ -52,7 +48,7 @@ async fn run() -> Result<(), Report> {
 
     let result = match cli.command {
         Command::Serve => cli::serve::run(config, db.clone()).await,
-        Command::Import { import_time } => cli::import::run(config, db.clone(), import_time).await,
+        Command::Import(options) => cli::import::run(config, db.clone(), options).await,
     };
 
     if let Err(error) = db.close().await {

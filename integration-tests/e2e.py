@@ -24,7 +24,6 @@ import boto3
 import requests
 from mypy_boto3_s3 import S3Client
 from rich import print
-from rich.markup import escape
 from rich.progress import track
 from testcontainers.core.generic import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
@@ -177,6 +176,15 @@ class Backend:
         ).fetchall()
         return {row[0]: row[1] for row in res}
 
+    def object_sizes(self) -> dict[tuple[str, str], int]:
+        res = self.sqlite_connection.execute(
+            """
+            SELECT bucket, key, size
+            FROM objects
+            """,
+        ).fetchall()
+        return {(row[0], row[1]): row[2] for row in res}
+
     def get_current_migration_run_num(self) -> int:
         response = requests.get(f"http://localhost:{METRICS_PORT}/metrics").text
         lines = [
@@ -308,6 +316,21 @@ class TestData:
                 f"Object content mismatch for {obj.bucket}/{obj.key}"
             )
 
+    def assert_recorded_sizes_match_uploads(self) -> None:
+        time.sleep(1)  # Wait a moment for all pending transactions to finish
+        actual_sizes = self.backend.object_sizes()
+        for obj in self.objects:
+            object_id = (obj.bucket, obj.key)
+            assert object_id in actual_sizes, (
+                f"Missing object row for {obj.bucket}/{obj.key}"
+            )
+
+            expected_size = len(obj.content)
+            actual_size = actual_sizes[object_id]
+            assert actual_size == expected_size, (
+                f"Size mismatch for {obj.bucket}/{obj.key}: expected {expected_size}, got {actual_size}"
+            )
+
     def _upstream_for(self, tier: Tier) -> Upstream:
         match tier:
             case Tier.HOT:
@@ -335,6 +358,10 @@ class TestData:
                 f"object-{index}",
                 bucket=random.choice(buckets),
             )
+            # Make the first object large to test size recording and retrieval of larger objects
+            if index == 0:
+                object.content = random.randbytes(50 * 1024 * 1024)  # 50 MiB
+
             backend.client.put_object(
                 Bucket=object.bucket,
                 Key=object.key,
@@ -434,12 +461,14 @@ def main(test_tier_by_bucket: bool) -> None:
         config = render_config(temp_dir, [hot, warm, cold], buckets_stop_at_warm)
         config_path = temp_dir / "config.toml"
         config_path.write_text(config)
-        print(escape(config))
         with start_backend(temp_dir, config_path) as backend:
             info("Uploading test data...")
             test_data = TestData.create_and_upload(
                 backend, hot, warm, cold, buckets, buckets_stop_at_warm, count=500
             )
+
+            info("Verifying recorded object sizes match uploaded payloads...", level=2)
+            test_data.assert_recorded_sizes_match_uploads()
 
             info("Verifying all objects are in the hot tier initially...", level=2)
             test_data.assert_all_hot()

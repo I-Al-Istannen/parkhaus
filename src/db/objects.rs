@@ -18,7 +18,7 @@ impl TieringRuleEnv {
             "object" => "(bucket || '/' || key)".to_string(),
             "key" => "key".to_string(),
             "upstream" => "assigned_upstream".to_string(),
-            "size" => todo!(),
+            "size" => "size".to_string(),
             _ => unreachable!("Unknown variable: {}", name),
         }
     }
@@ -32,7 +32,7 @@ impl Env for TieringRuleEnv {
             "object" => Some(Type::String),
             "key" => Some(Type::String),
             "upstream" => Some(Type::String),
-            // "size" => Some(Type::Number), TODO: Pls do this
+            "size" => Some(Type::Number),
             _ => None,
         }
     }
@@ -44,6 +44,7 @@ pub struct DbObject {
     key: String,
     assigned_upstream: UpstreamId,
     last_modified: i64,
+    size: i64,
 }
 
 impl TryFrom<DbObject> for S3Object {
@@ -62,6 +63,7 @@ impl TryFrom<DbObject> for S3Object {
             id,
             assigned_upstream: db_obj.assigned_upstream,
             last_modified,
+            size: db_obj.size as u64,
         })
     }
 }
@@ -72,7 +74,11 @@ pub(super) async fn get_object(
 ) -> Result<S3Object, Report> {
     query_as!(
         DbObject,
-        "SELECT * FROM objects WHERE bucket = $1 AND key = $2",
+        r#"
+        SELECT
+            bucket, key, assigned_upstream, last_modified, size
+        FROM objects
+        WHERE bucket = $1 AND key = $2"#,
         obj.bucket,
         obj.key
     )
@@ -122,19 +128,52 @@ pub(super) async fn record_creation(
     obj: &S3Object,
 ) -> Result<(), Report> {
     let last_modified = obj.last_modified.as_millisecond();
+    let size = obj.size as i64;
 
     query!(
         r#"
-        INSERT INTO objects (bucket, key, assigned_upstream, last_modified)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, size)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (bucket, key) DO UPDATE SET
             assigned_upstream = excluded.assigned_upstream,
+            size = excluded.size,
             last_modified = excluded.last_modified
         "#,
         obj.id.bucket,
         obj.id.key,
         obj.assigned_upstream,
-        last_modified
+        last_modified,
+        size
+    )
+    .execute(con)
+    .await
+    .context("failed to record object creation")
+    .attach(format!("object: {}", obj.id))
+    .attach(format!("upstream: {}", obj.assigned_upstream))?;
+
+    Ok(())
+}
+
+pub(super) async fn record_creation_keep_last_modified(
+    con: &mut SqliteConnection,
+    obj: &S3Object,
+) -> Result<(), Report> {
+    let last_modified = obj.last_modified.as_millisecond();
+    let size = obj.size as i64;
+
+    query!(
+        r#"
+        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, size)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (bucket, key) DO UPDATE SET
+            assigned_upstream = excluded.assigned_upstream,
+            size = excluded.size
+        "#,
+        obj.id.bucket,
+        obj.id.key,
+        obj.assigned_upstream,
+        last_modified,
+        size
     )
     .execute(con)
     .await
@@ -214,4 +253,17 @@ pub(super) async fn get_pending_migrations_for_rule(
         .collect();
 
     Ok(migrations)
+}
+
+pub(super) async fn get_num_of_objects_without_size(
+    con: &mut SqliteConnection,
+) -> Result<usize, Report> {
+    query!("SELECT COUNT(*) AS count FROM objects WHERE size = 46179488366592")
+        .fetch_one(con)
+        .await
+        .context("failed to count objects without size")?
+        .count
+        .try_into()
+        .context("count exceeds usize")
+        .map_err(Report::into_dynamic)
 }

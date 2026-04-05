@@ -116,14 +116,22 @@ impl Database {
 
     /// This calls [record_creation] for all objects in batches. It also updates the progress bar
     /// of the current span.
-    pub async fn bulk_import_creations(&self, objects: &[S3Object]) -> Result<(), Report> {
+    pub async fn bulk_import_creations(
+        &self,
+        objects: &[S3Object],
+        keep_last_modified: bool,
+    ) -> Result<(), Report> {
         let con = self.write().await;
         const BATCH_SIZE: usize = 10_000; // randomly chosen (after some experiments)
 
         for batch in objects.chunks(BATCH_SIZE) {
             let mut transaction = con.begin().await.context("begin transaction")?;
             for obj in batch {
-                objects::record_creation(&mut transaction, obj).await?;
+                if keep_last_modified {
+                    objects::record_creation_keep_last_modified(&mut transaction, obj).await?;
+                } else {
+                    objects::record_creation(&mut transaction, obj).await?;
+                }
             }
             transaction.commit().await?;
             Span::current().pb_inc(batch.len() as u64);
@@ -212,6 +220,12 @@ impl Database {
             now,
         )
         .await
+    }
+
+    pub async fn get_num_of_objects_without_size(&self) -> Result<usize, Report> {
+        let con = self.read().await;
+        objects::get_num_of_objects_without_size(&mut *con.acquire().await.context("acquire con")?)
+            .await
     }
 
     pub async fn close(self) -> Result<(), Report> {

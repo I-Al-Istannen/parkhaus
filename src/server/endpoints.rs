@@ -13,12 +13,15 @@ use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
+use futures_util::TryStreamExt;
 use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
-const fn nop() {}
+const fn nop(_size: u64) {}
 
 pub async fn proxy_request(
     State(state): State<AppState>,
@@ -104,7 +107,7 @@ async fn forward_request(
     upstream: &Upstream,
     target: ForwardObjectUrl,
     in_req: Request,
-    on_success: impl FnOnce(),
+    on_success: impl FnOnce(u64),
 ) -> Result<Response, TierError> {
     let mut out_req = state
         .http
@@ -121,9 +124,15 @@ async fn forward_request(
         }
         out_req = out_req.header(name, val);
     }
-    out_req = out_req.body(reqwest::Body::wrap_stream(
-        in_req.into_body().into_data_stream(),
-    ));
+
+    let request_size = Arc::new(AtomicU64::new(0));
+    let streamed_request_size = Arc::clone(&request_size);
+    let request_body = in_req.into_body().into_data_stream().map_ok(move |chunk| {
+        streamed_request_size.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        chunk
+    });
+
+    out_req = out_req.body(reqwest::Body::wrap_stream(request_body));
 
     debug!(
         upstream = %upstream.name,
@@ -165,7 +174,7 @@ async fn forward_request(
     }
 
     if in_resp_status.is_success() {
-        on_success();
+        on_success(request_size.load(Ordering::Relaxed));
     }
 
     Ok(out_response)
@@ -195,8 +204,8 @@ fn record_successful_request(
     obj_id: S3ObjectId,
     db: Database,
     upstream_name: UpstreamId,
-) -> impl FnOnce() {
-    move || {
+) -> impl FnOnce(u64) {
+    move |size| {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
             if is_creation(&req_method) {
@@ -206,6 +215,7 @@ fn record_successful_request(
                     id: obj_id_clone.clone(),
                     assigned_upstream: upstream_name,
                     last_modified: jiff::Timestamp::now(),
+                    size,
                 })
                 .await
                 .context("failed to record creation")

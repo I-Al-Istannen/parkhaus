@@ -1,0 +1,3 @@
+-- 42 TiB as sentinel to force the user to re-run the import...
+ALTER TABLE Objects
+    ADD COLUMN size BIGINT NOT NULL DEFAULT 46179488366592;
