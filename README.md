@@ -59,29 +59,4 @@ You can interpolate environment variables (e.g. for secret keys) by using
 
 #### Full config
 
-```toml
-listen = "0.0.0.0:8080"
-metrics_listen = "127.0.0.1:8081"     # optional, disabled if unset (serves at `/metrics`)
-db_path = "/data/parkhaus.db"
-
-[upstreams.hot]                     # named hot, name is arbitrary
-order = 1                           # smallest one is the hottest
-base_url = "http://127.0.0.1:9090"
-max_age = "21d"
-# "path" requests "base-url/bucket"
-# "virtual_hosted" requests "base-url" with a "Host" header of "bucket.base-url"
-# "virtual_hosted_resolve_dns" requests to "bucket.base-url"
-addressing_style = "path"
-s3_access_key = "key"
-s3_secret = "secret"
-region = "us-east-1"
-
-[upstreams.cold]
-order = 2
-base_url = "http://127.0.0.1:9091"
-# no max age for the coldest
-addressing_style = "path"
-s3_access_key = "key"
-s3_secret = "secret"
-region = "us-east-1"
-```
+To Come :)
