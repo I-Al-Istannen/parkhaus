@@ -1,6 +1,7 @@
 use ariadne::{Color, Label, ReportKind, Source};
 use chumsky::pratt::*;
 use chumsky::prelude::*;
+use chumsky::text::TextExpected;
 use derive_more::Display;
 use rootcause::{Report, report};
 use std::marker::PhantomData;
@@ -134,11 +135,25 @@ impl<T: Clone> Expr<T> {
 }
 
 fn p_int<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
+    // Reimplement text::int to allow '_' separators
     just('-')
         .or_not()
-        .then(text::int(10))
+        .then(
+            any()
+                .filter(move |c: &char| c.is_ascii_digit() && *c != '0')
+                .then(
+                    any()
+                        .filter(move |c: &char| c.is_ascii_digit() || *c == '_')
+                        .repeated(),
+                )
+                .ignored()
+                .or(just('0').ignored())
+                .to_slice()
+                .labelled_with(|| TextExpected::<&str>::Int),
+        )
         .try_map(|(sign, num_str): (Option<char>, &str), span| {
             num_str
+                .replace("_", "")
                 .parse::<i64>()
                 .map(|n| if sign.is_some() { -n } else { n })
                 .map_err(|e| Rich::custom(span, format!("invalid integer: {e}")))
