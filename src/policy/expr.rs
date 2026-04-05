@@ -180,11 +180,10 @@ fn p_int<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
     just('-')
         .or_not()
         .then(
-            any()
-                .filter(move |c: &char| c.is_ascii_digit() && *c != '0')
+            one_of("123456789")
                 .then(
-                    any()
-                        .filter(move |c: &char| c.is_ascii_digit() || *c == '_')
+                    one_of("0123456789_")
+                        .labelled_with(|| TextExpected::<&str>::Int)
                         .repeated(),
                 )
                 .ignored()
@@ -202,12 +201,17 @@ fn p_int<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
 }
 
 fn p_time_span<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
-    let p_suffix = choice((
-        p_int().then_ignore(just('d')).map(|it| it * 60 * 60 * 24),
-        p_int().then_ignore(just('h')).map(|it| it * 60 * 60),
-        p_int().then_ignore(just('m')).map(|it| it * 60),
-        p_int().then_ignore(just('s')).map(|it| it),
-    ));
+    let p_suffix = p_int()
+        .then(
+            choice((
+                just('d').to(60 * 60 * 24),
+                just('h').to(60 * 60),
+                just('m').to(60),
+                just('s').to(1),
+            ))
+            .labelled("time span"),
+        )
+        .map(|(it, factor)| it * factor);
     p_suffix
         .repeated()
         .at_least(1)
@@ -247,7 +251,7 @@ fn p_expr<'src>() -> impl Parser<'src, &'src str, Spanned<Expr<Raw>>, OurErr<'sr
         ($precedence:expr, $op:literal, $operator:ident) => {
             infix(
                 $precedence,
-                just($op).padded(),
+                just($op).padded().labelled("operator"),
                 |l: Spanned<Expr<Raw>>, _, r: Spanned<Expr<Raw>>, _| {
                     let span = l.span.union(r.span);
                     Spanned {
@@ -262,7 +266,7 @@ fn p_expr<'src>() -> impl Parser<'src, &'src str, Spanned<Expr<Raw>>, OurErr<'sr
         ($precedence:literal, $op:literal, $operator:ident) => {
             prefix(
                 $precedence,
-                just($op).padded(),
+                just($op).padded().labelled("operator"),
                 |_, rhs: Spanned<Expr<Raw>>, _| {
                     let span = rhs.span;
                     Spanned {
@@ -711,6 +715,21 @@ mod tests {
                 panic!("Parsing should succeed");
             }
         }
+    }
+
+    #[test]
+    fn parse_expr_uses_grouped_error_message() {
+        let error = parse_expr("size > 1foo").expect_err("expected a parse error");
+        let rendered = error
+            .current_context()
+            .format()
+            .expect("rendering parse error should succeed");
+
+        assert!(
+            rendered.contains("expected int, time span, operator, or end of input")
+                && rendered.contains("found 'f'"),
+            "actual output: {rendered}"
+        );
     }
 
     proptest! {
