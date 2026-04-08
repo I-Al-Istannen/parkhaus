@@ -31,10 +31,16 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), Report> {
         )
         .init();
 
-    if db.get_num_of_objects_without_size().await? > 0 {
-        let count = db.get_num_of_objects_without_size().await?;
+    if !db.get_num_of_objects_without_size().await?.is_empty() {
+        let counts = db
+            .get_num_of_objects_without_size()
+            .await?
+            .into_iter()
+            .map(|(bucket, count)| format!("{bucket}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         warn!(
-            %count,
+            %counts,
             "Database contains objects without size. You likely want to re-run import \
             (with --keep-modify-time)"
         )

@@ -6,6 +6,7 @@ use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use sqlx::{FromRow, Sqlite, SqliteConnection, query, query_as};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TieringRuleEnv;
@@ -257,13 +258,22 @@ pub(super) async fn get_pending_migrations_for_rule(
 
 pub(super) async fn get_num_of_objects_without_size(
     con: &mut SqliteConnection,
-) -> Result<usize, Report> {
-    query!("SELECT COUNT(*) AS count FROM objects WHERE size = 46179488366592")
-        .fetch_one(con)
-        .await
-        .context("failed to count objects without size")?
-        .count
-        .try_into()
-        .context("count exceeds usize")
-        .map_err(Report::into_dynamic)
+) -> Result<HashMap<String, usize>, Report> {
+    Ok(query!(
+        r#"
+        SELECT
+            bucket,
+            COUNT(*) AS count
+        FROM objects
+        WHERE size = 46179488366592
+        GROUP BY bucket
+        HAVING COUNT(*) > 0
+        "#
+    )
+    .map(|it| (it.bucket, it.count as usize))
+    .fetch_all(con)
+    .await
+    .context("failed to count objects without size")?
+    .into_iter()
+    .collect())
 }

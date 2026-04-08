@@ -12,7 +12,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -222,7 +222,7 @@ impl Database {
         .await
     }
 
-    pub async fn get_num_of_objects_without_size(&self) -> Result<usize, Report> {
+    pub async fn get_num_of_objects_without_size(&self) -> Result<HashMap<String, usize>, Report> {
         let con = self.read().await;
         objects::get_num_of_objects_without_size(&mut *con.acquire().await.context("acquire con")?)
             .await

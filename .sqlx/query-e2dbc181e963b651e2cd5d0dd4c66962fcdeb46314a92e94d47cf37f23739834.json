@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            bucket,\n            COUNT(*) AS count\n        FROM objects\n        WHERE size = 46179488366592\n        GROUP BY bucket\n        HAVING COUNT(*) > 0\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "count",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e2dbc181e963b651e2cd5d0dd4c66962fcdeb46314a92e94d47cf37f23739834"
+}
