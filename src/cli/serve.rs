@@ -15,7 +15,8 @@ use reqwest::Client;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
-use tokio::{join, signal};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::{join, select, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
@@ -130,8 +131,11 @@ async fn start_metric_server(
 }
 
 async fn shutdown_signal(token: CancellationToken) {
-    if signal::ctrl_c().await.is_ok() {
-        info!("received ctrl+c, shutting down");
-        token.cancel();
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let interrupt = signal::ctrl_c();
+    select! {
+        _ = sigterm.recv() => warn!("Received SIGTERM"),
+        _ = interrupt => warn!("Received SIGINT")
     }
+    token.cancel();
 }
