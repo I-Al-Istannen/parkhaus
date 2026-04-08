@@ -43,6 +43,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             metrics_start_run(&config, &pending, &in_flight);
             match execute_migrations(pending, in_flight, &config, &db).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
+                Ok(0) => {}
                 Ok(errors) => error!(error_count = errors, "Failed to perform migrations",),
             }
 
