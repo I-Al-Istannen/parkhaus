@@ -663,13 +663,18 @@ mod tests {
             byte_size_literal_strategy(),
         ];
 
-        atom.prop_recursive(4, 64, 2, |inner| {
-            prop_oneof![
-                (unary_op_strategy(), inner.clone()).prop_map(|(op, rhs)| format!("({op}{rhs})")),
-                (inner.clone(), binary_op_strategy(), inner.clone())
-                    .prop_map(|(lhs, op, rhs)| format!("({lhs} {op} {rhs})")),
-            ]
-        })
+        // recursive on its own doesn't generate any exprs of depth 0
+        prop_oneof![
+            atom.clone().prop_recursive(4, 64, 2, |inner| {
+                prop_oneof![
+                    (unary_op_strategy(), inner.clone())
+                        .prop_map(|(op, rhs)| format!("({op}{rhs})")),
+                    (inner.clone(), binary_op_strategy(), inner.clone())
+                        .prop_map(|(lhs, op, rhs)| format!("({lhs} {op} {rhs})")),
+                ]
+            }),
+            atom
+        ]
     }
 
     fn spanned<T: Clone>(inner: Expr<T>) -> Spanned<Expr<T>> {
