@@ -36,11 +36,6 @@
               version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
               doCheck = false;
 
-              nativeBuildInputs = [
-                pkgs.pkg-config
-                pkgs.openssl
-              ];
-
               src = pkgs.lib.cleanSourceWith {
                 filter = gitignoreFilterWith {
                   basePath = ./.;
