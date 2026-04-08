@@ -858,9 +858,8 @@ mod tests {
 
         #[test]
         fn parse_expr_accepts_surrounding_whitespace(expr in expr_strategy()) {
-            let wrapped = format!("({expr})");
-            let baseline = parse_pretty(&wrapped);
-            let padded = parse_pretty(&format!(" \n\t{wrapped}\t \n "));
+            let baseline = parse_pretty(&expr);
+            let padded = parse_pretty(&format!(" \n\t{expr}\t \n "));
 
             prop_assert_eq!(baseline.inner.to_debug_string(), padded.inner.to_debug_string());
             prop_assert_eq!(normalized_expr(baseline.inner), normalized_expr(padded.inner));
