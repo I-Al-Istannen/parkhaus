@@ -266,6 +266,7 @@ fn p_atom<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clo
         .or(p_bool().map(|it| Expr::Bool(it, Raw)))
         .or(p_string().map(|it| Expr::String(it, Raw)))
         .or(p_var())
+        .padded()
 }
 
 fn p_expr<'src>() -> impl Parser<'src, &'src str, Spanned<Expr<Raw>>, OurErr<'src>> + Clone {
