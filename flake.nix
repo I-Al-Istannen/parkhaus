@@ -88,7 +88,7 @@
             config = {
               Entrypoint = [ "${pkgs.lib.getExe parkhaus}" ];
               # The config uses the local timezone
-              Env = [ "TZDIR=${pkgs.tzdata}/share/zoneinfo" ];
+              Env = [ "TZDIR=${pkgs.tzdata}/share/zoneinfo" "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
 
               ExposedPorts = {
                 "8080/tcp" = { };
