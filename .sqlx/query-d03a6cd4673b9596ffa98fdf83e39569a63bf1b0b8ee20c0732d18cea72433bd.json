@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM AccessCounters WHERE time_bucket < ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d03a6cd4673b9596ffa98fdf83e39569a63bf1b0b8ee20c0732d18cea72433bd"
+}

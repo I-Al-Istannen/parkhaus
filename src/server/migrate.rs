@@ -48,6 +48,10 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
             }
 
             counter!(COUNTER_MIGRATION_RUNS_TOTAL).increment(1);
+
+            if let Err(e) = db.cleanup_old_access_times(&Zoned::now()).await {
+                error!(%e, "Failed to clean up old access times");
+            }
         }
     };
     select!(

@@ -1,3 +1,4 @@
+mod access_times;
 mod migrate;
 mod objects;
 
@@ -114,6 +115,12 @@ impl Database {
         objects::record_creation(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
+    pub async fn record_access(&self, obj: &S3ObjectId, now: &Zoned) -> Result<(), Report> {
+        let con = self.write().await;
+        access_times::record_access(&mut *con.acquire().await.context("acquire con")?, obj, now)
+            .await
+    }
+
     /// This calls [record_creation] for all objects in batches. It also updates the progress bar
     /// of the current span.
     pub async fn bulk_import_creations(
@@ -226,6 +233,11 @@ impl Database {
         let con = self.read().await;
         objects::get_num_of_objects_without_size(&mut *con.acquire().await.context("acquire con")?)
             .await
+    }
+
+    pub async fn cleanup_old_access_times(&self, now: &Zoned) -> Result<(), Report> {
+        let con = self.write().await;
+        access_times::cleanup_old(&mut *con.acquire().await.context("acquire con")?, now).await
     }
 
     pub async fn close(self) -> Result<(), Report> {

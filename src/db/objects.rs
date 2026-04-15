@@ -15,6 +15,7 @@ impl TieringRuleEnv {
     pub fn synthesize_variable_sql(name: &str, now_var: &str) -> String {
         match name {
             "age" => format!("({now_var} - last_modified)"),
+            "last_accessed" => format!("({now_var} - last_accessed)"),
             "bucket" => "bucket".to_string(),
             "object" => "(bucket || '/' || key)".to_string(),
             "key" => "key".to_string(),
@@ -29,6 +30,7 @@ impl Env for TieringRuleEnv {
     fn get_var(name: &str) -> Option<Type> {
         match name {
             "age" => Some(Type::Number),
+            "last_accessed" => Some(Type::Number),
             "bucket" => Some(Type::String),
             "object" => Some(Type::String),
             "key" => Some(Type::String),
@@ -133,12 +135,13 @@ pub(super) async fn record_creation(
 
     query!(
         r#"
-        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, size)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, last_accessed, size)
+        VALUES ($1, $2, $3, $4, $4, $5)
         ON CONFLICT (bucket, key) DO UPDATE SET
             assigned_upstream = excluded.assigned_upstream,
             size = excluded.size,
-            last_modified = excluded.last_modified
+            last_modified = excluded.last_modified,
+            last_accessed = excluded.last_accessed
         "#,
         obj.id.bucket,
         obj.id.key,
@@ -164,8 +167,8 @@ pub(super) async fn record_creation_keep_last_modified(
 
     query!(
         r#"
-        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, size)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, last_accessed, size)
+        VALUES ($1, $2, $3, $4, $4, $5)
         ON CONFLICT (bucket, key) DO UPDATE SET
             assigned_upstream = excluded.assigned_upstream,
             size = excluded.size

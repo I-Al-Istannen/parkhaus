@@ -208,13 +208,15 @@ fn record_successful_request(
     move |size| {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
+            let now = jiff::Zoned::now();
+
             if is_creation(&req_method) {
                 counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
                 db.record_creation(&S3Object {
                     id: obj_id_clone.clone(),
                     assigned_upstream: upstream_name,
-                    last_modified: jiff::Timestamp::now(),
+                    last_modified: now.timestamp(),
                     size,
                 })
                 .await
@@ -228,6 +230,10 @@ fn record_successful_request(
                     .context("failed to record deletion")
                     .attach(format!("object: {obj_id_clone:?}"))?;
             }
+            db.record_access(&obj_id_clone, &now)
+                .await
+                .context("failed to record access")
+                .attach(format!("object: {obj_id_clone:?}"))?;
             Result::<(), Report>::Ok(())
         };
 

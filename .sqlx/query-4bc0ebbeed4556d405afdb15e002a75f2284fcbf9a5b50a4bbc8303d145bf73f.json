@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO objects (bucket, key, assigned_upstream, last_modified, last_accessed, size)\n        VALUES ($1, $2, $3, $4, $4, $5)\n        ON CONFLICT (bucket, key) DO UPDATE SET\n            assigned_upstream = excluded.assigned_upstream,\n            size = excluded.size,\n            last_modified = excluded.last_modified,\n            last_accessed = excluded.last_accessed\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "4bc0ebbeed4556d405afdb15e002a75f2284fcbf9a5b50a4bbc8303d145bf73f"
+}
