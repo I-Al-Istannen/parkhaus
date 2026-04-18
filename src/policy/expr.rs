@@ -32,6 +32,8 @@ pub enum Type {
 
 pub trait Env {
     fn get_var(name: &str) -> Option<Type>;
+
+    fn get_fun(name: &str) -> Option<(Vec<Type>, Type)>;
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -115,6 +117,7 @@ pub enum Expr<T: Clone> {
     TimeSpan(i64, T),
     Bool(bool, T),
     String(String, T),
+    FunctionCall(Spanned<String>, Vec<Spanned<Self>>, T),
     Operator(Operator<T>, T),
 }
 
@@ -132,6 +135,7 @@ impl<T: Clone> Expr<T> {
             Self::TimeSpan(_, data) => data,
             Self::String(_, data) => data,
             Self::Bool(_, data) => data,
+            Self::FunctionCall(_, _, data) => data,
             Self::Operator(_, data) => data,
         }
     }
@@ -170,6 +174,14 @@ impl<T: Clone> Expr<T> {
             }
             Self::String(str, _) => format!("\'{}\'", str),
             Self::Bool(bool, _) => bool.to_string(),
+            Self::FunctionCall(name, args, _) => {
+                let args_str = args
+                    .iter()
+                    .map(|arg| arg.inner.to_debug_string())
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                format!("{}({})", name.inner, args_str)
+            }
             Self::Operator(op, _) => op.to_debug_string(),
         }
     }
@@ -252,10 +264,12 @@ fn p_bool<'src>() -> impl Parser<'src, &'src str, bool, OurErr<'src>> + Clone {
     just("true").map(|_| true).or(just("false").map(|_| false))
 }
 
+fn p_ident<'src>() -> impl Parser<'src, &'src str, String, OurErr<'src>> + Clone {
+    text::ident().map(String::from)
+}
+
 fn p_var<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clone {
-    text::ident()
-        .map(String::from)
-        .map(|it| Expr::Variable(it, Raw))
+    p_ident().map(|it| Expr::Variable(it, Raw))
 }
 
 fn p_atom<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clone {
@@ -265,8 +279,6 @@ fn p_atom<'src>() -> impl Parser<'src, &'src str, Expr<Raw>, OurErr<'src>> + Clo
         .or(p_int().map(|it| Expr::Number(it, Raw)))
         .or(p_bool().map(|it| Expr::Bool(it, Raw)))
         .or(p_string().map(|it| Expr::String(it, Raw)))
-        .or(p_var())
-        .padded()
 }
 
 fn p_expr<'src>() -> impl Parser<'src, &'src str, Spanned<Expr<Raw>>, OurErr<'src>> + Clone {
@@ -301,7 +313,18 @@ fn p_expr<'src>() -> impl Parser<'src, &'src str, Spanned<Expr<Raw>>, OurErr<'sr
         };
     }
     recursive(|expr| {
-        p_atom()
+        let p_function_call = p_ident()
+            .spanned()
+            .then(
+                expr.clone()
+                    .separated_by(just(',').padded())
+                    .collect::<Vec<_>>()
+                    .delimited_by(just('(').padded(), just(')').padded()),
+            )
+            .map(|(name, args)| Expr::FunctionCall(name, args, Raw));
+
+        choice((p_atom(), p_function_call, p_var()))
+            .padded()
             .spanned()
             .or(expr.delimited_by(just('(').padded(), just(')').padded()))
             .pratt((
@@ -423,6 +446,65 @@ pub fn typecheck<E: Env + Clone>(
         Expr::TimeSpan(num, _) => Expr::TimeSpan(num, Typechecked::new(Type::Number)),
         Expr::String(s, _) => Expr::String(s, Typechecked::new(Type::String)),
         Expr::Bool(b, _) => Expr::Bool(b, Typechecked::new(Type::Bool)),
+        Expr::FunctionCall(name, args, _) => {
+            let Some((types, res_type)) = E::get_fun(&name) else {
+                return Err(report!(AnnotatedError(
+                    ariadne::Report::build(ReportKind::Error, ((), expr.span.into_range()))
+                        .with_config(
+                            ariadne::Config::new().with_index_type(ariadne::IndexType::Byte)
+                        )
+                        .with_message("Unknown function")
+                        .with_label(
+                            Label::new(((), expr.span.into_range()))
+                                .with_message(format!("no function named '{}'", name.inner))
+                                .with_color(Color::Red),
+                        )
+                        .finish(),
+                    src.to_string()
+                )));
+            };
+            if args.len() != types.len() {
+                let mut report =
+                    ariadne::Report::build(ReportKind::Error, ((), expr.span.into_range()))
+                        .with_config(
+                            ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
+                        )
+                        .with_message("Incorrect number of arguments")
+                        .with_label(
+                            Label::new(((), name.span.into_range()))
+                                .with_message(format!("for function '{}'", name.inner))
+                                .with_color(Color::Red),
+                        );
+                if args.len() < types.len() {
+                    report = report.with_label(
+                        Label::new(((), expr.span.end - 1..expr.span.end))
+                            .with_message(format!("Missing {} arguments", types.len() - args.len()))
+                            .with_color(Color::Red),
+                    )
+                } else if args.len() > types.len() {
+                    for arg in args.iter().skip(types.len()) {
+                        report = report.with_label(
+                            Label::new(((), arg.span.into_range()))
+                                .with_message("Unexpected argument")
+                                .with_color(Color::Red),
+                        )
+                    }
+                }
+                return Err(report!(AnnotatedError(report.finish(), src.to_string())));
+            }
+            let args = args
+                .into_iter()
+                .zip(types.into_iter())
+                .map(|(arg, typ)| {
+                    let arg = Spanned {
+                        span: arg.span,
+                        inner: typecheck::<E>(arg, src)?,
+                    };
+                    arg.assert_typ(expr.span, src, typ)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Expr::FunctionCall(name, args, Typechecked::new(res_type))
+        }
         Expr::Operator(op, _) => match op {
             Operator::Negate(r) => Expr::Operator(
                 Operator::Negate(check_inner(r)?.assert_typ(expr.span, src, Type::Number)?),
@@ -476,6 +558,21 @@ where
 
 impl<E: Clone> Typeable for Box<Spanned<Expr<Typechecked<E>>>> {
     fn typ(&self) -> Type {
+        self.as_ref().typ()
+    }
+
+    fn assert_typ(
+        self,
+        full_span: SimpleSpan,
+        src: &str,
+        typ: Type,
+    ) -> Result<Self, Report<AnnotatedError>> {
+        Ok(Self::new((*self).assert_typ(full_span, src, typ)?))
+    }
+}
+
+impl<E: Clone> Typeable for Spanned<Expr<Typechecked<E>>> {
+    fn typ(&self) -> Type {
         self.data().typ
     }
 
@@ -512,7 +609,7 @@ impl<E: Clone> Typeable for Box<Spanned<Expr<Typechecked<E>>>> {
 mod tests {
     use super::{Expr, Operator, Raw, parse_expr};
     use chumsky::prelude::Spanned;
-    use chumsky::span::SimpleSpan;
+    use chumsky::span::{SimpleSpan, SpanWrap};
     use proptest::prelude::*;
     use proptest::string::string_regex;
 
@@ -523,7 +620,11 @@ mod tests {
     type BinaryOpCtor<T> = fn(Box<Spanned<Expr<T>>>, Box<Spanned<Expr<T>>>) -> Operator<T>;
 
     fn identifier_strategy() -> impl Strategy<Value = String> {
-        string_regex("[a-zA-Z_][a-zA-Z0-9_]{0,8}").expect("valid identifier regex")
+        string_regex("[a-zA-Z_][a-zA-Z0-9_]{0,8}")
+            .expect("valid identifier regex")
+            .prop_filter("exclude boolean literals", |it| {
+                it != "true" && it != "false"
+            })
     }
 
     fn integer_strategy() -> impl Strategy<Value = i64> {
@@ -672,13 +773,18 @@ mod tests {
                         .prop_map(|(op, rhs)| format!("({op}{rhs})")),
                     (inner.clone(), binary_op_strategy(), inner.clone())
                         .prop_map(|(lhs, op, rhs)| format!("({lhs} {op} {rhs})")),
+                    (
+                        identifier_strategy(),
+                        prop::collection::vec(inner.clone(), 0..=3)
+                    )
+                        .prop_map(|(name, args)| format!("{name}({})", args.join(", "))),
                 ]
             }),
             atom
         ]
     }
 
-    fn spanned<T: Clone>(inner: Expr<T>) -> Spanned<Expr<T>> {
+    fn spanned<T: Clone>(inner: T) -> Spanned<T> {
         Spanned {
             inner,
             span: (0..0).into(),
@@ -703,6 +809,13 @@ mod tests {
                 inner
                     .clone()
                     .prop_map(|rhs| { spanned(Expr::Operator(Operator::Not(Box::new(rhs)), Raw)) }),
+                (
+                    identifier_strategy(),
+                    prop::collection::vec(inner.clone(), 0..=3)
+                )
+                    .prop_map(|(name, args)| {
+                        spanned(Expr::FunctionCall(spanned(name), args, Raw))
+                    }),
                 (inner.clone(), binary_op_ctor_strategy(), inner.clone()).prop_map(
                     |(lhs, op, rhs)| {
                         spanned(Expr::Operator(op(Box::new(lhs), Box::new(rhs)), Raw))
@@ -713,10 +826,7 @@ mod tests {
     }
 
     fn normalized_spanned<T: Clone>(expr: Spanned<Expr<T>>) -> Spanned<Expr<T>> {
-        Spanned {
-            inner: normalized_expr(expr.inner),
-            span: SimpleSpan::default(),
-        }
+        normalized_expr(expr.inner).with_span(SimpleSpan::default())
     }
 
     fn normalized_expr<T: Clone>(expr: Expr<T>) -> Expr<T> {
@@ -726,6 +836,14 @@ mod tests {
             Expr::TimeSpan(number, data) => Expr::TimeSpan(number, data),
             Expr::String(value, data) => Expr::String(value.clone(), data),
             Expr::Bool(value, data) => Expr::Bool(value, data),
+            Expr::FunctionCall(name, args, data) => {
+                let args = args.into_iter().map(normalized_spanned).collect();
+                Expr::FunctionCall(
+                    name.inner.clone().with_span(SimpleSpan::default()),
+                    args,
+                    data,
+                )
+            }
             Expr::Operator(Operator::Negate(rhs), data) => {
                 let rhs = normalized_spanned(*rhs);
                 match rhs.inner {
@@ -801,6 +919,16 @@ mod tests {
             rendered.contains("expected int, time span, file size, operator, or end of input")
                 && rendered.contains("found 'f'"),
             "actual output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn parse_expr_parses_function_calls() {
+        let parsed = parse_pretty("min(age + 1d, max(size, 1MiB))");
+
+        assert_eq!(
+            parsed.inner.to_debug_string(),
+            "min((age + 1d), max(size, 1048576))"
         );
     }
 

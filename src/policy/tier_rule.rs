@@ -50,6 +50,11 @@ impl SqlBuilder {
             Expr::TimeSpan(num, _) => self.add_arg(SqlArgument::TimeSpan(*num)),
             Expr::String(str, _) => self.add_arg(SqlArgument::String(str.clone())),
             Expr::Bool(b, _) => self.add_arg(SqlArgument::Bool(*b)),
+            Expr::FunctionCall(name, args, _) => {
+                let arg_sql: Vec<String> =
+                    args.iter().map(|arg| self.add_expr(&arg.inner)).collect();
+                TieringRuleEnv::synthesize_function_sql(name, &self.now_arg, &arg_sql)
+            }
             Expr::Operator(op, _) => match op {
                 Operator::Negate(inner) => format!("(-{})", self.add_expr(&inner.inner)),
                 Operator::Not(inner) => format!("(NOT {})", self.add_expr(&inner.inner)),

@@ -24,6 +24,30 @@ impl TieringRuleEnv {
             _ => unreachable!("Unknown variable: {}", name),
         }
     }
+
+    pub fn synthesize_function_sql(name: &str, now_var: &str, args: &[String]) -> String {
+        match name {
+            "access_counts" => {
+                // 1d, 10d => swap order
+                // We do not need to truncate the now_var to a date, as e.g.
+                // 12.05. 15:00 | 1d, 10d => 02.05. 15:00, 11.05. 15:00
+                // We then move the start by one day back and get
+                // 01.05. 15:00 until 11.05. 15:00
+                // 01.05 15:00 ... 02.05. 00:00 ... 11.04. 00:00 ... 11.05. 15:00
+                //                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                //                       wanted timerange
+                // Which encloses the wanted timerange but no other bucket.
+                format!(
+                    "(SELECT SUM(count) FROM AccessCounters WHERE \
+                        obj_bucket = bucket AND \
+                        obj_key = key AND \
+                        time_bucket BETWEEN ({now_var} - {} - 86400000) AND ({now_var} - {}))",
+                    args[1], args[0]
+                )
+            }
+            _ => unreachable!("Unknown function: {}", name),
+        }
+    }
 }
 
 impl Env for TieringRuleEnv {
@@ -36,6 +60,13 @@ impl Env for TieringRuleEnv {
             "key" => Some(Type::String),
             "upstream" => Some(Type::String),
             "size" => Some(Type::Number),
+            _ => None,
+        }
+    }
+
+    fn get_fun(name: &str) -> Option<(Vec<Type>, Type)> {
+        match name {
+            "access_counts" => Some((vec![Type::Number, Type::Number], Type::Number)),
             _ => None,
         }
     }

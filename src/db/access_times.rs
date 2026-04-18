@@ -9,7 +9,7 @@ pub(super) async fn record_access(
     object: &S3ObjectId,
     now: &Zoned,
 ) -> Result<(), Report> {
-    let time_bucket = to_bucket(now);
+    let time_bucket = to_time_bucket_ms(now)?;
     query!(
         r#"
         INSERT INTO AccessCounters
@@ -30,7 +30,7 @@ pub(super) async fn record_access(
 }
 
 pub(super) async fn cleanup_old(con: &mut SqliteConnection, now: &Zoned) -> Result<(), Report> {
-    let last_bucket = to_bucket(&(now - jiff::Span::new().days(30)));
+    let last_bucket = to_time_bucket_ms(&(now - jiff::Span::new().days(30)))?;
     query!(
         "DELETE FROM AccessCounters WHERE time_bucket < ?",
         last_bucket
@@ -42,11 +42,11 @@ pub(super) async fn cleanup_old(con: &mut SqliteConnection, now: &Zoned) -> Resu
     Ok(())
 }
 
-pub(crate) fn to_bucket(now: &Zoned) -> i64 {
-    let date = now.date();
-    let year = date.year();
-    let month = now.date().month();
-    let day = now.date().day();
-
-    (year as i64) * 10000 + (month as i64) * 100 + (day as i64)
+pub(crate) fn to_time_bucket_ms(now: &Zoned) -> Result<i64, Report> {
+    Ok(now
+        .start_of_day()
+        .context("failed to get start of day")
+        .attach(format!("now: {now}"))?
+        .timestamp()
+        .as_millisecond())
 }
