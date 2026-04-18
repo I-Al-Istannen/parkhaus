@@ -48,7 +48,7 @@ pub const DEFAULT_REGION: &str = "garage";
 pub const ADMIN_TOKEN: &str = "test-admin-token";
 
 const IMAGE_NAME: &str = "dxflrs/garage";
-const IMAGE_TAG: &str = "v2.2.0";
+const IMAGE_TAG: &str = "v2.3.0";
 
 /// `garage.toml` embedded into the container via [`Image::copy_to_sources`].
 ///
@@ -89,10 +89,6 @@ admin_token   = "test-admin-token"
 ///
 /// The default instance injects a minimal single-node configuration and waits
 /// until Garage's admin `/health` endpoint returns `200 OK`.
-///
-/// In most cases you want [`GarageInstance::start`] instead of using this
-/// struct directly, because a freshly-started Garage node has no cluster
-/// layout yet and cannot serve S3 requests until one is assigned.
 #[derive(Debug, Clone)]
 pub struct Garage {
     config: CopyToContainer,
@@ -116,15 +112,18 @@ impl Image for Garage {
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
-        // Wait for 503: Garage is running but the cluster layout has not been
-        // applied yet, so quorum is unavailable.  We will apply the layout in
-        // `GarageInstance::init` and then poll until we get 200.
+        // With `server --single-node`, Garage bootstraps the initial layout
+        // itself. We can wait directly for a healthy cluster.
         vec![WaitFor::http(
             HttpWaitStrategy::new("/health")
                 .with_port(ADMIN_PORT)
                 .with_poll_interval(Duration::from_millis(200))
-                .with_expected_status_code(503u16),
+                .with_expected_status_code(200u16),
         )]
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        ["/garage", "server", "--single-node"]
     }
 
     fn env_vars(
@@ -156,7 +155,7 @@ pub struct GarageInstance {
 }
 
 impl GarageInstance {
-    /// Start a Garage container and initialize its cluster layout.
+    /// Start a Garage container initialized as a single-node cluster.
     ///
     /// This is the primary entry point for most tests.
     pub async fn start() -> Result<Self, Report> {
@@ -168,7 +167,7 @@ impl GarageInstance {
         Self::init(container).await
     }
 
-    /// Wrap an already-started container and initialize the cluster layout.
+    /// Wrap an already-started Garage test container.
     ///
     /// Use this when you started the container yourself (e.g. to share it
     /// across tests with `OnceCell`).
@@ -194,34 +193,10 @@ impl GarageInstance {
             s3_endpoint,
             admin_endpoint,
         };
-        instance.assign_layout().await?;
-        instance.wait_healthy().await?;
         Ok(instance)
     }
 
     // ── admin helpers ────────────────────────────────────────────────────────
-
-    async fn admin_get(&self, op: &str) -> Result<Value, Report> {
-        let url = self
-            .admin_endpoint
-            .join(&format!("v2/{op}"))
-            .context("build URL")?;
-        let resp = Client::new()
-            .get(url)
-            .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
-            .send()
-            .await
-            .context_with(|| format!("GET {op}"))?;
-
-        let status = resp.status();
-        let body: String = resp.text().await.context("read body")?;
-        if !status.is_success() {
-            bail!("Garage admin GET {op} failed ({status}): {body}");
-        }
-        serde_json::from_str(&body)
-            .context(format!("parse response for GET {op}"))
-            .map_err(Report::into_dynamic)
-    }
 
     async fn admin_post(&self, op: &str, payload: Value) -> Result<Value, Report> {
         let url = self
@@ -246,54 +221,6 @@ impl GarageInstance {
         serde_json::from_str(&body)
             .context(format!("parse response for POST {op}"))
             .map_err(Report::into_dynamic)
-    }
-
-    /// Poll `/health` until a 200 response is received (cluster is healthy).
-    async fn wait_healthy(&self) -> Result<(), Report> {
-        let url = self
-            .admin_endpoint
-            .join("/health")
-            .context("build health URL")?;
-        for _ in 0..50u8 {
-            if let Ok(resp) = Client::new().get(url.clone()).send().await
-                && resp.status().is_success()
-            {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        bail!("Garage cluster did not become healthy within 10 seconds after layout assignment")
-    }
-
-    /// Assign a zone+capacity to the single node and apply the layout.
-    async fn assign_layout(&self) -> Result<(), Report> {
-        let status = self.admin_get("GetClusterStatus").await?;
-        let node_id = status["nodes"]
-            .as_array()
-            .and_then(|n| n.first())
-            .and_then(|n| n["id"].as_str())
-            .ok_or_else(|| report!("no nodes in GetClusterStatus response"))?
-            .to_owned();
-
-        self.admin_post(
-            "UpdateClusterLayout",
-            json!({
-                "roles": [{
-                    "id": node_id,
-                    "zone": "dc1",
-                    "capacity": 1_000_000_000u64,
-                    "tags": []
-                }]
-            }),
-        )
-        .await
-        .context("UpdateClusterLayout")?;
-
-        self.admin_post("ApplyClusterLayout", json!({ "version": 1 }))
-            .await
-            .context("ApplyClusterLayout")?;
-
-        Ok(())
     }
 
     // ── public API ───────────────────────────────────────────────────────────

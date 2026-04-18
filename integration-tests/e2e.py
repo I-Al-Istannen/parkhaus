@@ -32,6 +32,13 @@ BACKEND_PORT = 6321
 METRICS_PORT = 6322
 BUCKET_NAME = "test-bucket"
 DB_PATH = "db.sqlite3"
+GARAGE_S3_PORT = 3900
+GARAGE_ADMIN_PORT = 3903
+GARAGE_CONFIG_PATH = "/etc/garage.toml"
+GARAGE_IMAGE = "dxflrs/garage:v2.3.0"
+GARAGE_DEFAULT_ACCESS_KEY = "testtest"
+GARAGE_DEFAULT_SECRET_KEY = "test-secret-1234567890"
+GARAGE_REGION = "us-east-1"
 
 CONFIG_TEMPLATE = """
 listen = "127.0.0.1:{{backend_port}}"
@@ -116,11 +123,10 @@ class Upstream:
     ) -> "Upstream":
         client = boto3.client(
             "s3",
-            endpoint_url=f"http://localhost:{container.get_exposed_port(9090)}",
-            aws_access_key_id="test",
-            aws_secret_access_key="test",
+            endpoint_url=f"http://localhost:{container.get_exposed_port(GARAGE_S3_PORT)}",
+            aws_access_key_id=GARAGE_DEFAULT_ACCESS_KEY,
+            aws_secret_access_key=GARAGE_DEFAULT_SECRET_KEY,
         )
-        client.create_bucket(Bucket=BUCKET_NAME)
         for bucket in buckets:
             if bucket != BUCKET_NAME:
                 client.create_bucket(Bucket=bucket)
@@ -445,11 +451,11 @@ def main(test_tier_by_bucket: bool) -> None:
         set(random.sample(buckets, k=5)) if test_tier_by_bucket else set()
     )
 
-    info("Creating S3Mock upstreams...")
+    info("Creating Garage upstreams...")
     with (
-        create_s3mock_container() as hot_container,
-        create_s3mock_container() as warm_container,
-        create_s3mock_container() as cold_container,
+        create_garage_container("hot") as hot_container,
+        create_garage_container("warm") as warm_container,
+        create_garage_container("cold") as cold_container,
         TemporaryDirectory(prefix="tiering-e2e-") as temp_dir_str,
     ):
         info("Initializing upstreams...", level=2)
@@ -490,12 +496,62 @@ def main(test_tier_by_bucket: bool) -> None:
             info("Test completed successfully!")
 
 
-def create_s3mock_container() -> DockerContainer:
-    return (
-        DockerContainer("adobe/s3mock:latest")
-        .with_exposed_ports(9090)
-        .waiting_for(HttpWaitStrategy(9090).for_status_code(200))
-    )
+@contextlib.contextmanager
+def create_garage_container(name: str):
+    with TemporaryDirectory(prefix=f"garage-{name}-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        config_path = temp_dir / "garage.toml"
+        config_path.write_text(
+            f"""
+metadata_dir = "/tmp/meta"
+data_dir     = "/tmp/data"
+db_engine    = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr   = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[s3_api]
+s3_region     = "{GARAGE_REGION}"
+api_bind_addr = "[::]:3900"
+root_domain   = ".localhost"
+
+[s3_web]
+bind_addr   = "[::]:3902"
+root_domain = ".localhost"
+index       = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token   = "unused-for-e2e"
+""".strip()
+            + "\n"
+        )
+
+        container = (
+            DockerContainer(GARAGE_IMAGE)
+            .with_volume_mapping(config_path, GARAGE_CONFIG_PATH, "ro")
+            .with_exposed_ports(GARAGE_S3_PORT, GARAGE_ADMIN_PORT)
+            .with_env("GARAGE_DEFAULT_ACCESS_KEY", GARAGE_DEFAULT_ACCESS_KEY)
+            .with_env("GARAGE_DEFAULT_SECRET_KEY", GARAGE_DEFAULT_SECRET_KEY)
+            .with_env("GARAGE_DEFAULT_BUCKET", BUCKET_NAME)
+            .with_command(
+                [
+                    "/garage",
+                    "server",
+                    "--single-node",
+                    "--default-access-key",
+                    "--default-bucket",
+                ]
+            )
+            .waiting_for(
+                HttpWaitStrategy(GARAGE_ADMIN_PORT, path="/health").for_status_code(200)
+            )
+        )
+        with container:
+            yield container
 
 
 def render_config(
@@ -505,14 +561,14 @@ def render_config(
 ) -> str:
     upstreams = []
     for upstream in started_containers:
-        port = upstream.container.get_exposed_port(9090)
+        port = upstream.container.get_exposed_port(GARAGE_S3_PORT)
         upstream_config = (
             UPSTREAM_TEMPLATE.replace("{{name}}", upstream.tier.value)
             .replace("{{order}}", str(upstream.tier.order()))
             .replace("{{port}}", str(port))
-            .replace("{{s3_access_key}}", "test")
-            .replace("{{s3_secret}}", "test")
-            .replace("{{s3_region}}", "us-east-1")
+            .replace("{{s3_access_key}}", GARAGE_DEFAULT_ACCESS_KEY)
+            .replace("{{s3_secret}}", GARAGE_DEFAULT_SECRET_KEY)
+            .replace("{{s3_region}}", GARAGE_REGION)
         )
         upstreams.append(upstream_config)
 
@@ -591,8 +647,8 @@ def start_backend(temp_dir: Path, config_path: Path):
     client = boto3.client(
         "s3",
         endpoint_url=f"http://localhost:{BACKEND_PORT}",
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
+        aws_access_key_id=GARAGE_DEFAULT_ACCESS_KEY,
+        aws_secret_access_key=GARAGE_DEFAULT_SECRET_KEY,
     )
     try:
         yield Backend(
