@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        tier-by-bucket: ["True", "False"]
+        command: ["tiering True", "tiering False", "access-log"]
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5
@@ -48,7 +48,7 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Run test
-        run: uv run integration-tests/e2e.py ${{ matrix.tier-by-bucket }}
+        run: uv run integration-tests/e2e.py ${{ matrix.command }}
 
   build-push-docker:
     runs-on: ubuntu-latest
