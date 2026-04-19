@@ -105,6 +105,25 @@ The expression syntax for tiering rules supports a few constructs:
   - `upstream`, the current upstream of the object
   - `size`, the size of the object in bytes. Use byte sizes for intuitive
     rules, e.g. `size > 1MiB` instead of `size > 1_048_576`
+  - `last_accessed`, the time since the object was last accessed. Use time
+    spans for intuitive rules, e.g. `last_accessed > 20d` instead of
+    `last_accessed > 1_728_000`.
+    **Note** that `parkhaus`, as of now, *does not include automatic
+    hysteresis*. Objects might be moved around once per day if they edge right
+    on the limits you define.
+- Functions, which are evaluated for every object:
+  - `access_counts`, the cumulative sum of accesses in a given (inclusive) day
+    range, topping out at 30 days.
+    As an example, `access_counts(0d, 10d)` will sum up all accesses in the
+    last 10 days and additionally today, while `access_counts(1d, 10d)` will
+    exclude today.
+    Accesse counts are discretised into per-day buckets, so any smaller
+    granularity in your rules doesn't make sense.
+    Mathematically, the expression is
+    `bucket BETWEEN (now - end - 1d) AND (now - start)`.  
+    **Note** that `parkhaus`, as of now, *does not include automatic
+    hysteresis*. Objects might be moved around once per day if they edge right
+    on the limits you define.
 - Some operators
   | Operator | Meaning                         |
   |----------|---------------------------------|
@@ -169,6 +188,12 @@ to = "hot"
 # or in a bucket starting with 'hot-bucket-' to hot, no matter its age
 # or size.
 when = "bucket == 'always-hot' || bucket ~= 'hot-bucket-.*'"
+
+[[tiering_rules]]
+to = "hot"
+# This expression migrates every object that has had more than 5000 accesses in
+# the last 10 days (plus today) to hot.
+when = "access_counts(0d, 10d) > 5000"
 
 [[tiering_rules]]
 to = "cold"
