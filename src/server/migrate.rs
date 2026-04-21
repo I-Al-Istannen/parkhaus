@@ -8,12 +8,12 @@ use crate::s3::client::S3Client;
 use axum_prometheus::metrics::{counter, gauge};
 use jiff::Zoned;
 use rand::prelude::SliceRandom;
-use rootcause::Report;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
+use rootcause::{Report, report};
 use std::collections::{HashMap, HashSet};
 use std::ops::Not;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
@@ -71,11 +71,19 @@ pub async fn compute_pending_migrations(
 ) -> Result<Vec<PendingMigration>, Report> {
     let mut all_migrations = Vec::new();
 
-    for rule in &config.tiering_rules {
+    for rule_index in 0..config.tiering_rules.len() {
+        let rule = &config.tiering_rules[rule_index];
+        let up_until = &config.tiering_rules[..rule_index];
+        let start = SystemTime::now();
         let pending = db
-            .get_pending_migrations_for_rule(rule, &now)
+            .get_pending_migrations_for_rule(rule, up_until, &rule.to, &now)
             .await
             .context("failed to apply rule")?;
+        debug!(
+            %rule_index,
+            duration=%SystemTime::now().duration_since(start).unwrap_or_default().as_secs_f32(),
+            "Applied rule",
+        );
         all_migrations.extend(pending);
     }
 
@@ -92,16 +100,6 @@ pub async fn compute_pending_migrations(
     for object in set {
         trace!(%object, "Covered object more than once");
     }
-
-    // Remove migrations that don't do anything. This must be done at the end to handle this case:
-    // hot : age <= 2d
-    // warm: age <= 3d
-    // In this case an object in hot matches both, hot and warm. It currently is in hot though,
-    // but this migration _must not_ be dropped, otherwise it is migrated to warm.
-    // When in warm this happens in reverse and it is moved back up to hot, ping-ponging
-    // between the two. Therefore, we retain "bogus" no-op migrations up until we realize them here,
-    // to allow the user to write overlapping rules that work as intuitively expected.
-    all_migrations.retain(|migration| migration.target_upstream != migration.source_upstream);
 
     Ok(all_migrations)
 }
@@ -223,6 +221,14 @@ async fn execute_migration(
     } = &action;
 
     debug!(from = ?source, to = ?target, %object, ?state, "Executing pending migration");
+
+    if source == target {
+        return Err(report!("Tried to migrate object to the same upstream")
+            .attach(format!("object: {object}"))
+            .attach(format!("source: {source}"))
+            .attach(format!("target: {target}"))
+            .attach(format!("state: {state}")));
+    }
 
     let source_client = upstream_to_client
         .get(source)

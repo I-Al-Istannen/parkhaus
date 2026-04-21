@@ -257,13 +257,31 @@ pub(super) async fn get_all_buckets(
 pub(super) async fn get_pending_migrations_for_rule(
     con: &mut SqliteConnection,
     rule: &TieringRule,
+    exclude: &[TieringRule],
+    rule_to_upstream: &UpstreamId,
     now: &Zoned,
 ) -> Result<Vec<PendingMigration>, Report> {
-    let rule_query = tier_rule::to_sql(rule.filter.clone(), now);
+    let mut all_arguments = vec![SqlArgument::String(rule_to_upstream.to_string())];
+    let mut exclude_sql = String::new();
 
-    let sql = format!("SELECT * FROM Objects WHERE {}", &rule_query.condition,);
+    let rule_query = tier_rule::to_sql(rule.filter.clone(), all_arguments.len(), now);
+    all_arguments.extend(rule_query.arguments.clone());
+
+    for exclude_rule in exclude {
+        let exclude_query =
+            tier_rule::to_sql(exclude_rule.filter.clone(), all_arguments.len(), now);
+        all_arguments.extend(exclude_query.arguments);
+        exclude_sql += "AND NOT";
+        exclude_sql += &exclude_query.condition;
+    }
+
+    let sql = format!(
+        "SELECT * FROM Objects WHERE assigned_upstream != $1 AND {} {exclude_sql}",
+        &rule_query.condition,
+    );
+
     let mut query = query_as::<Sqlite, DbObject>(&sql);
-    for arg in &rule_query.arguments {
+    for arg in &all_arguments {
         query = match arg {
             SqlArgument::String(str) => query.bind(str),
             SqlArgument::Number(num) => query.bind(num),

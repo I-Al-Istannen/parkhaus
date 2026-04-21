@@ -218,12 +218,16 @@ impl Database {
     pub async fn get_pending_migrations_for_rule(
         &self,
         rule: &TieringRule,
+        exclude: &[TieringRule],
+        rule_to_upstream: &UpstreamId,
         now: &Zoned,
     ) -> Result<Vec<PendingMigration>, Report> {
         let con = self.read().await;
         objects::get_pending_migrations_for_rule(
             &mut *con.acquire().await.context("acquire con")?,
             rule,
+            exclude,
+            rule_to_upstream,
             now,
         )
         .await

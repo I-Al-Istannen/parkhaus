@@ -14,13 +14,15 @@ pub enum SqlArgument {
 struct SqlBuilder {
     arguments: Vec<SqlArgument>,
     now_arg: String,
+    arg_offset: usize,
 }
 
 impl SqlBuilder {
-    fn new(now: &Zoned) -> Self {
+    fn new(arg_offset: usize, now: &Zoned) -> Self {
         let mut me = Self {
             arguments: Vec::new(),
-            now_arg: "$1".to_string(),
+            now_arg: format!("${}", arg_offset + 1),
+            arg_offset,
         };
         me.add_arg(SqlArgument::TimeSpan(now.timestamp().as_second()));
         me
@@ -28,7 +30,7 @@ impl SqlBuilder {
 
     fn add_arg(&mut self, arg: SqlArgument) -> String {
         self.arguments.push(arg);
-        format!("${}", self.arguments.len())
+        format!("${}", self.arguments.len() + self.arg_offset)
     }
 
     fn add_expr(&mut self, expr: &Expr<Typechecked<TieringRuleEnv>>) -> String {
@@ -82,8 +84,12 @@ pub struct TieringRuleQuery {
     pub arguments: Vec<SqlArgument>,
 }
 
-pub fn to_sql(expr: Expr<Typechecked<TieringRuleEnv>>, now: &Zoned) -> TieringRuleQuery {
-    let mut builder = SqlBuilder::new(now);
+pub fn to_sql(
+    expr: Expr<Typechecked<TieringRuleEnv>>,
+    arg_offset: usize,
+    now: &Zoned,
+) -> TieringRuleQuery {
+    let mut builder = SqlBuilder::new(arg_offset, now);
     let sql = builder.add_expr(&expr);
 
     TieringRuleQuery {
