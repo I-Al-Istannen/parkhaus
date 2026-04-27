@@ -3,6 +3,7 @@
 # dependencies = [
 #     "boto3>=1.42.69",
 #     "boto3-stubs[s3]>=1.42.70",
+#     "hypothesis>=6.152.3",
 #     "rich>=14.3.3",
 #     "testcontainers>=4.14.1",
 # ]
@@ -12,6 +13,7 @@ import argparse
 
 from e2e_access_log import main as run_access_log
 from e2e_tiering import main as run_tiering
+from e2e_crud import main as run_crud
 from e2e_utils import info
 
 
@@ -37,6 +39,10 @@ def main() -> None:
         "access-log",
         help="Run access-log driven migration e2e scenario",
     )
+    subparsers.add_parser(
+        "crud",
+        help="Run crud e2e scenario",
+    )
 
     args = parser.parse_args()
     if args.command == "tiering":
@@ -47,6 +53,11 @@ def main() -> None:
     if args.command == "access-log":
         info("Running access-log scenario")
         run_access_log()
+        return
+
+    if args.command == "crud":
+        info("Running crud scenario")
+        run_crud()
         return
 
     parser.error(f"Unknown command: {args.command}")

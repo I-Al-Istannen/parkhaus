@@ -1,6 +1,7 @@
 import contextlib
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -434,3 +435,16 @@ def start_backend(temp_dir: Path, config_path: Path):
             except subprocess.TimeoutExpired:
                 warn("Backend did not terminate in time, killing it")
                 backend_process.kill()
+
+    has_errors = False
+    for line in logfile.read_text().splitlines():
+        if ("WARN" in line or "ERROR" in line) and "SIGTERM" not in line:
+            has_errors = True
+
+    if has_errors:
+        warn("Backend emitted warnings during the test, check the logs for details")
+        print("[dim]============== Backend logs ==============[/]")
+        for line in logfile.read_text():
+            sys.stdout.write(line)
+        print("[dim]============== Backend logs ==============[/]")
+        raise RuntimeError("Backend emitted warnings during the test")
