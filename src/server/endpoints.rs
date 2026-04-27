@@ -15,7 +15,9 @@ use axum::response::Response;
 use axum_prometheus::metrics::counter;
 use futures_util::TryStreamExt;
 use reqwest::StatusCode;
+use rootcause::markers::Dynamic;
 use rootcause::prelude::ResultExt;
+use rootcause::report_collection::ReportCollection;
 use rootcause::{Report, report};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -209,32 +211,50 @@ fn record_successful_request(
         let obj_id_clone = obj_id.clone();
         let recording = async move {
             let now = jiff::Zoned::now();
+            let mut errors = ReportCollection::<Dynamic>::new();
 
             if is_creation(&req_method) {
                 counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
-                db.record_creation(&S3Object {
-                    id: obj_id_clone.clone(),
-                    assigned_upstream: upstream_name,
-                    last_modified: now.timestamp(),
-                    size,
-                })
-                .await
-                .context("failed to record creation")
-                .attach(format!("object: {obj_id_clone:?}"))?;
-            } else if is_delete(&req_method) {
+                add_if_err(
+                    &mut errors,
+                    db.record_creation(&S3Object {
+                        id: obj_id_clone.clone(),
+                        assigned_upstream: upstream_name.clone(),
+                        last_modified: now.timestamp(),
+                        size,
+                    })
+                    .await
+                    .context("failed to record creation")
+                    .attach(format!("object: {obj_id_clone:?}")),
+                );
+            }
+
+            add_if_err(
+                &mut errors,
+                db.record_access(&obj_id_clone, &now)
+                    .await
+                    .context("failed to record access")
+                    .attach(format!("object: {obj_id_clone:?}")),
+            );
+
+            if is_delete(&req_method) {
                 counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
-                db.delete_object(&obj_id_clone)
-                    .await
-                    .context("failed to record deletion")
-                    .attach(format!("object: {obj_id_clone:?}"))?;
+                add_if_err(
+                    &mut errors,
+                    db.delete_object(&obj_id_clone)
+                        .await
+                        .context("failed to record deletion")
+                        .attach(format!("object: {obj_id_clone:?}")),
+                );
             }
-            db.record_access(&obj_id_clone, &now)
-                .await
-                .context("failed to record access")
-                .attach(format!("object: {obj_id_clone:?}"))?;
-            Result::<(), Report>::Ok(())
+
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.into_dynamic())
+            }
         };
 
         tokio::spawn(async move {
@@ -255,4 +275,10 @@ fn is_creation(method: &Method) -> bool {
 
 fn is_delete(method: &Method) -> bool {
     method == Method::DELETE
+}
+
+fn add_if_err<T, E>(errors: &mut ReportCollection<Dynamic>, res: Result<T, Report<E>>) {
+    if let Err(e) = res {
+        errors.push(e.into_dynamic().into_cloneable());
+    }
 }
