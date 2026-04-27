@@ -176,6 +176,47 @@ impl S3Client {
         Ok((content_length, StreamReader::new(bytes_stream)))
     }
 
+    pub async fn head_file(&self, id: &S3ObjectId) -> Result<ObjectInfo, Report> {
+        let url = self.object_url(id)?;
+        let response = self.signed_request(&url, Method::HEAD, &[]).await?;
+
+        let last_modified = response.headers().get("last-modified").ok_or_else(|| {
+            report!("missing Last-Modified header in HEAD response").attach(format!("object: {id}"))
+        })?;
+        let last_modified = last_modified
+            .to_str()
+            .context("invalid Last-Modified header in HEAD response")
+            .attach(format!("object: {id}"))
+            .attach(format!("header value: {last_modified:?}"))?;
+        let last_modified = jiff::fmt::strtime::parse("%a, %d %b %Y %H:%M:%S %Q", last_modified)?;
+        let last_modified = last_modified
+            .to_zoned()
+            .context("failed to parse Last-Modified header in HEAD response")
+            .attach(format!("object: {id}"))
+            .attach(format!("header value: {last_modified:?}"))?;
+
+        let size = response.headers().get("content-length").ok_or_else(|| {
+            report!("missing Content-Length header in HEAD response")
+                .attach(format!("object: {id}"))
+        })?;
+        let size = size
+            .to_str()
+            .context("invalid Content-Length header in HEAD response")
+            .attach(format!("object: {id}"))
+            .attach(format!("header value: {size:?}"))?;
+        let size = size
+            .parse::<u64>()
+            .context("failed to parse Content-Length header in HEAD response")
+            .attach(format!("object: {id}"))
+            .attach(format!("header value: {size:?}"))?;
+
+        Ok(ObjectInfo {
+            last_modified: last_modified.timestamp(),
+            key: id.key.clone(),
+            size,
+        })
+    }
+
     /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
     /// `true` if it was deleted.
     pub async fn delete_file(&self, id: &S3ObjectId) -> Result<bool, Report> {

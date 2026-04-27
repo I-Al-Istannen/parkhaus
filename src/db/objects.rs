@@ -123,6 +123,23 @@ pub(super) async fn get_object(
     .try_into()
 }
 
+pub(super) async fn has_object(
+    con: &mut SqliteConnection,
+    obj: &S3ObjectId,
+) -> Result<bool, Report> {
+    query!(
+        r#"SELECT EXISTS(SELECT 1 FROM objects WHERE bucket = $1 AND key = $2) as "exists!: bool""#,
+        obj.bucket,
+        obj.key
+    )
+    .map(|row| row.exists)
+    .fetch_one(con)
+    .await
+    .context("failed to check if object exists")
+    .attach(format!("object: {obj}"))
+    .map_err(Report::into_dynamic)
+}
+
 pub(super) async fn get_upstream(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,

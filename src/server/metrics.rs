@@ -7,6 +7,7 @@ pub const COUNTER_UPSTREAM_FORWARDS_TOTAL: &str = "upstream_forwards_total";
 pub const COUNTER_UPSTREAM_FALLBACKS_TOTAL: &str = "upstream_fallbacks_total";
 pub const COUNTER_OBJECT_CREATIONS_TOTAL: &str = "object_creations_total";
 pub const COUNTER_OBJECT_DELETIONS_TOTAL: &str = "object_deletions_total";
+pub const COUNTER_OBJECT_IMPORTED_ON_THE_FLY: &str = "object_import_on_the_fly";
 
 pub fn initialize_metrics() {
     describe_gauge!(

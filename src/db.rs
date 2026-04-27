@@ -100,6 +100,11 @@ impl Database {
         objects::get_object(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
+    pub async fn has_object(&self, obj: &S3ObjectId) -> Result<bool, Report> {
+        let con = self.read().await;
+        objects::has_object(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
     pub async fn get_upstream(&self, obj: &S3ObjectId) -> Result<Option<UpstreamId>, Report> {
         let con = self.read().await;
         objects::get_upstream(&mut *con.acquire().await.context("acquire con")?, obj).await

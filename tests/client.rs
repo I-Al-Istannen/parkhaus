@@ -3,6 +3,7 @@
 use crate::common::garage::GarageInstance;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use jiff::Timestamp;
 use parkhaus::data::S3ObjectId;
 use parkhaus::s3::client::{CHUNK_SIZE, S3Client};
 use parkhaus::s3::types::AddressingStyle;
@@ -274,6 +275,92 @@ async fn test_list_objects() -> Result<(), Report> {
         assert_eq!(object.key, expected_key);
         assert_eq!(object.size, expected_size);
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_head_file_returns_metadata() -> Result<(), Report> {
+    let g = garage().await?;
+    let bucket = bucket_name("test-head-file-returns-metadata");
+    let client = setup_bucket(g, &bucket).await?;
+
+    let payload = b"head me";
+    let id = S3ObjectId {
+        bucket,
+        key: "metadata.txt".into(),
+    };
+
+    client
+        .put_file(&id, Cursor::new(payload.to_vec()), payload.len() as u64)
+        .await?;
+
+    let info = client.head_file(&id).await?;
+    assert_eq!(info.key, id.key);
+    assert_eq!(info.size, payload.len() as u64);
+    assert!(
+        info.last_modified <= Timestamp::now(),
+        "expected Last-Modified to be in the past"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_head_file_tracks_overwrites() -> Result<(), Report> {
+    let g = garage().await?;
+    let bucket = bucket_name("test-head-file-tracks-overwrites");
+    let client = setup_bucket(g, &bucket).await?;
+
+    let id = S3ObjectId {
+        bucket,
+        key: "overwrite.bin".into(),
+    };
+    let old_payload = b"abc";
+    let new_payload = b"123456789";
+
+    client
+        .put_file(
+            &id,
+            Cursor::new(old_payload.to_vec()),
+            old_payload.len() as u64,
+        )
+        .await?;
+    client
+        .put_file(
+            &id,
+            Cursor::new(new_payload.to_vec()),
+            new_payload.len() as u64,
+        )
+        .await?;
+
+    let info = client.head_file(&id).await?;
+    assert_eq!(info.key, id.key);
+    assert_eq!(info.size, new_payload.len() as u64);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_head_file_missing_object_errors() -> Result<(), Report> {
+    let g = garage().await?;
+    let bucket = bucket_name("test-head-file-missing-object-errors");
+    let client = setup_bucket(g, &bucket).await?;
+
+    let id = S3ObjectId {
+        bucket,
+        key: "missing.txt".into(),
+    };
+
+    let err = client
+        .head_file(&id)
+        .await
+        .expect_err("HEAD should fail for a missing object");
+    let err_text = format!("{err:?}");
+    assert!(
+        err_text.contains("404"),
+        "expected error to mention 404, got: {err_text}"
+    );
 
     Ok(())
 }

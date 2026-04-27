@@ -1,11 +1,12 @@
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
-use crate::db::Database;
 use crate::error::TierError;
+use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
-    COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
+    COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
+    COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
 use crate::server::state::AppState;
 use axum::body::Body;
@@ -15,9 +16,7 @@ use axum::response::Response;
 use axum_prometheus::metrics::counter;
 use futures_util::TryStreamExt;
 use reqwest::StatusCode;
-use rootcause::markers::Dynamic;
 use rootcause::prelude::ResultExt;
-use rootcause::report_collection::ReportCollection;
 use rootcause::{Report, report};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,7 +73,7 @@ pub async fn proxy_request(
     let on_success = record_successful_request(
         req.method().clone(),
         object_id.clone(),
-        state.db.clone(),
+        state.clone(),
         upstream.name.clone(),
     );
     let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
@@ -204,21 +203,32 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
 fn record_successful_request(
     req_method: Method,
     obj_id: S3ObjectId,
-    db: Database,
+    state: AppState,
     upstream_name: UpstreamId,
 ) -> impl FnOnce(u64) {
     move |size| {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
+            if is_delete(&req_method) {
+                counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                    .increment(1);
+                state
+                    .db
+                    .delete_object(&obj_id_clone)
+                    .await
+                    .context("failed to record deletion")
+                    .attach(format!("object: {obj_id_clone:?}"))?;
+                return Ok::<_, Report>(());
+            }
+
             let now = jiff::Zoned::now();
-            let mut errors = ReportCollection::<Dynamic>::new();
 
             if is_creation(&req_method) {
                 counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);
-                add_if_err(
-                    &mut errors,
-                    db.record_creation(&S3Object {
+                state
+                    .db
+                    .record_creation(&S3Object {
                         id: obj_id_clone.clone(),
                         assigned_upstream: upstream_name.clone(),
                         last_modified: now.timestamp(),
@@ -226,35 +236,27 @@ fn record_successful_request(
                     })
                     .await
                     .context("failed to record creation")
-                    .attach(format!("object: {obj_id_clone:?}")),
-                );
-            }
-
-            add_if_err(
-                &mut errors,
-                db.record_access(&obj_id_clone, &now)
+                    .attach(format!("object: {obj_id_clone:?}"))?;
+            } else if !state
+                .db
+                .has_object(&obj_id_clone)
+                .await
+                .context("failed to check object existence")?
+            {
+                import_on_the_fly(&state, &upstream_name, &obj_id_clone)
                     .await
-                    .context("failed to record access")
-                    .attach(format!("object: {obj_id_clone:?}")),
-            );
-
-            if is_delete(&req_method) {
-                counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                    .increment(1);
-                add_if_err(
-                    &mut errors,
-                    db.delete_object(&obj_id_clone)
-                        .await
-                        .context("failed to record deletion")
-                        .attach(format!("object: {obj_id_clone:?}")),
-                );
+                    .context("failed to import object on the fly")
+                    .attach(format!("object: {obj_id_clone:?}"))?;
             }
 
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(errors.into_dynamic())
-            }
+            state
+                .db
+                .record_access(&obj_id_clone, &now)
+                .await
+                .context("failed to record access")
+                .attach(format!("object: {obj_id_clone:?}"))?;
+
+            Ok(())
         };
 
         tokio::spawn(async move {
@@ -269,16 +271,41 @@ fn record_successful_request(
     }
 }
 
+async fn import_on_the_fly(
+    state: &AppState,
+    upstream_name: &UpstreamId,
+    obj_id_clone: &S3ObjectId,
+) -> Result<(), Report> {
+    let upstream = state.config.upstreams.get(upstream_name).ok_or_else(|| {
+        report!("upstream not found in config").attach(format!("upstream: '{upstream_name:?}'"))
+    })?;
+    let s3_client = S3Client::for_upstream(state.http.clone(), upstream);
+    let metadata = s3_client
+        .head_file(obj_id_clone)
+        .await
+        .context("failed to HEAD file")
+        .attach(format!("object: {obj_id_clone:?}"))?;
+    state
+        .db
+        .record_creation(&S3Object {
+            id: obj_id_clone.clone(),
+            assigned_upstream: upstream_name.clone(),
+            last_modified: metadata.last_modified,
+            size: metadata.size,
+        })
+        .await
+        .context("failed to record creation of previously unknown object")?;
+
+    counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
+        .increment(1);
+
+    Ok(())
+}
+
 fn is_creation(method: &Method) -> bool {
     method == Method::PUT
 }
 
 fn is_delete(method: &Method) -> bool {
     method == Method::DELETE
-}
-
-fn add_if_err<T, E>(errors: &mut ReportCollection<Dynamic>, res: Result<T, Report<E>>) {
-    if let Err(e) = res {
-        errors.push(e.into_dynamic().into_cloneable());
-    }
 }
