@@ -11,13 +11,14 @@ use crate::server::metrics::{
 use crate::server::state::AppState;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
 use futures_util::TryStreamExt;
 use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
@@ -119,8 +120,9 @@ async fn forward_request(
         out_req = out_req.header(reqwest::header::HOST, host_header);
     }
 
+    let connection_headers = connection_header_names(in_req.headers());
     for (name, val) in in_req.headers() {
-        if is_hop_by_hop_header(name) {
+        if is_hop_by_hop_header(name) || connection_headers.contains(name) {
             continue;
         }
         out_req = out_req.header(name, val);
@@ -198,6 +200,18 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
+    headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| HeaderName::from_bytes(value.as_bytes()).ok())
+        .collect()
 }
 
 fn record_successful_request(
@@ -308,4 +322,45 @@ fn is_creation(method: &Method) -> bool {
 
 fn is_delete(method: &Method) -> bool {
     method == Method::DELETE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{connection_header_names, is_hop_by_hop_header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    #[test]
+    fn strips_headers_named_by_connection() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, x-foo, x-bar"),
+        );
+
+        let names = connection_header_names(&headers);
+
+        assert!(names.contains(&HeaderName::from_static("keep-alive")));
+        assert!(names.contains(&HeaderName::from_static("x-foo")));
+        assert!(names.contains(&HeaderName::from_static("x-bar")));
+    }
+
+    #[test]
+    fn ignores_invalid_connection_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("x-ok, bad token"));
+
+        let names = connection_header_names(&headers);
+
+        assert!(names.contains(&HeaderName::from_static("x-ok")));
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn fixed_hop_by_hop_headers_remain_filtered() {
+        assert!(is_hop_by_hop_header(&HeaderName::from_static("connection")));
+        assert!(is_hop_by_hop_header(&HeaderName::from_static("upgrade")));
+        assert!(!is_hop_by_hop_header(&HeaderName::from_static(
+            "x-not-hop-by-hop"
+        )));
+    }
 }
