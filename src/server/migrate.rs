@@ -276,6 +276,11 @@ async fn upload_object(
         .attach(format!("source upstream: {source}"))
         .attach(format!("object: {object}"))?;
 
+    // We mark it as started because we might finish creating the file in the target and then
+    // crash. In that case we have two copies, one of them untracked on the target. This is not
+    // ideal, so we just redo the migration instead.
+    update_in_flight(db, &migration).await?;
+
     target_client
         .put_file(object, data, size.unwrap_or(0))
         .await
@@ -294,11 +299,11 @@ async fn upload_object(
         .attach(format!("old upstream: {source}"))
         .attach(format!("new upstream: {target}"))?;
 
-    // If this update fails we do the whole copy again, but that is fine.
     let migration = InFlightMigration {
         pending: migration.pending,
         state: MigrationState::CopiedToTarget,
     };
+    // If this update fails we do the whole copy again, but that is fine.
     update_in_flight(db, &migration).await?;
     debug!(
         source = ?migration.pending.source_upstream,
