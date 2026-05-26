@@ -84,6 +84,7 @@ pub async fn compute_pending_migrations(
             duration=%SystemTime::now().duration_since(start).unwrap_or_default().as_secs_f32(),
             "Applied rule",
         );
+        MigrationMetrics::record_rule_migrations(rule_index, &rule.to, pending.len());
         all_migrations.extend(pending);
     }
 

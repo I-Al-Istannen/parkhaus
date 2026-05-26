@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 pub const GAUGE_PENDING_ACTIONS: &str = "pending_actions";
 pub const COUNTER_MIGRATION_RUNS_TOTAL: &str = "migration_runs_total";
+pub const COUNTER_MIGRATION_RULE_MIGRATIONS_TOTAL: &str = "migration_rule_migrations_total";
 pub const COUNTER_MIGRATED_OBJECTS_TOTAL: &str = "migrated_objects_total";
 pub const COUNTER_UPSTREAM_FORWARDS_TOTAL: &str = "upstream_forwards_total";
 pub const COUNTER_UPSTREAM_FALLBACKS_TOTAL: &str = "upstream_fallbacks_total";
@@ -90,6 +91,14 @@ impl MigrationMetrics {
     pub(super) fn record_migrated_object() {
         counter!(COUNTER_MIGRATED_OBJECTS_TOTAL).increment(1);
     }
+
+    pub(super) fn record_rule_migrations(rule_index: usize, target: &UpstreamId, count: usize) {
+        counter!(COUNTER_MIGRATION_RULE_MIGRATIONS_TOTAL,
+            "rule_index" => rule_index.to_string(),
+            "target" => target.0.clone()
+        )
+        .increment(count as u64);
+    }
 }
 
 impl MigrationMetricsSnapshot {
@@ -163,6 +172,10 @@ pub fn initialize_metrics() {
     describe_counter!(
         COUNTER_MIGRATION_RUNS_TOTAL,
         "Total number of migration runs"
+    );
+    describe_counter!(
+        COUNTER_MIGRATION_RULE_MIGRATIONS_TOTAL,
+        "Total number of pending migrations created by tiering rules"
     );
     describe_counter!(
         COUNTER_UPSTREAM_FORWARDS_TOTAL,
