@@ -494,7 +494,7 @@ pub fn typecheck<E: Env + Clone>(
             }
             let args = args
                 .into_iter()
-                .zip(types.into_iter())
+                .zip(types)
                 .map(|(arg, typ)| {
                     let arg = Spanned {
                         span: arg.span,

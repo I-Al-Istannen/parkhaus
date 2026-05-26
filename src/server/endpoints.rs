@@ -8,7 +8,7 @@ use crate::server::metrics::{
     COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
     COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
-use crate::server::state::AppState;
+use crate::server::state::{AppState, MutationLockGuard};
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
@@ -54,6 +54,10 @@ pub async fn proxy_request(
         bucket: bucket.to_string(),
         key: key.to_string(),
     };
+    let mutation_guard = state
+        .migration_locks
+        .wait_for_migration(req.method(), &object_id)
+        .await;
 
     let upstream = state
         .db
@@ -76,6 +80,7 @@ pub async fn proxy_request(
         object_id.clone(),
         state.clone(),
         upstream.name.clone(),
+        mutation_guard,
     );
     let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
     target_url.url.set_query(req.uri().query());
@@ -219,10 +224,12 @@ fn record_successful_request(
     obj_id: S3ObjectId,
     state: AppState,
     upstream_name: UpstreamId,
+    mutation_guard: MutationLockGuard,
 ) -> impl FnOnce(u64) {
     move |size| {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
+            let _mutation_guard = mutation_guard;
             if is_delete(&req_method) {
                 counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
                     .increment(1);

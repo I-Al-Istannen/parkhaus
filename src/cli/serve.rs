@@ -6,7 +6,7 @@ use crate::db::Database;
 use crate::server::endpoints;
 use crate::server::metrics::initialize_metrics;
 use crate::server::migrate::migration_task;
-use crate::server::state::AppState;
+use crate::server::state::{AppState, MigrationLocks};
 use axum::Router;
 use axum::routing::{any, get};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
@@ -74,9 +74,11 @@ async fn start_main_server(
     prometheus_layer: GenericMetricLayer<'static, PrometheusHandle, Handle>,
     shutdown_token: CancellationToken,
 ) -> Result<(), Report> {
+    let migration_locks = MigrationLocks::default();
     tokio::spawn(migration_task(
         (*config).clone(),
         db.clone(),
+        migration_locks.clone(),
         shutdown_token.clone(),
     ));
 
@@ -86,6 +88,7 @@ async fn start_main_server(
         http: Client::builder()
             .build()
             .context("failed to build HTTP client")?,
+        migration_locks,
     };
 
     let app = Router::new()

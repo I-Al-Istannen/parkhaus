@@ -9,6 +9,7 @@ use parkhaus::db::Database;
 use parkhaus::policy::expr::{parse_expr, typecheck};
 use parkhaus::s3::client::{ObjectInfo, S3Client};
 use parkhaus::s3::types::AddressingStyle;
+use parkhaus::server::MigrationLocks;
 use parkhaus::server::migrate::{compute_pending_migrations, execute_migrations};
 use rand::prelude::IndexedRandom;
 use rand::rngs::StdRng;
@@ -307,7 +308,14 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         .collect::<HashSet<_>>();
     assert_eq!(pending_set, expected_pending, "pending migrations mismatch");
 
-    let errors = execute_migrations(pending, Vec::new(), &config, &db).await?;
+    let errors = execute_migrations(
+        pending,
+        Vec::new(),
+        &config,
+        &db,
+        &MigrationLocks::default(),
+    )
+    .await?;
     assert_eq!(0, errors, "migration execution failed: {errors:?}");
 
     let tier_to_keys = [

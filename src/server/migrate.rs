@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::data::{InFlightMigration, MigrationState, PendingMigration, UpstreamId};
 use crate::db::Database;
 use crate::s3::client::S3Client;
+use crate::server::state::MigrationLocks;
 use axum_prometheus::metrics::{counter, gauge};
 use jiff::Zoned;
 use rand::prelude::SliceRandom;
@@ -22,7 +23,12 @@ const SAMPLE_ERRORS: usize = 50;
 const METRICS_STATE_PENDING: &str = "Pending";
 const METRICS_STATE_COMPLETED: &str = "Completed";
 
-pub async fn migration_task(config: Config, db: Database, shutdown: CancellationToken) {
+pub async fn migration_task(
+    config: Config,
+    db: Database,
+    migration_locks: MigrationLocks,
+    shutdown: CancellationToken,
+) {
     let work = async {
         loop {
             // Only check sometimes :)
@@ -41,7 +47,7 @@ pub async fn migration_task(config: Config, db: Database, shutdown: Cancellation
                 Vec::new()
             });
             metrics_start_run(&config, &pending, &in_flight);
-            match execute_migrations(pending, in_flight, &config, &db).await {
+            match execute_migrations(pending, in_flight, &config, &db, &migration_locks).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
                 Ok(0) => {}
                 Ok(errors) => error!(error_count = errors, "Failed to perform migrations",),
@@ -110,6 +116,7 @@ pub async fn execute_migrations(
     in_flight: Vec<InFlightMigration>,
     config: &Config,
     db: &Database,
+    migration_locks: &MigrationLocks,
 ) -> Result<usize, Report> {
     let pending = remove_in_flight(&in_flight, pending);
     debug!(count = pending.len(), "Executing pending migrations");
@@ -126,7 +133,7 @@ pub async fn execute_migrations(
     let mut total_errors = 0;
 
     let mut execute = async |in_flight: InFlightMigration| {
-        let res = execute_migration(in_flight, &upstream_to_client, db)
+        let res = execute_migration(in_flight, &upstream_to_client, db, migration_locks)
             .await
             .context("failed to execute a pending migration")
             .into_report();
@@ -209,6 +216,7 @@ async fn execute_migration(
     action: InFlightMigration,
     upstream_to_client: &HashMap<UpstreamId, S3Client>,
     db: &Database,
+    migration_locks: &MigrationLocks,
 ) -> Result<PendingMigration, Report> {
     let InFlightMigration {
         pending:
@@ -219,17 +227,6 @@ async fn execute_migration(
             },
         state,
     } = &action;
-
-    debug!(from = ?source, to = ?target, %object, ?state, "Executing pending migration");
-
-    if source == target {
-        return Err(report!("Tried to migrate object to the same upstream")
-            .attach(format!("object: {object}"))
-            .attach(format!("source: {source}"))
-            .attach(format!("target: {target}"))
-            .attach(format!("state: {state}")));
-    }
-
     let source_client = upstream_to_client
         .get(source)
         .context("unknown upstream")
@@ -240,6 +237,20 @@ async fn execute_migration(
         .context("unknown upstream")
         .attach(format!("target upstream: {target}"))
         .attach(format!("object: {object}"))?;
+
+    debug!(from = ?source, to = ?target, %object, ?state, "Executing pending migration");
+    let _migration_guard = migration_locks.lock_migration(object).await;
+
+    if source == target {
+        return Err(report!("Tried to migrate object to the same upstream")
+            .attach(format!("object: {object}"))
+            .attach(format!("source: {source}"))
+            .attach(format!("target: {target}"))
+            .attach(format!("state: {state}")));
+    }
+    if !db.has_object(object).await? {
+        return cleanup_deleted_object(db, target_client, action).await;
+    }
 
     let action = match state {
         MigrationState::CopiedToTarget => action,
@@ -348,12 +359,7 @@ async fn delete_object(
         "Deleted object"
     );
 
-    db.delete_in_flight(&pending.source_upstream, &pending.object)
-        .await
-        .context("failed to delete pending migration from database")
-        .attach(format!("object: {}", &pending.object))
-        .attach(format!("source: {}", &pending.source_upstream))
-        .attach(format!("target: {}", &pending.target_upstream))?;
+    delete_in_flight(db, pending).await?;
     debug!(
         source = ?pending.source_upstream,
         target = ?pending.target_upstream,
@@ -362,6 +368,38 @@ async fn delete_object(
     );
 
     Ok(action.pending)
+}
+
+async fn cleanup_deleted_object(
+    db: &Database,
+    target_client: &S3Client,
+    action: InFlightMigration,
+) -> Result<PendingMigration, Report> {
+    let pending = &action.pending;
+    info!(state = %action.state, object = %pending.object, "Cleaning up migration for deleted object");
+
+    if matches!(action.state, MigrationState::CopiedToTarget) {
+        target_client
+            .delete_file(&pending.object)
+            .await
+            .context("failed to delete object from target upstream")
+            .attach(format!("old upstream: {}", &pending.source_upstream))
+            .attach(format!("new upstream: {}", &pending.target_upstream))
+            .attach(format!("object: {}", &pending.object))?;
+    }
+
+    delete_in_flight(db, pending).await?;
+    Ok(action.pending)
+}
+
+async fn delete_in_flight(db: &Database, pending: &PendingMigration) -> Result<(), Report> {
+    db.delete_in_flight(&pending.source_upstream, &pending.object)
+        .await
+        .context("failed to delete pending migration from database")
+        .attach(format!("object: {}", &pending.object))
+        .attach(format!("source: {}", &pending.source_upstream))
+        .attach(format!("target: {}", &pending.target_upstream))
+        .map_err(Report::into_dynamic)
 }
 
 async fn update_in_flight(db: &Database, migration: &InFlightMigration) -> Result<(), Report> {
