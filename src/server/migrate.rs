@@ -1,12 +1,9 @@
-use super::metrics::{
-    COUNTER_MIGRATED_OBJECTS_TOTAL, COUNTER_MIGRATION_RUNS_TOTAL, GAUGE_PENDING_ACTIONS,
-};
+use super::metrics::{MigrationMetrics, MigrationMetricsSnapshot};
 use crate::config::Config;
 use crate::data::{InFlightMigration, MigrationState, PendingMigration, UpstreamId};
 use crate::db::Database;
 use crate::s3::client::S3Client;
 use crate::server::state::MigrationLocks;
-use axum_prometheus::metrics::{counter, gauge};
 use jiff::Zoned;
 use rand::prelude::SliceRandom;
 use rootcause::option_ext::OptionExt;
@@ -20,8 +17,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
 const SAMPLE_ERRORS: usize = 50;
-const METRICS_STATE_PENDING: &str = "Pending";
-const METRICS_STATE_COMPLETED: &str = "Completed";
 
 pub async fn migration_task(
     config: Config,
@@ -46,14 +41,13 @@ pub async fn migration_task(
                 error!(%error, "Failed to get in-flight migrations");
                 Vec::new()
             });
-            metrics_start_run(&config, &pending, &in_flight);
             match execute_migrations(pending, in_flight, &config, &db, &migration_locks).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
                 Ok(0) => {}
                 Ok(errors) => error!(error_count = errors, "Failed to perform migrations",),
             }
 
-            counter!(COUNTER_MIGRATION_RUNS_TOTAL).increment(1);
+            MigrationMetrics::record_run();
 
             if let Err(e) = db.cleanup_old_access_times(&Zoned::now()).await {
                 error!(%e, "Failed to clean up old access times");
@@ -119,6 +113,7 @@ pub async fn execute_migrations(
     migration_locks: &MigrationLocks,
 ) -> Result<usize, Report> {
     let pending = remove_in_flight(&in_flight, pending);
+    let mut metrics = MigrationMetrics::snapshot(config, &pending, &in_flight);
     debug!(count = pending.len(), "Executing pending migrations");
 
     let client = reqwest::Client::new();
@@ -133,27 +128,32 @@ pub async fn execute_migrations(
     let mut total_errors = 0;
 
     let mut execute = async |in_flight: InFlightMigration| {
-        let res = execute_migration(in_flight, &upstream_to_client, db, migration_locks)
-            .await
-            .context("failed to execute a pending migration")
-            .into_report();
+        let pending = in_flight.pending.clone();
+        let res = execute_migration(
+            in_flight,
+            &mut metrics,
+            &upstream_to_client,
+            db,
+            migration_locks,
+        )
+        .await
+        .context("failed to execute a pending migration")
+        .into_report();
         let sample_selected = rand::random_range(0..100) == 1;
         match res {
             Err(e) if errors_printed < SAMPLE_ERRORS && sample_selected => {
+                metrics.failed(&pending);
                 error!(%e, "Failed to execute pending migration");
                 errors_printed += 1;
                 total_errors += 1;
             }
             Err(e) => {
+                metrics.failed(&pending);
                 debug!(%e, "Failed to execute pending migration");
                 errors.push(e.into_dynamic());
                 total_errors += 1;
             }
-            Ok(migration) => metrics_change_state(
-                &migration,
-                MigrationState::CopiedToTarget.to_string(),
-                METRICS_STATE_COMPLETED.to_string(),
-            ),
+            Ok(_) => {}
         }
     };
 
@@ -165,20 +165,10 @@ pub async fn execute_migrations(
             state = %action.state,
             "Retrying in-flight migration"
         );
-        metrics_change_state(
-            &action.pending,
-            action.state.to_string(),
-            MigrationState::Started.to_string(),
-        );
         execute(action).await;
     }
 
     for action in pending {
-        metrics_change_state(
-            &action,
-            METRICS_STATE_PENDING.to_string(),
-            MigrationState::Started.to_string(),
-        );
         execute(InFlightMigration {
             pending: action,
             state: MigrationState::Started,
@@ -214,6 +204,7 @@ fn remove_in_flight(
 
 async fn execute_migration(
     action: InFlightMigration,
+    metrics: &mut MigrationMetricsSnapshot,
     upstream_to_client: &HashMap<UpstreamId, S3Client>,
     db: &Database,
     migration_locks: &MigrationLocks,
@@ -249,16 +240,18 @@ async fn execute_migration(
             .attach(format!("state: {state}")));
     }
     if !db.has_object(object).await? {
-        return cleanup_deleted_object(db, target_client, action).await;
+        return cleanup_deleted_object(db, target_client, action, metrics).await;
     }
 
     let action = match state {
         MigrationState::CopiedToTarget => action,
-        MigrationState::Started => upload_object(db, source_client, target_client, action).await?,
+        MigrationState::Started => {
+            upload_object(db, source_client, target_client, action, metrics).await?
+        }
     };
-    let action = delete_object(db, source_client, action).await?;
+    let action = delete_object(db, source_client, action, metrics).await?;
 
-    counter!(COUNTER_MIGRATED_OBJECTS_TOTAL).increment(1);
+    MigrationMetrics::record_migrated_object();
     debug!(
         from = ?action.source_upstream,
         to = ?action.target_upstream,
@@ -274,6 +267,7 @@ async fn upload_object(
     source_client: &S3Client,
     target_client: &S3Client,
     migration: InFlightMigration,
+    metrics: &mut MigrationMetricsSnapshot,
 ) -> Result<InFlightMigration, Report> {
     let source = &migration.pending.source_upstream;
     let target = &migration.pending.target_upstream;
@@ -291,6 +285,7 @@ async fn upload_object(
     // crash. In that case we have two copies, one of them untracked on the target. This is not
     // ideal, so we just redo the migration instead.
     update_in_flight(db, &migration).await?;
+    metrics.started(&migration.pending);
 
     target_client
         .put_file(object, data, size.unwrap_or(0))
@@ -322,11 +317,7 @@ async fn upload_object(
         object = %migration.pending.object,
         "Updated database after upload"
     );
-    metrics_change_state(
-        &migration.pending,
-        MigrationState::Started.to_string(),
-        migration.state.to_string(),
-    );
+    metrics.copied_to_target(&migration.pending);
 
     Ok(migration)
 }
@@ -335,6 +326,7 @@ async fn delete_object(
     db: &Database,
     source_client: &S3Client,
     action: InFlightMigration,
+    metrics: &mut MigrationMetricsSnapshot,
 ) -> Result<PendingMigration, Report> {
     let pending = &action.pending;
     debug!(
@@ -360,6 +352,7 @@ async fn delete_object(
     );
 
     delete_in_flight(db, pending).await?;
+    metrics.completed(pending);
     debug!(
         source = ?pending.source_upstream,
         target = ?pending.target_upstream,
@@ -374,6 +367,7 @@ async fn cleanup_deleted_object(
     db: &Database,
     target_client: &S3Client,
     action: InFlightMigration,
+    metrics: &mut MigrationMetricsSnapshot,
 ) -> Result<PendingMigration, Report> {
     let pending = &action.pending;
     info!(state = %action.state, object = %pending.object, "Cleaning up migration for deleted object");
@@ -389,6 +383,7 @@ async fn cleanup_deleted_object(
     }
 
     delete_in_flight(db, pending).await?;
+    metrics.completed(pending);
     Ok(action.pending)
 }
 
@@ -411,67 +406,4 @@ async fn update_in_flight(db: &Database, migration: &InFlightMigration) -> Resul
         .attach(format!("old upstream: {}", pending.source_upstream))
         .attach(format!("new state: {}", migration.state))
         .map_err(Report::into_dynamic)
-}
-
-fn metrics_start_run(
-    config: &Config,
-    pending: &[PendingMigration],
-    in_flight: &[InFlightMigration],
-) {
-    metrics_reset(config);
-    for migration in in_flight {
-        gauge!(GAUGE_PENDING_ACTIONS,
-            "source" => migration.pending.source_upstream.0.clone(),
-            "target" => migration.pending.target_upstream.0.clone(),
-            "state" => migration.state.to_string()
-        )
-        .increment(1);
-    }
-    for migration in pending {
-        gauge!(GAUGE_PENDING_ACTIONS,
-            "source" => migration.source_upstream.0.clone(),
-            "target" => migration.target_upstream.0.clone(),
-            "state" => METRICS_STATE_PENDING
-        )
-        .increment(1);
-    }
-}
-
-fn metrics_reset(config: &Config) {
-    let states = [
-        METRICS_STATE_PENDING.to_string(),
-        METRICS_STATE_COMPLETED.to_string(),
-        MigrationState::CopiedToTarget.to_string(),
-        MigrationState::Started.to_string(),
-    ];
-    for source in config.upstreams.keys() {
-        for target in config.upstreams.keys() {
-            if source == target {
-                continue;
-            }
-            for state in &states {
-                gauge!(GAUGE_PENDING_ACTIONS,
-                    "source" => source.0.clone(),
-                    "target" => target.0.clone(),
-                    "state" => state.clone()
-                )
-                .set(0.0);
-            }
-        }
-    }
-}
-
-fn metrics_change_state(pending: &PendingMigration, from: String, to: String) {
-    gauge!(GAUGE_PENDING_ACTIONS,
-        "source" => pending.source_upstream.0.clone(),
-        "target" => pending.target_upstream.0.clone(),
-        "state" => from
-    )
-    .decrement(1);
-    gauge!(GAUGE_PENDING_ACTIONS,
-        "source" => pending.source_upstream.0.clone(),
-        "target" => pending.target_upstream.0.clone(),
-        "state" => to.to_string()
-    )
-    .increment(1);
 }
