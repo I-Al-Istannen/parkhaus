@@ -96,9 +96,16 @@ pub async fn proxy_request(
         .wait_for_migration(req.method(), &object_id)
         .await;
 
+    // CopyObject is executed by the upstream holding the source, the destination follows it.
+    let copy_source = match op {
+        ObjectOp::Write => copy_source(req.headers())?,
+        _ => None,
+    };
+    let routing_id = copy_source.as_ref().unwrap_or(&object_id);
+
     let upstream = state
         .db
-        .get_upstream(&object_id)
+        .get_upstream(routing_id)
         .await
         .context("failed to get upstream for object")?
         .and_then(|it| {
@@ -110,13 +117,26 @@ pub async fn proxy_request(
             state.config.upstreams.get(&it)
         })
         // default to the coldest upstream
-        .unwrap_or_else(|| get_fallback_upstream(&object_id, &state.config, &req, op));
+        .unwrap_or_else(|| {
+            get_fallback_upstream(routing_id, &state.config, &req, op, copy_source.is_some())
+        });
+
+    let stale_upstream = match &copy_source {
+        Some(_) => state
+            .db
+            .get_upstream(&object_id)
+            .await
+            .context("failed to get upstream for copy destination")?
+            .filter(|it| *it != upstream.name),
+        None => None,
+    };
 
     let on_success = record_successful_request(
         op,
         object_id.clone(),
         state.clone(),
         upstream.name.clone(),
+        stale_upstream,
         mutation_guard,
     );
     let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
@@ -129,9 +149,11 @@ fn get_fallback_upstream<'a>(
     config: &'a Config,
     request: &'_ Request,
     op: ObjectOp,
+    is_copy: bool,
 ) -> &'a Upstream {
     let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-    let fallback = if is_read && op != ObjectOp::MultipartStep {
+    let is_delete = request.method() == Method::DELETE;
+    let fallback = if (is_copy || is_read || is_delete) && op != ObjectOp::MultipartStep {
         config.coldest_upstream()
     } else {
         config.hottest_upstream()
@@ -222,6 +244,31 @@ async fn forward_request(
     Ok(out_response)
 }
 
+/// Parses `x-amz-copy-source` (`[/]bucket/key[?versionId=...]`, URL-encoded).
+fn copy_source(headers: &HeaderMap) -> Result<Option<S3ObjectId>, TierError> {
+    let Some(value) = headers.get("x-amz-copy-source") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .context("invalid x-amz-copy-source header")
+        .attach(StatusCode::BAD_REQUEST)?;
+    let value = value.split_once('?').map_or(value, |(path, _)| path);
+    let decoded = percent_decode_str(value.trim_start_matches('/'))
+        .decode_utf8()
+        .context("x-amz-copy-source is not valid UTF-8")
+        .attach(StatusCode::BAD_REQUEST)?;
+    let Some((bucket, key)) = decoded.split_once('/') else {
+        return Err(report!("x-amz-copy-source misses key: '{decoded}'")
+            .attach(StatusCode::BAD_REQUEST)
+            .into());
+    };
+    Ok(Some(S3ObjectId {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    }))
+}
+
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     // https://datatracker.ietf.org/doc/html/rfc2068#section-13.5.1
     //   - Connection
@@ -258,6 +305,7 @@ fn record_successful_request(
     obj_id: S3ObjectId,
     state: AppState,
     upstream_name: UpstreamId,
+    stale_upstream: Option<UpstreamId>,
     mutation_guard: MutationLockGuard,
 ) -> impl FnOnce() {
     move || {
@@ -284,6 +332,12 @@ fn record_successful_request(
                         .await
                         .context("failed to record creation")
                         .attach(format!("object: {obj_id_clone:?}"))?;
+                    if let Some(stale) = &stale_upstream {
+                        delete_from_upstream(&state, stale, &obj_id_clone)
+                            .await
+                            .context("failed to delete overwritten object")
+                            .attach(format!("object: {obj_id_clone:?}"))?;
+                    }
                 }
                 ObjectOp::Access => {
                     if !state
@@ -324,6 +378,22 @@ fn record_successful_request(
     }
 }
 
+async fn delete_from_upstream(
+    state: &AppState,
+    upstream_name: &UpstreamId,
+    obj_id: &S3ObjectId,
+) -> Result<(), Report> {
+    let upstream = state.config.upstreams.get(upstream_name).ok_or_else(|| {
+        report!("upstream not found in config").attach(format!("upstream: '{upstream_name:?}'"))
+    })?;
+    S3Client::for_upstream(state.http.clone(), upstream)
+        .delete_file(obj_id)
+        .await
+        .context("failed to DELETE file")
+        .attach(format!("upstream: '{upstream_name:?}'"))?;
+    Ok(())
+}
+
 async fn record_from_upstream(
     state: &AppState,
     upstream_name: &UpstreamId,
@@ -353,8 +423,33 @@ async fn record_from_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectOp, connection_header_names, is_hop_by_hop_header};
+    use super::{ObjectOp, connection_header_names, copy_source, is_hop_by_hop_header};
+    use crate::data::S3ObjectId;
     use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+
+    #[test]
+    fn parses_copy_source() {
+        let parse = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-copy-source", HeaderValue::from_str(value).unwrap());
+            copy_source(&headers).ok().flatten()
+        };
+        let id = |bucket: &str, key: &str| {
+            Some(S3ObjectId {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })
+        };
+
+        assert_eq!(parse("bucket/a/b"), id("bucket", "a/b"));
+        assert_eq!(parse("/bucket/a/b"), id("bucket", "a/b"));
+        assert_eq!(
+            parse("bucket/k%C3%A4y%20%3F?versionId=1"),
+            id("bucket", "käy ?")
+        );
+        assert_eq!(parse("bucket"), None);
+        assert_eq!(copy_source(&HeaderMap::new()).ok().flatten(), None);
+    }
 
     #[test]
     fn classifies_object_operations() {
