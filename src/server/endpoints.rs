@@ -14,16 +14,46 @@ use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
-use futures_util::TryStreamExt;
 use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
+use url::form_urlencoded;
 
-const fn nop(_size: u64) {}
+const fn nop() {}
+
+/// How a successful request affects the tracked state of an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectOp {
+    /// The object was created or replaced, its metadata must be fetched from the upstream.
+    Write,
+    Delete,
+    Access,
+    /// Multipart upload bookkeeping that does not (yet) change the object.
+    MultipartStep,
+}
+
+impl ObjectOp {
+    fn classify(method: &Method, query: Option<&str>) -> Self {
+        let has_param = |name: &str| {
+            query.is_some_and(|q| form_urlencoded::parse(q.as_bytes()).any(|(k, _)| k == name))
+        };
+        let upload_id = has_param("uploadId");
+
+        match *method {
+            Method::PUT if upload_id => Self::MultipartStep,
+            Method::PUT => Self::Write,
+            // CompleteMultipartUpload
+            Method::POST if upload_id => Self::Write,
+            Method::POST if has_param("uploads") => Self::MultipartStep,
+            Method::DELETE if upload_id => Self::MultipartStep,
+            Method::DELETE => Self::Delete,
+            Method::GET if upload_id => Self::MultipartStep,
+            _ => Self::Access,
+        }
+    }
+}
 
 pub async fn proxy_request(
     State(state): State<AppState>,
@@ -54,6 +84,7 @@ pub async fn proxy_request(
         bucket: bucket.to_string(),
         key: key.to_string(),
     };
+    let op = ObjectOp::classify(req.method(), req.uri().query());
     let mutation_guard = state
         .migration_locks
         .wait_for_migration(req.method(), &object_id)
@@ -73,10 +104,10 @@ pub async fn proxy_request(
             state.config.upstreams.get(&it)
         })
         // default to the coldest upstream
-        .unwrap_or_else(|| get_fallback_upstream(&object_id, &state.config, &req));
+        .unwrap_or_else(|| get_fallback_upstream(&object_id, &state.config, &req, op));
 
     let on_success = record_successful_request(
-        req.method().clone(),
+        op,
         object_id.clone(),
         state.clone(),
         upstream.name.clone(),
@@ -91,22 +122,24 @@ fn get_fallback_upstream<'a>(
     object_id: &'_ S3ObjectId,
     config: &'a Config,
     request: &'_ Request,
+    op: ObjectOp,
 ) -> &'a Upstream {
-    let coldest = if is_creation(request.method()) {
-        config.hottest_upstream()
-    } else {
+    let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
+    let fallback = if is_read && op != ObjectOp::MultipartStep {
         config.coldest_upstream()
+    } else {
+        config.hottest_upstream()
     };
 
     counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => request.method().to_string())
         .increment(1);
     debug!(
         ?object_id,
-        %coldest.name,
+        %fallback.name,
         "object not found in database, defaulting upstream"
     );
 
-    coldest
+    fallback
 }
 
 async fn forward_request(
@@ -114,7 +147,7 @@ async fn forward_request(
     upstream: &Upstream,
     target: ForwardObjectUrl,
     in_req: Request,
-    on_success: impl FnOnce(u64),
+    on_success: impl FnOnce(),
 ) -> Result<Response, TierError> {
     let mut out_req = state
         .http
@@ -133,14 +166,9 @@ async fn forward_request(
         out_req = out_req.header(name, val);
     }
 
-    let request_size = Arc::new(AtomicU64::new(0));
-    let streamed_request_size = Arc::clone(&request_size);
-    let request_body = in_req.into_body().into_data_stream().map_ok(move |chunk| {
-        streamed_request_size.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        chunk
-    });
-
-    out_req = out_req.body(reqwest::Body::wrap_stream(request_body));
+    out_req = out_req.body(reqwest::Body::wrap_stream(
+        in_req.into_body().into_data_stream(),
+    ));
 
     debug!(
         upstream = %upstream.name,
@@ -182,7 +210,7 @@ async fn forward_request(
     }
 
     if in_resp_status.is_success() {
-        on_success(request_size.load(Ordering::Relaxed));
+        on_success();
     }
 
     Ok(out_response)
@@ -220,59 +248,57 @@ fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
 }
 
 fn record_successful_request(
-    req_method: Method,
+    op: ObjectOp,
     obj_id: S3ObjectId,
     state: AppState,
     upstream_name: UpstreamId,
     mutation_guard: MutationLockGuard,
-) -> impl FnOnce(u64) {
-    move |size| {
+) -> impl FnOnce() {
+    move || {
         let obj_id_clone = obj_id.clone();
         let recording = async move {
             let _mutation_guard = mutation_guard;
-            if is_delete(&req_method) {
-                counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                    .increment(1);
-                state
-                    .db
-                    .delete_object(&obj_id_clone)
-                    .await
-                    .context("failed to record deletion")
-                    .attach(format!("object: {obj_id_clone:?}"))?;
-                return Ok::<_, Report>(());
-            }
-
-            let now = jiff::Zoned::now();
-
-            if is_creation(&req_method) {
-                counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                    .increment(1);
-                state
-                    .db
-                    .record_creation(&S3Object {
-                        id: obj_id_clone.clone(),
-                        assigned_upstream: upstream_name.clone(),
-                        last_modified: now.timestamp(),
-                        size,
-                    })
-                    .await
-                    .context("failed to record creation")
-                    .attach(format!("object: {obj_id_clone:?}"))?;
-            } else if !state
-                .db
-                .has_object(&obj_id_clone)
-                .await
-                .context("failed to check object existence")?
-            {
-                import_on_the_fly(&state, &upstream_name, &obj_id_clone)
-                    .await
-                    .context("failed to import object on the fly")
-                    .attach(format!("object: {obj_id_clone:?}"))?;
+            match op {
+                ObjectOp::MultipartStep => return Ok::<_, Report>(()),
+                ObjectOp::Delete => {
+                    counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                        .increment(1);
+                    state
+                        .db
+                        .delete_object(&obj_id_clone)
+                        .await
+                        .context("failed to record deletion")
+                        .attach(format!("object: {obj_id_clone:?}"))?;
+                    return Ok(());
+                }
+                ObjectOp::Write => {
+                    counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                        .increment(1);
+                    record_from_upstream(&state, &upstream_name, &obj_id_clone)
+                        .await
+                        .context("failed to record creation")
+                        .attach(format!("object: {obj_id_clone:?}"))?;
+                }
+                ObjectOp::Access => {
+                    if !state
+                        .db
+                        .has_object(&obj_id_clone)
+                        .await
+                        .context("failed to check object existence")?
+                    {
+                        record_from_upstream(&state, &upstream_name, &obj_id_clone)
+                            .await
+                            .context("failed to import object on the fly")
+                            .attach(format!("object: {obj_id_clone:?}"))?;
+                        counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
+                            .increment(1);
+                    }
+                }
             }
 
             state
                 .db
-                .record_access(&obj_id_clone, &now)
+                .record_access(&obj_id_clone, &jiff::Zoned::now())
                 .await
                 .context("failed to record access")
                 .attach(format!("object: {obj_id_clone:?}"))?;
@@ -292,49 +318,74 @@ fn record_successful_request(
     }
 }
 
-async fn import_on_the_fly(
+async fn record_from_upstream(
     state: &AppState,
     upstream_name: &UpstreamId,
-    obj_id_clone: &S3ObjectId,
+    obj_id: &S3ObjectId,
 ) -> Result<(), Report> {
     let upstream = state.config.upstreams.get(upstream_name).ok_or_else(|| {
         report!("upstream not found in config").attach(format!("upstream: '{upstream_name:?}'"))
     })?;
-    let s3_client = S3Client::for_upstream(state.http.clone(), upstream);
-    let metadata = s3_client
-        .head_file(obj_id_clone)
+    let metadata = S3Client::for_upstream(state.http.clone(), upstream)
+        .head_file(obj_id)
         .await
         .context("failed to HEAD file")
-        .attach(format!("object: {obj_id_clone:?}"))?;
+        .attach(format!("object: {obj_id:?}"))?;
     state
         .db
         .record_creation(&S3Object {
-            id: obj_id_clone.clone(),
+            id: obj_id.clone(),
             assigned_upstream: upstream_name.clone(),
             last_modified: metadata.last_modified,
             size: metadata.size,
         })
         .await
-        .context("failed to record creation of previously unknown object")?;
-
-    counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
-        .increment(1);
+        .context("failed to record object")?;
 
     Ok(())
 }
 
-fn is_creation(method: &Method) -> bool {
-    method == Method::PUT
-}
-
-fn is_delete(method: &Method) -> bool {
-    method == Method::DELETE
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{connection_header_names, is_hop_by_hop_header};
-    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use super::{ObjectOp, connection_header_names, is_hop_by_hop_header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+
+    #[test]
+    fn classifies_object_operations() {
+        let cases = [
+            (Method::PUT, None, ObjectOp::Write),
+            (Method::PUT, Some("tagging"), ObjectOp::Write),
+            (
+                Method::PUT,
+                Some("partNumber=1&uploadId=abc"),
+                ObjectOp::MultipartStep,
+            ),
+            (Method::POST, Some("uploads"), ObjectOp::MultipartStep),
+            (Method::POST, Some("uploads="), ObjectOp::MultipartStep),
+            (Method::POST, Some("uploadId=abc"), ObjectOp::Write),
+            (Method::DELETE, None, ObjectOp::Delete),
+            (
+                Method::DELETE,
+                Some("uploadId=abc"),
+                ObjectOp::MultipartStep,
+            ),
+            (Method::GET, None, ObjectOp::Access),
+            (
+                Method::GET,
+                Some("uploadId=abc&max-parts=10"),
+                ObjectOp::MultipartStep,
+            ),
+            (Method::GET, Some("x-id=uploadIdent"), ObjectOp::Access),
+            (Method::HEAD, None, ObjectOp::Access),
+        ];
+        for (method, query, expected) in cases {
+            assert_eq!(
+                ObjectOp::classify(&method, query),
+                expected,
+                "{method} ?{query:?}"
+            );
+        }
+    }
 
     #[test]
     fn strips_headers_named_by_connection() {

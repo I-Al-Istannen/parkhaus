@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        command: ["tiering True", "tiering False", "access-log", "crud"]
+        command: ["tiering True", "tiering False", "access-log", "crud", "multipart"]
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5

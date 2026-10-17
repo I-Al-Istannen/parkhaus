@@ -14,6 +14,7 @@ import argparse
 from e2e_access_log import main as run_access_log
 from e2e_tiering import main as run_tiering
 from e2e_crud import main as run_crud
+from e2e_multipart import main as run_multipart
 from e2e_utils import info
 
 
@@ -43,6 +44,10 @@ def main() -> None:
         "crud",
         help="Run crud e2e scenario",
     )
+    subparsers.add_parser(
+        "multipart",
+        help="Run multipart upload e2e scenario",
+    )
 
     args = parser.parse_args()
     if args.command == "tiering":
@@ -58,6 +63,11 @@ def main() -> None:
     if args.command == "crud":
         info("Running crud scenario")
         run_crud()
+        return
+
+    if args.command == "multipart":
+        info("Running multipart scenario")
+        run_multipart()
         return
 
     parser.error(f"Unknown command: {args.command}")
