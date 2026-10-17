@@ -69,6 +69,15 @@ pub async fn proxy_request(
         .attach(StatusCode::BAD_REQUEST)?;
 
     if path.chars().filter(|&it| it == '/').count() == 1 {
+        // CreateBucket/DeleteBucket would need to be coordinated across all upstreams
+        if req.uri().query().is_none_or(str::is_empty)
+            && matches!(*req.method(), Method::PUT | Method::DELETE)
+        {
+            return Err(report!("creating and deleting buckets is not supported")
+                .attach(StatusCode::NOT_IMPLEMENTED)
+                .into());
+        }
+
         // bucket-specific operation, nothing for us to track
         let upstream = state.config.hottest_upstream();
         let bucket = path.trim_start_matches('/');
