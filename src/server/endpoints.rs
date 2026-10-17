@@ -10,8 +10,10 @@ use crate::server::metrics::{
     COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
 use crate::server::state::{AppState, MutationLockGuard};
+use crate::server::unsupported;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
+use axum::http::Uri;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
@@ -27,7 +29,7 @@ const fn nop() {}
 
 /// How a successful request affects the tracked state of an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectOp {
+pub(super) enum ObjectOp {
     /// The object was created or replaced, its metadata must be fetched from the upstream.
     Write,
     Delete,
@@ -37,7 +39,7 @@ enum ObjectOp {
 }
 
 impl ObjectOp {
-    fn classify(method: &Method, query: Option<&str>) -> Self {
+    pub(super) fn classify(method: &Method, query: Option<&str>) -> Self {
         let has_param = |name: &str| {
             query.is_some_and(|q| form_urlencoded::parse(q.as_bytes()).any(|(k, _)| k == name))
         };
@@ -57,6 +59,29 @@ impl ObjectOp {
     }
 }
 
+/// What a request addresses, parsed from its percent-decoded path.
+pub(super) enum Target {
+    Bucket(String),
+    Object(S3ObjectId),
+}
+
+impl Target {
+    fn parse(uri: &Uri) -> Result<Self, TierError> {
+        let path = percent_decode_str(uri.path())
+            .decode_utf8()
+            .context("request path is not valid UTF-8")
+            .attach(StatusCode::BAD_REQUEST)?;
+        let path = path.trim_start_matches('/');
+        Ok(match path.split_once('/') {
+            None => Self::Bucket(path.to_string()),
+            Some((bucket, key)) => Self::Object(S3ObjectId {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            }),
+        })
+    }
+}
+
 pub async fn proxy_request(
     State(state): State<AppState>,
     OriginalUri(original_uri): OriginalUri,
@@ -64,50 +89,31 @@ pub async fn proxy_request(
 ) -> Result<Response, TierError> {
     debug!(%original_uri, method=%req.method(), "received request for URL");
 
-    let path = percent_decode_str(original_uri.path())
-        .decode_utf8()
-        .context("request path is not valid UTF-8")
-        .attach(StatusCode::BAD_REQUEST)?;
+    let target = Target::parse(&original_uri)?;
+    let req = unsupported::reject_unsupported(&state, &target, req).await?;
 
-    if path.chars().filter(|&it| it == '/').count() == 1 {
-        // CreateBucket/DeleteBucket would need to be coordinated across all upstreams
-        if req.uri().query().is_none_or(str::is_empty)
-            && matches!(*req.method(), Method::PUT | Method::DELETE)
-        {
-            return Err(report!("creating and deleting buckets is not supported")
-                .attach(StatusCode::NOT_IMPLEMENTED)
-                .into());
+    match target {
+        Target::Bucket(bucket) => {
+            if is_post_object(&req) {
+                let (object_id, req) = read_post_object_key(&bucket, req).await?;
+                return proxy_object_request(state, object_id, ObjectOp::Write, req, None).await;
+            }
+
+            // bucket-specific operation, nothing for us to track
+            let upstream = state.config.hottest_upstream();
+            debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
+
+            let mut upstream_url = upstream.format_url(&bucket, None)?;
+            upstream_url.url.set_query(req.uri().query());
+            forward_request(&state, upstream, upstream_url, req, nop).await
         }
-
-        let bucket = path.trim_start_matches('/');
-        if is_post_object(&req) {
-            let (object_id, req) = read_post_object_key(bucket, req).await?;
-            return proxy_object_request(state, object_id, ObjectOp::Write, req, None).await;
+        Target::Object(object_id) => {
+            debug!(%original_uri, method=%req.method(), "handling request for URL");
+            let op = ObjectOp::classify(req.method(), req.uri().query());
+            let url_key = object_id.key.clone();
+            proxy_object_request(state, object_id, op, req, Some(&url_key)).await
         }
-
-        // bucket-specific operation, nothing for us to track
-        let upstream = state.config.hottest_upstream();
-        debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
-
-        let mut upstream_url = upstream.format_url(bucket, None)?;
-        upstream_url.url.set_query(req.uri().query());
-        return forward_request(&state, upstream, upstream_url, req, nop).await;
     }
-
-    debug!(foo=%original_uri, method=%req.method(), "handling request for URL");
-    let Some((bucket, key)) = path.trim_start_matches('/').split_once('/') else {
-        return Err(report!("url misses bucket: '{original_uri}'")
-            .attach(StatusCode::BAD_REQUEST)
-            .into());
-    };
-
-    let object_id = S3ObjectId {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-    };
-    let op = ObjectOp::classify(req.method(), req.uri().query());
-    let url_key = object_id.key.clone();
-    proxy_object_request(state, object_id, op, req, Some(&url_key)).await
 }
 
 /// Proxies a request affecting a single object. `url_key` is the key in the forwarded URL, which
@@ -126,7 +132,7 @@ async fn proxy_object_request(
 
     // CopyObject is executed by the upstream holding the source, the destination follows it.
     let copy_source = match op {
-        ObjectOp::Write => copy_source(req.headers())?,
+        ObjectOp::Write => parse_copy_source(req.headers())?,
         _ => None,
     };
     let routing_id = copy_source.as_ref().unwrap_or(&object_id);
@@ -273,7 +279,7 @@ async fn forward_request(
 }
 
 /// Parses `x-amz-copy-source` (`[/]bucket/key[?versionId=...]`, URL-encoded).
-fn copy_source(headers: &HeaderMap) -> Result<Option<S3ObjectId>, TierError> {
+pub(super) fn parse_copy_source(headers: &HeaderMap) -> Result<Option<S3ObjectId>, TierError> {
     let Some(value) = headers.get("x-amz-copy-source") else {
         return Ok(None);
     };
@@ -451,7 +457,7 @@ async fn record_from_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectOp, connection_header_names, copy_source, is_hop_by_hop_header};
+    use super::{ObjectOp, connection_header_names, is_hop_by_hop_header, parse_copy_source};
     use crate::data::S3ObjectId;
     use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
@@ -460,7 +466,7 @@ mod tests {
         let parse = |value: &str| {
             let mut headers = HeaderMap::new();
             headers.insert("x-amz-copy-source", HeaderValue::from_str(value).unwrap());
-            copy_source(&headers).ok().flatten()
+            parse_copy_source(&headers).ok().flatten()
         };
         let id = |bucket: &str, key: &str| {
             Some(S3ObjectId {
@@ -476,7 +482,7 @@ mod tests {
             id("bucket", "käy ?")
         );
         assert_eq!(parse("bucket"), None);
-        assert_eq!(copy_source(&HeaderMap::new()).ok().flatten(), None);
+        assert_eq!(parse_copy_source(&HeaderMap::new()).ok().flatten(), None);
     }
 
     #[test]
