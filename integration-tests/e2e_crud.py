@@ -85,8 +85,8 @@ def _run_hypothesis_crud_checks(backend: Backend) -> None:
 
         def _assert_live_object(self, key: str) -> None:
             expected_content = self.live_objects[key]
-            _assert_get_matches(backend, key=key, expected_content=expected_content)
             _assert_recorded_size(backend, key=key, expected_size=len(expected_content))
+            _assert_get_matches(backend, key=key, expected_content=expected_content)
 
         @rule(
             is_large=st.booleans(),
@@ -156,6 +156,7 @@ def _run_hypothesis_crud_checks(backend: Backend) -> None:
 
             self.live_objects.pop(key)
             self.deleted_objects.add(key)
+            assert (BUCKET_NAME, key) not in backend.object_sizes(), f"DB row survived deletion of {key}"
             _assert_missing_key(backend, key=key)
 
         @rule(data=st.data())

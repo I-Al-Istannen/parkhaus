@@ -25,8 +25,6 @@ use std::collections::HashSet;
 use tracing::{debug, warn};
 use url::form_urlencoded;
 
-const fn nop() {}
-
 /// How a successful request affects the tracked state of an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectOp {
@@ -105,7 +103,7 @@ pub async fn proxy_request(
 
             let mut upstream_url = upstream.format_url(&bucket, None)?;
             upstream_url.url.set_query(req.uri().query());
-            forward_request(&state, upstream, upstream_url, req, nop).await
+            forward_request(&state, upstream, upstream_url, req, async {}).await
         }
         Target::Object(object_id) => {
             debug!(%original_uri, method=%req.method(), "handling request for URL");
@@ -209,7 +207,7 @@ async fn forward_request(
     upstream: &Upstream,
     target: ForwardObjectUrl,
     in_req: Request,
-    on_success: impl FnOnce(),
+    on_success: impl Future<Output = ()>,
 ) -> Result<Response, TierError> {
     let mut out_req = state
         .http
@@ -272,7 +270,7 @@ async fn forward_request(
     }
 
     if in_resp_status.is_success() {
-        on_success();
+        on_success.await;
     }
 
     Ok(out_response)
@@ -334,82 +332,86 @@ fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
         .collect()
 }
 
-fn record_successful_request(
+async fn record_successful_request(
     op: ObjectOp,
     obj_id: S3ObjectId,
     state: AppState,
     upstream_name: UpstreamId,
     stale_upstream: Option<UpstreamId>,
     mutation_guard: MutationLockGuard,
-) -> impl FnOnce() {
-    move || {
-        let obj_id_clone = obj_id.clone();
-        let recording = async move {
-            let _mutation_guard = mutation_guard;
-            match op {
-                ObjectOp::MultipartStep => return Ok::<_, Report>(()),
-                ObjectOp::Delete => {
-                    counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                        .increment(1);
-                    state
-                        .db
-                        .delete_object(&obj_id_clone)
-                        .await
-                        .context("failed to record deletion")
-                        .attach(format!("object: {obj_id_clone:?}"))?;
-                    return Ok(());
-                }
-                ObjectOp::Write => {
-                    counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                        .increment(1);
-                    record_from_upstream(&state, &upstream_name, &obj_id_clone)
-                        .await
-                        .context("failed to record creation")
-                        .attach(format!("object: {obj_id_clone:?}"))?;
-                    if let Some(stale) = &stale_upstream {
-                        delete_from_upstream(&state, stale, &obj_id_clone)
-                            .await
-                            .context("failed to delete overwritten object")
-                            .attach(format!("object: {obj_id_clone:?}"))?;
-                    }
-                }
-                ObjectOp::Access => {
-                    if !state
-                        .db
-                        .has_object(&obj_id_clone)
-                        .await
-                        .context("failed to check object existence")?
-                    {
-                        record_from_upstream(&state, &upstream_name, &obj_id_clone)
-                            .await
-                            .context("failed to import object on the fly")
-                            .attach(format!("object: {obj_id_clone:?}"))?;
-                        counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
-                            .increment(1);
-                    }
-                }
-            }
+) {
+    let recording = async move {
+        let _mutation_guard = mutation_guard;
+        if let Err(e) = record(op, &obj_id, &state, &upstream_name, stale_upstream.as_ref()).await {
+            warn!(%e, object_id=?obj_id, "failed to record object creation/deletion");
+        }
+    };
+    // The client's next request must be routed according to its writes and deletes.
+    match op {
+        ObjectOp::Access => drop(tokio::spawn(recording)),
+        _ => recording.await,
+    }
+}
 
+async fn record(
+    op: ObjectOp,
+    obj_id: &S3ObjectId,
+    state: &AppState,
+    upstream_name: &UpstreamId,
+    stale_upstream: Option<&UpstreamId>,
+) -> Result<(), Report> {
+    match op {
+        ObjectOp::MultipartStep => return Ok(()),
+        ObjectOp::Delete => {
+            counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                .increment(1);
             state
                 .db
-                .record_access(&obj_id_clone, &jiff::Zoned::now())
+                .delete_object(obj_id)
                 .await
-                .context("failed to record access")
-                .attach(format!("object: {obj_id_clone:?}"))?;
-
-            Ok(())
-        };
-
-        tokio::spawn(async move {
-            if let Err(e) = recording.await {
-                warn!(
-                    %e,
-                    object_id=?obj_id,
-                    "failed to record object creation/deletion"
-                );
+                .context("failed to record deletion")
+                .attach(format!("object: {obj_id:?}"))?;
+            return Ok(());
+        }
+        ObjectOp::Write => {
+            counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
+                .increment(1);
+            record_from_upstream(state, upstream_name, obj_id)
+                .await
+                .context("failed to record creation")
+                .attach(format!("object: {obj_id:?}"))?;
+            if let Some(stale) = stale_upstream {
+                delete_from_upstream(state, stale, obj_id)
+                    .await
+                    .context("failed to delete overwritten object")
+                    .attach(format!("object: {obj_id:?}"))?;
             }
-        });
+        }
+        ObjectOp::Access => {
+            if !state
+                .db
+                .has_object(obj_id)
+                .await
+                .context("failed to check object existence")?
+            {
+                record_from_upstream(state, upstream_name, obj_id)
+                    .await
+                    .context("failed to import object on the fly")
+                    .attach(format!("object: {obj_id:?}"))?;
+                counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
+                    .increment(1);
+            }
+        }
     }
+
+    state
+        .db
+        .record_access(obj_id, &jiff::Zoned::now())
+        .await
+        .context("failed to record access")
+        .attach(format!("object: {obj_id:?}"))?;
+
+    Ok(())
 }
 
 async fn delete_from_upstream(
