@@ -14,6 +14,7 @@ use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
+use percent_encoding::percent_decode_str;
 use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
@@ -62,10 +63,15 @@ pub async fn proxy_request(
 ) -> Result<Response, TierError> {
     debug!(%original_uri, method=%req.method(), "received request for URL");
 
-    if req.uri().path().chars().filter(|&it| it == '/').count() == 1 {
+    let path = percent_decode_str(original_uri.path())
+        .decode_utf8()
+        .context("request path is not valid UTF-8")
+        .attach(StatusCode::BAD_REQUEST)?;
+
+    if path.chars().filter(|&it| it == '/').count() == 1 {
         // bucket-specific operation, nothing for us to track
         let upstream = state.config.hottest_upstream();
-        let bucket = req.uri().path().trim_start_matches('/');
+        let bucket = path.trim_start_matches('/');
         debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
 
         let mut upstream_url = upstream.format_url(bucket, None)?;
@@ -74,7 +80,7 @@ pub async fn proxy_request(
     }
 
     debug!(foo=%original_uri, method=%req.method(), "handling request for URL");
-    let Some((bucket, key)) = original_uri.path().trim_start_matches('/').split_once('/') else {
+    let Some((bucket, key)) = path.trim_start_matches('/').split_once('/') else {
         return Err(report!("url misses bucket: '{original_uri}'")
             .attach(StatusCode::BAD_REQUEST)
             .into());
