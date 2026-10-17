@@ -3,6 +3,7 @@ use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use crate::error::TierError;
 use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
+use crate::server::hacks::{is_post_object, read_post_object_key};
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
@@ -78,9 +79,14 @@ pub async fn proxy_request(
                 .into());
         }
 
+        let bucket = path.trim_start_matches('/');
+        if is_post_object(&req) {
+            let (object_id, req) = read_post_object_key(bucket, req).await?;
+            return proxy_object_request(state, object_id, ObjectOp::Write, req, None).await;
+        }
+
         // bucket-specific operation, nothing for us to track
         let upstream = state.config.hottest_upstream();
-        let bucket = path.trim_start_matches('/');
         debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
 
         let mut upstream_url = upstream.format_url(bucket, None)?;
@@ -100,6 +106,19 @@ pub async fn proxy_request(
         key: key.to_string(),
     };
     let op = ObjectOp::classify(req.method(), req.uri().query());
+    let url_key = object_id.key.clone();
+    proxy_object_request(state, object_id, op, req, Some(&url_key)).await
+}
+
+/// Proxies a request affecting a single object. `url_key` is the key in the forwarded URL, which
+/// is absent for PostObject.
+async fn proxy_object_request(
+    state: AppState,
+    object_id: S3ObjectId,
+    op: ObjectOp,
+    req: Request,
+    url_key: Option<&str>,
+) -> Result<Response, TierError> {
     let mutation_guard = state
         .migration_locks
         .wait_for_migration(req.method(), &object_id)
@@ -148,7 +167,7 @@ pub async fn proxy_request(
         stale_upstream,
         mutation_guard,
     );
-    let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
+    let mut target_url = upstream.format_url(&object_id.bucket, url_key)?;
     target_url.url.set_query(req.uri().query());
     forward_request(&state, upstream, target_url, req, on_success).await
 }
