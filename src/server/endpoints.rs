@@ -3,6 +3,7 @@ use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use crate::error::TierError;
 use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
+use crate::server::batch_delete::{is_delete_objects, proxy_delete_objects};
 use crate::server::hacks::{is_post_object, read_post_object_key};
 use crate::server::listing::{is_list_objects_v2, proxy_list_objects_v2};
 use crate::server::metrics::{
@@ -95,6 +96,9 @@ pub async fn proxy_request(
         Target::Bucket(bucket) => {
             if is_list_objects_v2(&req) {
                 return proxy_list_objects_v2(&state, &bucket, req).await;
+            }
+            if is_delete_objects(&req) {
+                return proxy_delete_objects(&state, &bucket, req).await;
             }
             if is_post_object(&req) {
                 let (object_id, req) = read_post_object_key(&bucket, req).await?;

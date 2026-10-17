@@ -466,7 +466,7 @@ async fn fetch_page(
     ))
 }
 
-fn query_param(req: &Request, name: &str) -> Option<String> {
+pub(super) fn query_param(req: &Request, name: &str) -> Option<String> {
     form_urlencoded::parse(req.uri().query()?.as_bytes())
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())

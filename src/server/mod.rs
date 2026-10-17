@@ -1,3 +1,4 @@
+mod batch_delete;
 pub(super) mod endpoints;
 mod hacks;
 pub mod listing;

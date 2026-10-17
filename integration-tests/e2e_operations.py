@@ -535,16 +535,100 @@ def check_delete_unindexed_cold_object(ctx: Ctx) -> None:
     ctx.assert_gone(key)
 
 
+def _delete_objects(client, keys: list[str], quiet: bool = False) -> dict[str, str]:
+    """Deletes `keys` in one batch, returning `Deleted` or the error code per key."""
+    res = client.delete_objects(
+        Bucket=BUCKET_NAME,
+        Delete={"Objects": [{"Key": k} for k in keys], "Quiet": quiet},
+    )
+    outcomes = {d["Key"]: "Deleted" for d in res.get("Deleted", [])}
+    for e in res.get("Errors", []):
+        assert e["Key"] not in outcomes, f"{e['Key']} both deleted and failed: {res}"
+        outcomes[e["Key"]] = e["Code"]
+    return outcomes
+
+
 def check_delete_objects(ctx: Ctx) -> None:
     hot, _ = ctx.put_hot("batch-delete")
     cold, _ = ctx.put_cold_indexed("batch-delete")
-    res = ctx.s3.delete_objects(
-        Bucket=BUCKET_NAME,
-        Delete={"Objects": [{"Key": hot}, {"Key": cold}]},
-    )
-    assert not res.get("Errors"), res["Errors"]
+    outcomes = _delete_objects(ctx.s3, [hot, cold])
+    assert outcomes == {hot: "Deleted", cold: "Deleted"}, outcomes
     ctx.assert_gone(hot)
     ctx.assert_gone(cold)
+
+
+def check_delete_objects_unindexed(ctx: Ctx) -> None:
+    unindexed, _ = ctx.put_cold_unindexed("batch-delete-unindexed")
+    hot, _ = ctx.put_hot("batch-delete-unindexed")
+    outcomes = _delete_objects(ctx.s3, [unindexed, hot])
+    assert outcomes == {unindexed: "Deleted", hot: "Deleted"}, outcomes
+    ctx.assert_gone(unindexed)
+    ctx.assert_gone(hot)
+
+
+def check_delete_objects_on_both_upstreams(ctx: Ctx) -> None:
+    key, body = ctx.put_hot("batch-delete-both")
+    ctx.cold.client.put_object(Bucket=BUCKET_NAME, Key=key, Body=body)
+    outcomes = _delete_objects(ctx.s3, [key])
+    assert outcomes == {key: "Deleted"}, outcomes
+    ctx.assert_gone(key)
+
+
+def check_delete_objects_missing_key(ctx: Ctx) -> None:
+    """Missing keys are reported like a single upstream reports them."""
+    existing, _ = ctx.put_hot("batch-delete-present")
+    missing = ctx.key("batch-delete-missing")
+    expected = _delete_objects(ctx.hot.client, [missing])[missing]
+    outcomes = _delete_objects(ctx.s3, [existing, missing])
+    assert outcomes == {existing: "Deleted", missing: expected}, outcomes
+    ctx.assert_gone(existing)
+
+
+def check_delete_objects_quiet(ctx: Ctx) -> None:
+    hot, _ = ctx.put_hot("batch-delete-quiet")
+    cold, _ = ctx.put_cold_indexed("batch-delete-quiet")
+    outcomes = _delete_objects(ctx.s3, [hot, cold], quiet=True)
+    assert outcomes == {}, outcomes
+    ctx.assert_gone(hot)
+    ctx.assert_gone(cold)
+
+
+def check_delete_objects_special_character_keys(ctx: Ctx) -> None:
+    hot, _ = ctx.put_hot("batch & <delete> 'ä' \"x\"/y")
+    cold, _ = ctx.put_cold_indexed("batch & <delete> 'é' \"x\"/y")
+    outcomes = _delete_objects(ctx.s3, [hot, cold])
+    assert outcomes == {hot: "Deleted", cold: "Deleted"}, outcomes
+    ctx.assert_gone(hot)
+    ctx.assert_gone(cold)
+
+
+def check_delete_objects_duplicate_keys(ctx: Ctx) -> None:
+    key, _ = ctx.put_cold_indexed("batch-delete-duplicate")
+    res = ctx.s3.delete_objects(
+        Bucket=BUCKET_NAME, Delete={"Objects": [{"Key": key}, {"Key": key}]}
+    )
+    assert not res.get("Errors"), res["Errors"]
+    assert [d["Key"] for d in res["Deleted"]] == [key], res["Deleted"]
+    ctx.assert_gone(key)
+
+
+def check_delete_objects_full_batch(ctx: Ctx) -> None:
+    hot = [ctx.put_hot("batch-delete-full")[0] for _ in range(10)]
+    cold = [ctx.put_cold_indexed("batch-delete-full")[0] for _ in range(10)]
+    unindexed = [ctx.put_cold_unindexed("batch-delete-full")[0] for _ in range(10)]
+    present = hot + cold + unindexed
+    missing = [ctx.key("batch-delete-full-missing") for _ in range(1000 - len(present))]
+    expected = _delete_objects(ctx.hot.client, missing[:1])[missing[0]]
+
+    outcomes = _delete_objects(ctx.s3, present + missing)
+
+    assert len(outcomes) == 1000, f"{len(outcomes)} outcomes for 1000 keys"
+    wrong = {k: v for k, v in outcomes.items() if v != "Deleted" and k in present}
+    assert not wrong, f"present keys not deleted: {wrong}"
+    wrong = {k: v for k, v in outcomes.items() if v != expected and k in missing}
+    assert not wrong, f"missing keys not reported as {expected}: {wrong}"
+    for key in present:
+        ctx.assert_gone(key)
 
 
 def check_copy_object_same_upstream(ctx: Ctx) -> None:
@@ -845,6 +929,13 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("DeleteObject", check_delete_object),
     ("DeleteObject unindexed cold object", check_delete_unindexed_cold_object),
     ("DeleteObjects (hot + cold)", check_delete_objects),
+    ("DeleteObjects unindexed cold object", check_delete_objects_unindexed),
+    ("DeleteObjects key on both upstreams", check_delete_objects_on_both_upstreams),
+    ("DeleteObjects missing key", check_delete_objects_missing_key),
+    ("DeleteObjects quiet", check_delete_objects_quiet),
+    ("DeleteObjects special-character keys", check_delete_objects_special_character_keys),
+    ("DeleteObjects duplicate keys", check_delete_objects_duplicate_keys),
+    ("DeleteObjects 1000 keys", check_delete_objects_full_batch),
     ("CopyObject same upstream", check_copy_object_same_upstream),
     ("CopyObject from cold source", check_copy_object_from_cold),
     ("CopyObject onto object on other upstream", check_copy_object_onto_other_upstream),
