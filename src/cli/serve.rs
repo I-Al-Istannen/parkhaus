@@ -4,6 +4,7 @@ use crate::cli::logging::env_filter;
 use crate::config::Config;
 use crate::db::Database;
 use crate::server::endpoints;
+use crate::server::listing::ListingStore;
 use crate::server::metrics::initialize_metrics;
 use crate::server::migrate::migration_task;
 use crate::server::state::{AppState, MigrationLocks};
@@ -89,6 +90,7 @@ async fn start_main_server(
             .build()
             .context("failed to build HTTP client")?,
         migration_locks,
+        listings: ListingStore::default(),
     };
 
     let app = Router::new()

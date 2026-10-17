@@ -4,6 +4,7 @@ use crate::error::TierError;
 use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
 use crate::server::hacks::{is_post_object, read_post_object_key};
+use crate::server::listing::{is_list_objects_v2, proxy_list_objects_v2};
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
@@ -92,6 +93,9 @@ pub async fn proxy_request(
 
     match target {
         Target::Bucket(bucket) => {
+            if is_list_objects_v2(&req) {
+                return proxy_list_objects_v2(&state, &bucket, req).await;
+            }
             if is_post_object(&req) {
                 let (object_id, req) = read_post_object_key(&bucket, req).await?;
                 return proxy_object_request(state, object_id, ObjectOp::Write, req, None).await;
@@ -202,7 +206,7 @@ fn get_fallback_upstream<'a>(
     fallback
 }
 
-async fn forward_request(
+pub(super) async fn forward_request(
     state: &AppState,
     upstream: &Upstream,
     target: ForwardObjectUrl,

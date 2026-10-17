@@ -15,6 +15,7 @@ from e2e_access_log import main as run_access_log
 from e2e_tiering import main as run_tiering
 from e2e_crud import main as run_crud
 from e2e_multipart import main as run_multipart
+from e2e_operations import main as run_operations
 from e2e_utils import info
 
 
@@ -48,6 +49,10 @@ def main() -> None:
         "multipart",
         help="Run multipart upload e2e scenario",
     )
+    subparsers.add_parser(
+        "operations",
+        help="Run every Garage-supported S3 operation through parkhaus",
+    )
 
     args = parser.parse_args()
     if args.command == "tiering":
@@ -68,6 +73,11 @@ def main() -> None:
     if args.command == "multipart":
         info("Running multipart scenario")
         run_multipart()
+        return
+
+    if args.command == "operations":
+        info("Running operations scenario")
+        run_operations()
         return
 
     parser.error(f"Unknown command: {args.command}")

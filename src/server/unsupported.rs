@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, Method};
 use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
+use url::form_urlencoded;
 
 /// Returns the request unchanged if parkhaus can handle it.
 pub(super) async fn reject_unsupported(
@@ -22,6 +23,9 @@ pub(super) async fn reject_unsupported(
     match target {
         Target::Bucket(_) if is_bucket_creation_or_deletion(&req) => {
             Err(not_supported("creating and deleting buckets"))
+        }
+        Target::Bucket(bucket) if !bucket.is_empty() && is_list_objects_v1(&req) => {
+            Err(not_supported("ListObjects (v1), use ListObjectsV2"))
         }
         Target::Object(upload) => {
             if let Some(source) = part_copy_source(&req)?
@@ -54,6 +58,15 @@ fn is_sse_c(headers: &HeaderMap) -> bool {
 fn is_bucket_creation_or_deletion(req: &Request) -> bool {
     req.uri().query().is_none_or(str::is_empty)
         && matches!(*req.method(), Method::PUT | Method::DELETE)
+}
+
+/// ListObjects v1 is rarely used anymore. Its `marker` is a key every upstream understands, so it
+/// could be merged without sessions by forwarding each request to all upstreams.
+fn is_list_objects_v1(req: &Request) -> bool {
+    const V1_PARAMS: [&str; 5] = ["prefix", "delimiter", "marker", "max-keys", "encoding-type"];
+    *req.method() == Method::GET
+        && form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+            .all(|(key, _)| V1_PARAMS.contains(&key.as_ref()))
 }
 
 /// UploadPartCopy: a multipart upload is bound to one upstream, which can only copy parts from

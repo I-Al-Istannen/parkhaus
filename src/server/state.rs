@@ -8,6 +8,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use crate::config::Config;
 use crate::data::S3ObjectId;
 use crate::db::Database;
+use crate::server::listing::ListingStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -15,6 +16,7 @@ pub struct AppState {
     pub db: Database,
     pub http: Client,
     pub migration_locks: MigrationLocks,
+    pub listings: ListingStore,
 }
 
 pub struct MutationLockGuard {
