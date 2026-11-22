@@ -524,7 +524,7 @@ pub fn typecheck<E: Env + Clone>(
                 Typechecked::new(Type::Number),
             ),
             Operator::Not(r) => Expr::Operator(
-                Operator::Negate(check_inner(r)?.assert_typ(expr.span, src, Type::Bool)?),
+                Operator::Not(check_inner(r)?.assert_typ(expr.span, src, Type::Bool)?),
                 Typechecked::new(Type::Bool),
             ),
             Operator::Times(l, r) => bin_op!(l, r, Times, Number, Number, Number),
@@ -631,6 +631,19 @@ mod tests {
     ];
 
     type BinaryOpCtor<T> = fn(Box<Spanned<Expr<T>>>, Box<Spanned<Expr<T>>>) -> Operator<T>;
+
+    #[test]
+    fn not_typechecks_to_not() {
+        let src = "!true";
+        let expr =
+            super::typecheck_filter::<crate::db::TieringRuleEnv>(parse_expr(src).unwrap(), src)
+                .unwrap();
+        assert!(
+            matches!(expr, Expr::Operator(Operator::Not(_), _)),
+            "{}",
+            expr.to_debug_string()
+        );
+    }
 
     fn identifier_strategy() -> impl Strategy<Value = String> {
         string_regex("[a-zA-Z_][a-zA-Z0-9_]{0,8}")

@@ -495,3 +495,51 @@ async fn objects_without_accesses_reach_catch_all_rule() -> Result<(), Report> {
     );
     Ok(())
 }
+
+async fn pending_for(rules: &[(Tier, &str)], objects: &[S3Object]) -> Result<Vec<String>, Report> {
+    let db = Database::in_memory().await?;
+    for object in objects {
+        db.record_creation(object).await?;
+    }
+    let base = test_config()?;
+    let config = Config::new(
+        base.listen,
+        None,
+        base.db_path,
+        base.upstreams.into_values().collect(),
+        rules
+            .iter()
+            .map(|(tier, expr)| TieringRule {
+                to: UpstreamId(tier.to_string()),
+                filter: typecheck(parse_expr(expr).unwrap(), expr).unwrap(),
+            })
+            .collect(),
+    )?;
+    let mut keys: Vec<_> = compute_pending_migrations(&config, &db, Zoned::now())
+        .await?
+        .into_iter()
+        .map(|it| format!("{}->{}", it.object, it.target_upstream))
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+fn hot_object(bucket: &str, key: &str) -> S3Object {
+    S3Object {
+        id: S3ObjectId {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        },
+        assigned_upstream: UpstreamId(Tier::Hot.to_string()),
+        last_modified: Zoned::now().timestamp(),
+        size: 1,
+    }
+}
+
+#[tokio::test]
+async fn negation_selects_the_complement() -> Result<(), Report> {
+    let objects = [hot_object("a", "k"), hot_object("b", "k")];
+    let pending = pending_for(&[(Tier::Cold, "!(bucket == 'a')")], &objects).await?;
+    assert_eq!(pending, vec!["b/k->Cold".to_string()]);
+    Ok(())
+}
