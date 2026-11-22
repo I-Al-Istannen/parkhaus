@@ -332,15 +332,4 @@ impl GarageInstance {
 
         Ok(())
     }
-
-    pub fn drop_in_new_runtime(container: ContainerAsync<Garage>) {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("teardown runtime")
-            .block_on(async move {
-                drop(container);
-                tokio::task::yield_now().await;
-            });
-    }
 }

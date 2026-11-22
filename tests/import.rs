@@ -1,6 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
-use crate::common::garage::GarageInstance;
+use crate::common::S3Instance;
 use jiff::Timestamp;
 use parkhaus::cli::import::{ImportOptions, import_upstream};
 use parkhaus::config::{S3Secret, Upstream, UpstreamId};
@@ -17,38 +17,38 @@ use tokio::sync::OnceCell;
 
 mod common;
 
-static GARAGE: OnceCell<GarageInstance> = OnceCell::const_new();
+static BACKEND: OnceCell<S3Instance> = OnceCell::const_new();
 
 #[ctor::dtor]
-fn shutdown_garage() {
-    if let Some(container) = GARAGE.get().and_then(GarageInstance::take_container) {
-        GarageInstance::drop_in_new_runtime(container);
+fn shutdown_backend() {
+    if let Some(backend) = BACKEND.get() {
+        backend.shutdown();
     }
 }
 
-async fn garage() -> Result<&'static GarageInstance, Report> {
-    GARAGE.get_or_try_init(GarageInstance::start).await
+async fn backend() -> Result<&'static S3Instance, Report> {
+    BACKEND.get_or_try_init(S3Instance::start).await
 }
 
 #[tokio::test]
 async fn test_import_buckets() -> Result<(), Report> {
-    let garage = garage().await?;
+    let backend = backend().await?;
     let reqwest_client = reqwest::Client::new();
 
-    let (key_id, key_secret) = garage.create_key("access-key").await?;
+    let (key_id, key_secret) = backend.create_key("access-key").await?;
     let upstream = Upstream {
-        name: UpstreamId("garage".to_string()),
+        name: UpstreamId("upstream".to_string()),
         order: 0,
-        base_url: garage.s3_endpoint().clone(),
-        region: garage.region().to_string(),
+        base_url: backend.s3_endpoint().clone(),
+        region: backend.region().to_string(),
         addressing_style: AddressingStyle::Path,
         s3_access_key: key_id.clone(),
         s3_secret: S3Secret(key_secret.clone()),
     };
     let s3 = S3Client::new(
         reqwest_client.clone(),
-        garage.s3_endpoint().clone(),
-        garage.region(),
+        backend.s3_endpoint().clone(),
+        backend.region(),
         &key_id,
         &key_secret,
         AddressingStyle::Path,
@@ -56,8 +56,8 @@ async fn test_import_buckets() -> Result<(), Report> {
 
     let bucket_names = (0..5).map(|i| format!("bucket-{i}")).collect::<Vec<_>>();
     for bucket_name in &bucket_names {
-        let bucket_id = garage.create_bucket(bucket_name).await?;
-        garage.allow_key_on_bucket(&bucket_id, &key_id).await?;
+        let bucket_id = backend.create_bucket(bucket_name).await?;
+        backend.allow_key_on_bucket(&bucket_id, &key_id).await?;
     }
 
     let mut expected_objects: BTreeMap<String, Vec<String>> = BTreeMap::new();

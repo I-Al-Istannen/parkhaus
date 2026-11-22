@@ -1,6 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
-use crate::common::garage::GarageInstance;
+use crate::common::S3Instance;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jiff::Timestamp;
@@ -16,17 +16,17 @@ use tokio::sync::OnceCell;
 
 mod common;
 
-static GARAGE: OnceCell<GarageInstance> = OnceCell::const_new();
+static BACKEND: OnceCell<S3Instance> = OnceCell::const_new();
 
 #[ctor::dtor]
-fn shutdown_garage() {
-    if let Some(container) = GARAGE.get().and_then(GarageInstance::take_container) {
-        GarageInstance::drop_in_new_runtime(container);
+fn shutdown_backend() {
+    if let Some(backend) = BACKEND.get() {
+        backend.shutdown();
     }
 }
 
-async fn garage() -> Result<&'static GarageInstance, Report> {
-    GARAGE.get_or_try_init(GarageInstance::start).await
+async fn backend() -> Result<&'static S3Instance, Report> {
+    BACKEND.get_or_try_init(S3Instance::start).await
 }
 
 fn bucket_name(test_name: &str) -> String {
@@ -38,12 +38,12 @@ fn bucket_name_with_suffix(test_name: &str, suffix: &str) -> String {
 }
 
 /// Create a bucket + key with full permissions, return a ready-to-use client.
-async fn setup_bucket(g: &GarageInstance, bucket: &str) -> Result<S3Client, Report> {
+async fn setup_bucket(g: &S3Instance, bucket: &str) -> Result<S3Client, Report> {
     setup_bucket_with_style(g, bucket, AddressingStyle::Path).await
 }
 
 async fn setup_bucket_with_style(
-    g: &GarageInstance,
+    g: &S3Instance,
     bucket: &str,
     style: AddressingStyle,
 ) -> Result<S3Client, Report> {
@@ -77,7 +77,7 @@ async fn put_object(
 
 #[tokio::test]
 async fn test_put_and_get_file() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-put-and-get-file");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -111,7 +111,7 @@ async fn test_put_and_get_file() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_get_object_sha() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-get-object-sha");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -136,7 +136,7 @@ async fn test_get_object_sha() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_put_large_file() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-put-large-file");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -161,7 +161,7 @@ async fn test_put_large_file() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_put_empty_file() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-put-empty-file");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -180,7 +180,7 @@ async fn test_put_empty_file() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_virtual_hosted_put_get_and_list() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-virtual-hosted-put-get-and-list");
     let client = setup_bucket_with_style(g, &bucket, AddressingStyle::VirtualHosted).await?;
 
@@ -206,7 +206,7 @@ async fn test_virtual_hosted_put_get_and_list() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_list_buckets() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let expected_buckets = [
         bucket_name_with_suffix("test-list-buckets", "a"),
         bucket_name_with_suffix("test-list-buckets", "b"),
@@ -246,7 +246,7 @@ async fn test_list_buckets() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_list_objects() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-list-objects");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -281,7 +281,7 @@ async fn test_list_objects() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_head_file_returns_metadata() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-head-file-returns-metadata");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -308,7 +308,7 @@ async fn test_head_file_returns_metadata() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_head_file_tracks_overwrites() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-head-file-tracks-overwrites");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -343,7 +343,7 @@ async fn test_head_file_tracks_overwrites() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_head_file_missing_object_errors() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-head-file-missing-object-errors");
     let client = setup_bucket(g, &bucket).await?;
 
@@ -367,7 +367,7 @@ async fn test_head_file_missing_object_errors() -> Result<(), Report> {
 
 #[tokio::test]
 async fn test_delete() -> Result<(), Report> {
-    let g = garage().await?;
+    let g = backend().await?;
     let bucket = bucket_name("test-delete-objects");
     let client = setup_bucket(g, &bucket).await?;
 

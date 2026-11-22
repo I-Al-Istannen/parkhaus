@@ -1,6 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
-use common::garage::GarageInstance;
+use common::S3Instance;
 use derive_more::Display;
 use jiff::{Span, Unit, Zoned};
 use parkhaus::config::{Config, S3Secret, Upstream, UpstreamId};
@@ -92,9 +92,9 @@ impl TryFrom<&str> for Tier {
     }
 }
 
-static GARAGE_HOT: OnceCell<GarageInstance> = OnceCell::const_new();
-static GARAGE_WARM: OnceCell<GarageInstance> = OnceCell::const_new();
-static GARAGE_COLD: OnceCell<GarageInstance> = OnceCell::const_new();
+static BACKEND_HOT: OnceCell<S3Instance> = OnceCell::const_new();
+static BACKEND_WARM: OnceCell<S3Instance> = OnceCell::const_new();
+static BACKEND_COLD: OnceCell<S3Instance> = OnceCell::const_new();
 
 #[derive(Debug, Clone)]
 struct SeededObject {
@@ -109,37 +109,33 @@ struct TierBackend {
 }
 
 #[ctor::dtor]
-fn shutdown_garages() {
-    [
-        GARAGE_HOT.get().and_then(GarageInstance::take_container),
-        GARAGE_WARM.get().and_then(GarageInstance::take_container),
-        GARAGE_COLD.get().and_then(GarageInstance::take_container),
-    ]
-    .into_iter()
-    .flatten()
-    .for_each(GarageInstance::drop_in_new_runtime);
+fn shutdown_backends() {
+    [&BACKEND_HOT, &BACKEND_WARM, &BACKEND_COLD]
+        .into_iter()
+        .filter_map(OnceCell::get)
+        .for_each(S3Instance::shutdown);
 }
 
-async fn garage_for_tier(tier: Tier) -> Result<&'static GarageInstance, Report> {
+async fn backend_for_tier(tier: Tier) -> Result<&'static S3Instance, Report> {
     match tier {
-        Tier::Hot => GARAGE_HOT.get_or_try_init(GarageInstance::start).await,
-        Tier::Warm => GARAGE_WARM.get_or_try_init(GarageInstance::start).await,
-        Tier::Cold => GARAGE_COLD.get_or_try_init(GarageInstance::start).await,
+        Tier::Hot => BACKEND_HOT.get_or_try_init(S3Instance::start).await,
+        Tier::Warm => BACKEND_WARM.get_or_try_init(S3Instance::start).await,
+        Tier::Cold => BACKEND_COLD.get_or_try_init(S3Instance::start).await,
     }
 }
 
 async fn setup_tier_backend(tier: Tier) -> Result<TierBackend, Report> {
-    let garage = garage_for_tier(tier).await?;
+    let backend = backend_for_tier(tier).await?;
 
     let bucket = "test";
-    let bucket_id = garage.create_bucket(bucket).await?;
-    let (key_id, secret) = garage.create_key(&format!("e2e-{}", tier)).await?;
-    garage.allow_key_on_bucket(&bucket_id, &key_id).await?;
+    let bucket_id = backend.create_bucket(bucket).await?;
+    let (key_id, secret) = backend.create_key(&format!("e2e-{}", tier)).await?;
+    backend.allow_key_on_bucket(&bucket_id, &key_id).await?;
 
     let client = S3Client::new(
         Client::new(),
-        garage.s3_endpoint().clone(),
-        garage.region(),
+        backend.s3_endpoint().clone(),
+        backend.region(),
         &key_id,
         &secret,
         AddressingStyle::Path,
@@ -149,11 +145,11 @@ async fn setup_tier_backend(tier: Tier) -> Result<TierBackend, Report> {
         upstream: Upstream {
             name: UpstreamId(tier.to_string()),
             order: tier.order(),
-            base_url: garage.s3_endpoint().clone(),
+            base_url: backend.s3_endpoint().clone(),
             addressing_style: AddressingStyle::Path,
             s3_access_key: key_id,
             s3_secret: S3Secret(secret),
-            region: garage.region().to_owned(),
+            region: backend.region().to_owned(),
         },
         client,
     })
