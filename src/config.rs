@@ -92,7 +92,7 @@ pub struct S3Secret(pub String);
 
 impl Debug for S3Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "s3:{}", "*".repeat(self.0.len()))
+        write!(f, "s3:***")
     }
 }
 
@@ -371,5 +371,10 @@ mod tests {
             config.upstreams.values().next().unwrap().s3_access_key,
             "key-with-env:inside"
         );
+    }
+
+    #[test]
+    fn secret_debug_hides_length() {
+        assert_eq!(format!("{:?}", S3Secret("abc".to_string())), "s3:***");
     }
 }
