@@ -1,5 +1,5 @@
 use super::metrics::MigrationMetrics;
-use crate::config::{Config, Upstream};
+use crate::config::{Config, Upstream, UpstreamId};
 use crate::data::{PendingMigration, S3ObjectId};
 use crate::db::{Database, DirtyObject};
 use crate::s3::client::S3Client;
@@ -7,18 +7,21 @@ use crate::server::resolve::{resolve, sweep};
 use crate::server::state::KeyLocks;
 use crate::server::uploads::reap_abandoned_uploads;
 use jiff::{Timestamp, Zoned};
+use rand::seq::SliceRandom;
 use reqwest::Client;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail};
-use std::collections::HashSet;
-use std::ops::Not;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 const SAMPLE_ERRORS: usize = 50;
+/// A route that keeps failing is likely down, so trying the rest of its objects only wastes
+/// downloads from the source.
+const MAX_FAILURES_IN_A_ROW: usize = 5;
 
 pub async fn migration_task(
     config: Config,
@@ -95,18 +98,20 @@ pub async fn compute_pending_migrations(
         all_migrations.extend(pending);
     }
 
+    let total = all_migrations.len();
     let mut set = HashSet::new();
-    all_migrations.retain(|migration| set.insert(migration.object.clone()));
-
-    if set.is_empty().not() {
+    all_migrations.retain(|migration| {
+        let first = set.insert(migration.object.clone());
+        if !first {
+            trace!(object = %migration.object, "Covered object more than once");
+        }
+        first
+    });
+    if all_migrations.len() < total {
         debug!(
-            covered_twice=%set.len(),
-            "Overlapping rules found, covered {} objects more than once. Prioritizing first rule.",
-            set.len()
-        )
-    }
-    for object in set {
-        trace!(%object, "Covered object more than once");
+            covered_twice = total - all_migrations.len(),
+            "Overlapping rules found, prioritizing the first matching rule"
+        );
     }
 
     Ok(all_migrations)
@@ -121,17 +126,37 @@ pub async fn execute_migrations(
     key_locks: &KeyLocks,
 ) -> Result<usize, Report> {
     let mut metrics = MigrationMetrics::snapshot(config, &pending);
+    // Objects that always fail must not block the same objects behind them in every pass
+    let mut pending = pending;
+    pending.shuffle(&mut rand::rng());
     debug!(count = pending.len(), "Executing pending migrations");
 
     let mut failed = 0;
     let mut sampled_errors = Vec::with_capacity(SAMPLE_ERRORS);
+    let mut failures_in_a_row: HashMap<(&UpstreamId, &UpstreamId), usize> = HashMap::new();
     for migration in &pending {
+        let route = (&migration.source_upstream, &migration.target_upstream);
+        let route_failures = failures_in_a_row.entry(route).or_default();
+        if *route_failures >= MAX_FAILURES_IN_A_ROW {
+            continue;
+        }
         match execute_migration(migration, config, db, http, key_locks).await {
-            Ok(()) => metrics.completed(migration),
+            Ok(()) => {
+                *route_failures = 0;
+                metrics.completed(migration);
+            }
             Err(e) => {
                 debug!(%e, "Failed to execute pending migration");
                 metrics.failed(migration);
                 failed += 1;
+                *route_failures += 1;
+                if *route_failures == MAX_FAILURES_IN_A_ROW {
+                    warn!(
+                        from = %route.0,
+                        to = %route.1,
+                        "Too many failed migrations in a row, skipping the route until the next pass"
+                    );
+                }
                 // Reservoir sampling keeps memory bounded
                 if sampled_errors.len() < SAMPLE_ERRORS {
                     sampled_errors.push(e);

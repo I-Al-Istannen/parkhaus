@@ -4,7 +4,7 @@ use common::S3Instance;
 use derive_more::Display;
 use jiff::{Span, Unit, Zoned};
 use parkhaus::config::{Config, S3Secret, Upstream, UpstreamId};
-use parkhaus::data::{S3Object, S3ObjectId, TieringRule};
+use parkhaus::data::{PendingMigration, S3Object, S3ObjectId, TieringRule};
 use parkhaus::db::Database;
 use parkhaus::policy::expr::{parse_expr, typecheck};
 use parkhaus::s3::client::{ObjectInfo, S3Client};
@@ -575,5 +575,28 @@ async fn accesses_update_last_accessed() -> Result<(), Report> {
     )?;
     let pending = compute_pending_migrations(&config, &db, Zoned::now()).await?;
     assert!(pending.is_empty(), "{pending:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn failing_routes_are_skipped_for_the_rest_of_the_pass() -> Result<(), Report> {
+    let db = Database::in_memory().await?;
+    let objects: Vec<_> = (0..20).map(|i| hot_object("a", &format!("k{i}"))).collect();
+    for object in &objects {
+        db.record_creation(object).await?;
+    }
+    let config = test_config()?;
+    let pending = objects
+        .iter()
+        .map(|object| PendingMigration {
+            object: object.id.clone(),
+            source_upstream: UpstreamId(Tier::Hot.to_string()),
+            target_upstream: UpstreamId(Tier::Cold.to_string()),
+        })
+        .collect();
+
+    let failed =
+        execute_migrations(pending, &config, &db, &Client::new(), &KeyLocks::default()).await?;
+    assert_eq!(failed, 5);
     Ok(())
 }
