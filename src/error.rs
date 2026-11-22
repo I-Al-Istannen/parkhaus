@@ -1,33 +1,62 @@
 use crate::policy::expr::AnnotatedError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use quick_xml::escape::escape;
 use rootcause::handlers::{ContextFormattingStyle, FormattingFunction};
 use rootcause::hooks::context_formatter::ContextFormatterHook;
 use rootcause::markers::{Dynamic, Local, Uncloneable};
 use rootcause::{Report, ReportRef};
 use std::fmt::Formatter;
-use tracing::warn;
+use tracing::error;
+
+const X_AMZ_REQUEST_ID: &str = "x-amz-request-id";
 
 pub struct TierError {
     report: Report,
 }
 
 impl IntoResponse for TierError {
+    /// Answers with an S3 error document. Only errors with a status carry their message to the
+    /// client, everything else is logged and reported as an internal error.
     fn into_response(self) -> Response {
-        let status_code = self
-            .report
-            .iter_reports()
-            .flat_map(|node| node.attachments().iter())
-            .filter_map(|attachment| attachment.downcast_inner::<StatusCode>())
-            .next();
-        let error_message = format!("error: {}", self.report);
-
-        if let Some(status_code) = status_code {
-            (*status_code, error_message).into_response()
-        } else {
-            warn!(%self.report, "error without status code during handling");
-            (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
+        let request_id = format!("{:016x}", rand::random::<u64>());
+        let with_status = self.report.iter_reports().find_map(|node| {
+            node.attachments()
+                .iter()
+                .find_map(|it| it.downcast_inner::<StatusCode>())
+                .map(|status| (*status, node.format_current_context().to_string()))
+        });
+        let (status, message) = with_status.unwrap_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "We encountered an internal error. Please try again.".to_string(),
+            )
+        });
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            error!(%request_id, report = %self.report, "Failed to handle request");
         }
+
+        let code = match status {
+            StatusCode::BAD_REQUEST => "InvalidRequest",
+            StatusCode::NOT_FOUND => "NoSuchKey",
+            StatusCode::NOT_IMPLEMENTED => "NotImplemented",
+            StatusCode::SERVICE_UNAVAILABLE => "ServiceUnavailable",
+            _ => "InternalError",
+        };
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+             <Message>{}</Message><RequestId>{request_id}</RequestId></Error>",
+            escape(&message)
+        );
+        (
+            status,
+            [
+                ("content-type", "application/xml"),
+                (X_AMZ_REQUEST_ID, request_id.as_str()),
+            ],
+            body,
+        )
+            .into_response()
     }
 }
 
@@ -68,5 +97,49 @@ impl ContextFormatterHook<AnnotatedError> for AriadneErrorFormatter {
             .format()
             .map_err(|_| std::fmt::Error)?;
         formatter.write_str(&val)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TierError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use rootcause::prelude::ResultExt;
+    use rootcause::report;
+
+    async fn render(error: TierError) -> (StatusCode, String) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn client_errors_carry_their_message() {
+        let error: TierError = report!("versionId <x> is not supported")
+            .attach(StatusCode::NOT_IMPLEMENTED)
+            .into();
+        let (status, body) = render(error).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+        assert!(
+            body.contains("<Message>versionId &lt;x&gt; is not supported</Message>"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_errors_hide_details() {
+        let error: TierError = Err::<(), _>(report!("secret upstream http://10.0.0.1"))
+            .context("failed to forward")
+            .unwrap_err()
+            .into();
+        let (status, body) = render(error).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("<Code>InternalError</Code>"), "{body}");
+        assert!(!body.contains("10.0.0.1"), "{body}");
     }
 }
