@@ -1,8 +1,8 @@
 """Exercises every S3 operation Garage supports through parkhaus.
 
 Objects are created either through parkhaus (landing on the hottest upstream)
-or directly on the cold upstream, mimicking pre-existing data parkhaus does not
-know about yet. Each check is independent; all results are reported at the end.
+or directly on the cold upstream plus a DB row, mimicking imported data. Each
+check is independent; all results are reported at the end.
 """
 
 import hashlib
@@ -84,9 +84,18 @@ class Ctx:
 
     def put_cold_indexed(self, name: str, size: int = 1024) -> tuple[str, bytes]:
         key, body = self.put_cold_unindexed(name, size)
-        self.s3.get_object(Bucket=BUCKET_NAME, Key=key)["Body"].read()
-        self.wait_for_row(key, size=len(body), upstream=Tier.COLD)
+        self.index(key, len(body), Tier.COLD)
         return key, body
+
+    def index(self, key: str, size: int, tier: Tier) -> None:
+        """Records an object like `parkhaus import` would."""
+        now = int(time.time() * 1000)
+        self.backend.sqlite_connection.execute(
+            "INSERT INTO objects (bucket, key, assigned_upstream, last_modified, last_accessed, size)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (BUCKET_NAME, key, tier.value, now, now, size),
+        )
+        self.backend.sqlite_connection.commit()
 
     def row(self, key: str, bucket: str = BUCKET_NAME) -> tuple[str, int] | None:
         return self.backend.sqlite_connection.execute(
@@ -485,10 +494,11 @@ def check_put_aws_chunked(ctx: Ctx) -> None:
     assert ctx.get(key) == body
 
 
-def check_get_unindexed_cold_object(ctx: Ctx) -> None:
-    key, body = ctx.put_cold_unindexed("get-unindexed")
-    assert ctx.get(key) == body
-    ctx.wait_for_row(key, size=len(body), upstream=Tier.COLD)
+def check_unindexed_object_invisible(ctx: Ctx) -> None:
+    key, _ = ctx.put_cold_unindexed("unindexed")
+    expect_status(404, lambda: ctx.get(key))
+    expect_status(404, lambda: ctx.s3.head_object(Bucket=BUCKET_NAME, Key=key))
+    assert ctx.row(key) is None, ctx.row(key)
 
 
 def check_get_range(ctx: Ctx) -> None:
@@ -512,20 +522,8 @@ def check_head_object(ctx: Ctx) -> None:
     assert res["ContentLength"] == len(body), res
 
 
-def check_head_unindexed_cold_object(ctx: Ctx) -> None:
-    key, body = ctx.put_cold_unindexed("head-unindexed")
-    res = ctx.s3.head_object(Bucket=BUCKET_NAME, Key=key)
-    assert res["ContentLength"] == len(body), res
-
-
 def check_delete_object(ctx: Ctx) -> None:
     key, _ = ctx.put_cold_indexed("delete")
-    ctx.s3.delete_object(Bucket=BUCKET_NAME, Key=key)
-    ctx.assert_gone(key)
-
-
-def check_delete_unindexed_cold_object(ctx: Ctx) -> None:
-    key, _ = ctx.put_cold_unindexed("delete-unindexed")
     ctx.s3.delete_object(Bucket=BUCKET_NAME, Key=key)
     ctx.assert_gone(key)
 
@@ -550,15 +548,6 @@ def check_delete_objects(ctx: Ctx) -> None:
     assert outcomes == {hot: "Deleted", cold: "Deleted"}, outcomes
     ctx.assert_gone(hot)
     ctx.assert_gone(cold)
-
-
-def check_delete_objects_unindexed(ctx: Ctx) -> None:
-    unindexed, _ = ctx.put_cold_unindexed("batch-delete-unindexed")
-    hot, _ = ctx.put_hot("batch-delete-unindexed")
-    outcomes = _delete_objects(ctx.s3, [unindexed, hot])
-    assert outcomes == {unindexed: "Deleted", hot: "Deleted"}, outcomes
-    ctx.assert_gone(unindexed)
-    ctx.assert_gone(hot)
 
 
 def check_delete_objects_on_both_upstreams(ctx: Ctx) -> None:
@@ -610,8 +599,7 @@ def check_delete_objects_duplicate_keys(ctx: Ctx) -> None:
 def check_delete_objects_full_batch(ctx: Ctx) -> None:
     hot = [ctx.put_hot("batch-delete-full")[0] for _ in range(10)]
     cold = [ctx.put_cold_indexed("batch-delete-full")[0] for _ in range(10)]
-    unindexed = [ctx.put_cold_unindexed("batch-delete-full")[0] for _ in range(10)]
-    present = hot + cold + unindexed
+    present = hot + cold
     missing = [ctx.key("batch-delete-full-missing") for _ in range(1000 - len(present))]
     expected = _delete_objects(ctx.hot.client, missing[:1])[missing[0]]
 
@@ -665,6 +653,7 @@ def check_copy_object_special_character_source(ctx: Ctx) -> None:
     src = ctx.key("copy späcial/+&=?#%")
     body = os.urandom(256)
     ctx.cold.client.put_object(Bucket=BUCKET_NAME, Key=src, Body=body)
+    ctx.index(src, len(body), Tier.COLD)
     dst = ctx.key("copy-special-dst")
     ctx.s3.copy_object(
         Bucket=BUCKET_NAME, Key=dst, CopySource={"Bucket": BUCKET_NAME, "Key": src}
@@ -871,16 +860,13 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("PutObject user metadata", check_user_metadata),
     ("PutObject special-character key", check_special_character_key),
     ("PutObject SSE-C (rejected with 501)", check_sse_c_rejected),
-    ("GetObject unindexed cold object", check_get_unindexed_cold_object),
+    ("Unindexed object is invisible", check_unindexed_object_invisible),
     ("GetObject Range", check_get_range),
     ("GetObject If-None-Match", check_get_if_none_match),
     ("GetObject missing key", check_get_missing_object),
     ("HeadObject", check_head_object),
-    ("HeadObject unindexed cold object", check_head_unindexed_cold_object),
     ("DeleteObject", check_delete_object),
-    ("DeleteObject unindexed cold object", check_delete_unindexed_cold_object),
     ("DeleteObjects (hot + cold)", check_delete_objects),
-    ("DeleteObjects unindexed cold object", check_delete_objects_unindexed),
     ("DeleteObjects key on both upstreams", check_delete_objects_on_both_upstreams),
     ("DeleteObjects missing key", check_delete_objects_missing_key),
     ("DeleteObjects quiet", check_delete_objects_quiet),

@@ -172,47 +172,6 @@ def random_age_for_tier(tier: Tier) -> int:
             return random.randint(warm_max + safety_buffer, 24 * 60 * 60)
 
 
-def test_get_unknown_defaults_to_coldest_upstream(
-    test_data: TestData, bucket: str
-) -> None:
-    info("Testing GET defaults to coldest_upstream for unknown objects...", level=2)
-
-    unknown_object = S3TestObject.new_random("unknown-object", bucket)
-    test_data.cold.client.put_object(
-        Bucket=bucket,
-        Key=unknown_object.key,
-        Body=unknown_object.content,
-    )
-    info("Uploaded unknown object to cold upstream only", level=4)
-
-    hot_keys = test_data.hot.get_object_keys()
-    warm_keys = test_data.warm.get_object_keys()
-    cold_keys = test_data.cold.get_object_keys()
-
-    assert unknown_object.key not in hot_keys, (
-        "Unknown object should not be in hot tier"
-    )
-    assert unknown_object.key not in warm_keys, (
-        "Unknown object should not be in warm tier"
-    )
-    assert unknown_object.key in cold_keys, "Unknown object should be in cold tier"
-    info("Verified object is only in cold upstream", level=4)
-
-    response = test_data.backend.client.get_object(
-        Bucket=bucket,
-        Key=unknown_object.key,
-    )
-    retrieved_content = response.get("Body").read()
-
-    assert retrieved_content == unknown_object.content, (
-        "Retrieved content should match original content for unknown object"
-    )
-    info(
-        "Successfully retrieved unknown object through proxy from coldest upstream",
-        level=4,
-    )
-
-
 def main(test_tier_by_bucket: bool) -> None:
     info("Starting tiering e2e test...")
 
@@ -266,12 +225,6 @@ def main(test_tier_by_bucket: bool) -> None:
 
             info("Verifying all objects are in the hot tier initially...", level=2)
             test_data.assert_all_hot()
-
-            info(
-                "Testing proxy defaults to coldest_upstream for unknown objects...",
-                level=2,
-            )
-            test_get_unknown_defaults_to_coldest_upstream(test_data, buckets[0])
 
             for randomize_round in range(3):
                 info(f"Randomizing object tiers (round {randomize_round + 1}/3)")

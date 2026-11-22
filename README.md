@@ -28,8 +28,7 @@ colder or hotter storage, depending on their age.
 - transparent S3 proxy
 - records creation times while forwarding requests
 - automatically migrates objects between upstreams based on tiering rules
-- always routes requests to the correct upstream, falling back to coldest for
-  unknown queries
+- always routes requests to the correct upstream
 - import your current upstreams for proper routing of existing objects
 
 ## Getting started
@@ -39,9 +38,9 @@ colder or hotter storage, depending on their age.
    permissions for these buckets.  
    *This is used for migration/import only!* No request passed-through by
    `parkhaus` will use these credentials.
-3. *Recommended*: Run `parkhaus --config config.toml import` to import all
-   existing objects, to ensure requests are routed to the correct upstream and
-   modification dates are known.
+3. Run `parkhaus --config config.toml import` to import all existing objects.
+   `parkhaus` treats objects it does not know as missing, so they are invisible
+   to clients until imported.
 4. Run parkhaus via `parkhaus --config config.toml serve`.
 5. Configure parkhaus as upstream for your applications.
    Remember that `parkhaus` is a _transparent proxy_. This imposes a few unique

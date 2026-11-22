@@ -8,8 +8,7 @@ use crate::server::classify::{BucketOp, Classified, ObjectOp, classify, not_supp
 use crate::server::listing::proxy_list_objects_v2;
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
-    COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
-    COUNTER_UPSTREAM_FORWARDS_TOTAL,
+    COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
 use crate::server::state::{AppState, MutationLockGuard};
 use axum::body::Body;
@@ -72,10 +71,10 @@ async fn proxy_object_request(
         ObjectOp::Copy { source } => source,
         _ => &object_id,
     };
-    let upstream = upstream_for(&state, routing_id, &op, req.method()).await?;
+    let upstream = upstream_for(&state, routing_id, req.method()).await?;
 
     if let ObjectOp::UploadPartCopy { source } = &op
-        && upstream_for(&state, source, &op, req.method()).await?.name != upstream.name
+        && upstream_for(&state, source, req.method()).await?.name != upstream.name
     {
         return Err(not_supported("UploadPartCopy across upstreams"));
     }
@@ -106,7 +105,6 @@ async fn proxy_object_request(
 async fn upstream_for<'a>(
     state: &'a AppState,
     object_id: &S3ObjectId,
-    op: &ObjectOp,
     method: &Method,
 ) -> Result<&'a Upstream, TierError> {
     let assigned = state
@@ -124,14 +122,10 @@ async fn upstream_for<'a>(
         return Ok(upstream);
     }
 
-    let fallback = match op {
-        ObjectOp::Read | ObjectOp::Delete | ObjectOp::Copy { .. } => {
-            state.config.coldest_upstream()
-        }
-        _ => state.config.hottest_upstream(),
-    };
+    // Unknown objects do not exist, the hottest upstream answers as if for any missing key.
+    let fallback = state.config.hottest_upstream();
     counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => method.to_string()).increment(1);
-    debug!(?object_id, %fallback.name, "object not found in database, defaulting upstream");
+    debug!(?object_id, %fallback.name, "object not found in database, using hottest upstream");
     Ok(fallback)
 }
 
@@ -311,12 +305,7 @@ async fn record(
                 .await
                 .context("failed to check object existence")?
             {
-                record_from_upstream(state, upstream_name, obj_id)
-                    .await
-                    .context("failed to import object on the fly")
-                    .attach(format!("object: {obj_id:?}"))?;
-                counter!(COUNTER_OBJECT_IMPORTED_ON_THE_FLY, "upstream" => upstream_name.0.clone())
-                    .increment(1);
+                return Ok(());
             }
         }
         ObjectOp::Preflight
