@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        command: ["tiering True", "tiering False", "access-log", "crud", "multipart"]
+        command: ["tiering True", "tiering False", "access-log", "crud", "multipart", "operations"]
         backend: ["garage", "rustfs"]
     env:
       PARKHAUS_TEST_BACKEND: ${{ matrix.backend }}
