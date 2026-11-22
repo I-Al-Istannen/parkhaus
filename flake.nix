@@ -1,5 +1,5 @@
 {
-  description = "A suite for testing compiler submissions";
+  description = "An S3 proxy that tiers objects across upstreams";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
