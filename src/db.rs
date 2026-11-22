@@ -14,7 +14,7 @@ use rootcause::prelude::ResultExt;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
-use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query};
+use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query, query_scalar};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,22 +71,31 @@ impl Database {
     }
 
     async fn new_impl(pool: Pool<Sqlite>, path: Option<PathBuf>) -> Result<Self, Report> {
+        let applied = Self::applied_migrations(&pool).await;
         sqlx::migrate!().run(&pool).await?;
 
-        // This might duplicate the database according to the docs:
-        // https://sqlite.org/lang_vacuum.html#how_vacuum_works
-        query!("VACUUM")
-            .execute(&mut *pool.acquire().await?)
-            .await?;
-        // Therefore, we now also checkpoint it
-        query("PRAGMA WAL_CHECKPOINT(TRUNCATE)")
-            .execute(&mut *pool.acquire().await?)
-            .await?;
+        if Self::applied_migrations(&pool).await != applied {
+            // Needs up to twice the size of the database on disk:
+            // https://sqlite.org/lang_vacuum.html#how_vacuum_works
+            query!("VACUUM")
+                .execute(&mut *pool.acquire().await?)
+                .await?;
+            query("PRAGMA WAL_CHECKPOINT(TRUNCATE)")
+                .execute(&mut *pool.acquire().await?)
+                .await?;
+        }
 
         Ok(Self {
             con: Arc::new(RwLock::new(pool)),
             path,
         })
+    }
+
+    async fn applied_migrations(pool: &SqlitePool) -> i64 {
+        query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
     }
 
     async fn read(&self) -> RwLockReadGuard<'_, SqlitePool> {
