@@ -319,8 +319,7 @@ pub(super) async fn get_pending_migrations_for_rule(
         let exclude_query =
             tier_rule::to_sql(exclude_rule.filter.clone(), all_arguments.len(), now);
         all_arguments.extend(exclude_query.arguments);
-        exclude_sql += "AND NOT";
-        exclude_sql += &exclude_query.condition;
+        exclude_sql += &format!(" AND NOT ({})", exclude_query.condition);
     }
 
     let sql = format!(

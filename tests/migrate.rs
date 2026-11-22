@@ -543,3 +543,11 @@ async fn negation_selects_the_complement() -> Result<(), Report> {
     assert_eq!(pending, vec!["b/k->Cold".to_string()]);
     Ok(())
 }
+
+#[tokio::test]
+async fn literal_rules_can_be_excluded() -> Result<(), Report> {
+    let objects = [hot_object("a", "k")];
+    let pending = pending_for(&[(Tier::Warm, "false"), (Tier::Cold, "true")], &objects).await?;
+    assert_eq!(pending, vec!["a/k->Cold".to_string()]);
+    Ok(())
+}
