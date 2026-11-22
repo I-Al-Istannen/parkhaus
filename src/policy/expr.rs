@@ -377,6 +377,19 @@ pub fn parse_expr(inp: &str) -> Result<Spanned<Expr<Raw>>, Report<AnnotatedError
     }
 }
 
+/// Typechecks a filter, which must evaluate to a boolean.
+pub fn typecheck_filter<E: Env + Clone>(
+    expr: Spanned<Expr<Raw>>,
+    src: &str,
+) -> Result<Expr<Typechecked<E>>, Report<AnnotatedError>> {
+    let span = expr.span;
+    let checked = Spanned {
+        span,
+        inner: typecheck::<E>(expr, src)?,
+    };
+    Ok(checked.assert_typ(span, src, Type::Bool)?.inner)
+}
+
 pub fn typecheck<E: Env + Clone>(
     expr: Spanned<Expr<Raw>>,
     src: &str,

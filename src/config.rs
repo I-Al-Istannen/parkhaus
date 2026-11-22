@@ -1,5 +1,5 @@
 use crate::data::TieringRule;
-use crate::policy::expr::{parse_expr, typecheck};
+use crate::policy::expr::{parse_expr, typecheck_filter};
 use crate::s3::types::{AddressingStyle, ForwardObjectUrl};
 use derive_more::{Display, From};
 use rootcause::bail;
@@ -34,6 +34,12 @@ impl Config {
         tiering_rules: Vec<TieringRule>,
     ) -> Result<Self, Report> {
         let upstreams = Self::validate_upstreams(upstreams)?;
+        if let Some(rule) = tiering_rules
+            .iter()
+            .find(|rule| !upstreams.iter().any(|it| it.name == rule.to))
+        {
+            bail!("tiering rule targets unknown upstream '{}'", rule.to);
+        }
 
         Ok(Self {
             listen,
@@ -173,8 +179,8 @@ fn from_raw(raw: RawConfig) -> Result<Config, Report> {
         .into_iter()
         .map(|it| {
             let expr = parse_expr(&it.when).context("failed to parse tiering rule query")?;
-            let expr =
-                typecheck(expr, &it.when).context("failed to typecheck tiering rule query")?;
+            let expr = typecheck_filter(expr, &it.when)
+                .context("failed to typecheck tiering rule query")?;
             Ok(TieringRule {
                 filter: expr,
                 to: UpstreamId(it.to),
@@ -371,6 +377,18 @@ mod tests {
             config.upstreams.values().next().unwrap().s3_access_key,
             "key-with-env:inside"
         );
+    }
+
+    #[test]
+    fn rejects_rules_for_unknown_upstreams() {
+        assert!(from_raw(raw_config("key", &[("test", "true")])).is_ok());
+        assert!(from_raw(raw_config("key", &[("missing", "true")])).is_err());
+    }
+
+    #[test]
+    fn rejects_non_boolean_rules() {
+        assert!(from_raw(raw_config("key", &[("test", "5")])).is_err());
+        assert!(from_raw(raw_config("key", &[("test", "bucket")])).is_err());
     }
 
     #[test]
