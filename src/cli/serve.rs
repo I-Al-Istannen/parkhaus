@@ -51,13 +51,19 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), Report> {
 
     let shutdown_token = CancellationToken::new();
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
-    let main_server = start_main_server(
-        config.clone(),
-        db.clone(),
-        prometheus_layer,
-        shutdown_token.clone(),
+    let main_server = cancel_on_error(
+        start_main_server(
+            config.clone(),
+            db.clone(),
+            prometheus_layer,
+            shutdown_token.clone(),
+        ),
+        &shutdown_token,
     );
-    let metrics_server = start_metric_server(config.clone(), metric_handle, shutdown_token.clone());
+    let metrics_server = cancel_on_error(
+        start_metric_server(config.clone(), metric_handle, shutdown_token.clone()),
+        &shutdown_token,
+    );
 
     initialize_metrics();
 
@@ -147,12 +153,25 @@ async fn start_metric_server(
     .map_err(Report::into_dynamic)
 }
 
+/// Shuts everything down when one server fails, so `run` does not wait for a signal.
+async fn cancel_on_error(
+    server: impl Future<Output = Result<(), Report>>,
+    token: &CancellationToken,
+) -> Result<(), Report> {
+    let result = server.await;
+    if result.is_err() {
+        token.cancel();
+    }
+    result
+}
+
 async fn shutdown_signal(token: CancellationToken) {
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let interrupt = signal::ctrl_c();
     select! {
         _ = sigterm.recv() => warn!("Received SIGTERM"),
-        _ = interrupt => warn!("Received SIGINT")
+        _ = interrupt => warn!("Received SIGINT"),
+        _ = token.cancelled() => {}
     }
     token.cancel();
 }
