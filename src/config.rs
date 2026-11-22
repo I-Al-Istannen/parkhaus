@@ -193,7 +193,7 @@ fn from_raw(raw: RawConfig) -> Result<Config, Report> {
 }
 
 fn maybe_env(value: String) -> Result<String, Report> {
-    let Some((_, env_var)) = value.split_once("env:") else {
+    let Some(env_var) = value.strip_prefix("env:") else {
         return Ok(value);
     };
     std::env::var(env_var)
@@ -230,7 +230,8 @@ fn byte_offset_to_line_col(input: &str, offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        AddressingStyle, Config, RawConfig, RawUpstream, S3Secret, Upstream, from_raw,
+        AddressingStyle, Config, RawConfig, RawTieringRule, RawUpstream, S3Secret, Upstream,
+        from_raw,
     };
     use crate::data::{TieringRule, UpstreamId};
     use rootcause::Report;
@@ -332,6 +333,43 @@ mod tests {
                 .s3_secret
                 .0,
             var_val
+        );
+    }
+
+    fn raw_config(access_key: &str, rules: &[(&str, &str)]) -> RawConfig {
+        RawConfig {
+            listen: "127.0.0.1".to_string(),
+            metrics_listen: None,
+            db_path: PathBuf::default(),
+            upstreams: [(
+                "test".to_string(),
+                RawUpstream {
+                    order: 1,
+                    base_url: "http://localhost:3000".parse().unwrap(),
+                    addressing_style: AddressingStyle::Path,
+                    s3_access_key: access_key.to_string(),
+                    s3_secret: "secret".to_string(),
+                    region: "garage".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            tiering_rules: rules
+                .iter()
+                .map(|(to, when)| RawTieringRule {
+                    to: to.to_string(),
+                    when: when.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn env_prefix_must_start_the_value() {
+        let config = from_raw(raw_config("key-with-env:inside", &[])).unwrap();
+        assert_eq!(
+            config.upstreams.values().next().unwrap().s3_access_key,
+            "key-with-env:inside"
         );
     }
 }
