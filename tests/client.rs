@@ -394,3 +394,59 @@ async fn test_delete() -> Result<(), Report> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn object_headers_survive_a_copy() -> Result<(), Report> {
+    let g = backend().await?;
+    let bucket = bucket_name("test-object-headers");
+    let client = setup_bucket(g, &bucket).await?;
+
+    let payload = b"{\"compressed\": false}";
+    let source = S3ObjectId {
+        bucket: bucket.clone(),
+        key: "source.json".into(),
+    };
+    let headers = [
+        ("cache-control", "max-age=60"),
+        ("content-disposition", "attachment; filename=\"a.json\""),
+        ("content-encoding", "identity"),
+        ("content-language", "de"),
+        ("content-type", "application/json"),
+        ("x-amz-meta-owner", "someone"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()));
+    client
+        .put_file_with_headers(
+            &source,
+            Cursor::new(payload.to_vec()),
+            payload.len() as u64,
+            &headers,
+        )
+        .await?;
+
+    let download = client.download(&source).await?;
+    let mut got = download.headers.clone();
+    got.sort();
+    assert_eq!(got, headers.to_vec());
+
+    let target = S3ObjectId {
+        bucket,
+        key: "target.json".into(),
+    };
+    client
+        .put_file_with_headers(
+            &target,
+            download.data,
+            download.size.unwrap(),
+            &download.headers,
+        )
+        .await?;
+    let mut copy = client.download(&target).await?;
+    let mut copied = std::mem::take(&mut copy.headers);
+    copied.sort();
+    assert_eq!(copied, headers.to_vec());
+    let mut body = Vec::new();
+    copy.data.read_to_end(&mut body).await?;
+    assert_eq!(body, payload);
+    Ok(())
+}

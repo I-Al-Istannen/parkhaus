@@ -6,6 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
+use reqwest::header::CONTENT_LENGTH;
 use reqwest::{Client, Method, Response, StatusCode};
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail, report};
@@ -28,6 +29,23 @@ pub fn http_client() -> Result<Client, Report> {
         .build()
         .context("failed to build HTTP client")
         .map_err(Report::into_dynamic)
+}
+
+/// Headers describing an object, which a copy must keep (next to `x-amz-meta-*`).
+const OBJECT_HEADERS: [&str; 6] = [
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-type",
+    "expires",
+];
+
+pub struct Download<R> {
+    pub size: Option<u64>,
+    /// Content headers and user metadata of the object.
+    pub headers: Vec<(String, String)>,
+    pub data: R,
 }
 
 pub struct S3Client {
@@ -172,11 +190,23 @@ impl S3Client {
         data: impl AsyncRead + Unpin + Send + 'static,
         content_length: u64,
     ) -> Result<(), Report> {
+        self.put_file_with_headers(id, data, content_length, &[])
+            .await
+    }
+
+    /// Uploads with additional headers, e.g. the [`Download::headers`] of another copy.
+    pub async fn put_file_with_headers(
+        &self,
+        id: &S3ObjectId,
+        data: impl AsyncRead + Unpin + Send + 'static,
+        content_length: u64,
+        headers: &[(String, String)],
+    ) -> Result<(), Report> {
         let target = self.object_url(id)?;
 
-        let signed_headers = self
-            .signing
-            .sign_streaming(StreamingSignRequest::now(&target, content_length))?;
+        let signed_headers = self.signing.sign_streaming(
+            StreamingSignRequest::now(&target, content_length).with_extra_headers(headers),
+        )?;
 
         let body = reqwest::Body::wrap_stream(chunked_upload_stream(data));
 
@@ -184,6 +214,7 @@ impl S3Client {
             .client
             .put(target.url.clone())
             .headers(signed_headers)
+            .header(CONTENT_LENGTH, chunked_upload_length(content_length))
             .body(body)
             .send()
             .await
@@ -207,13 +238,36 @@ impl S3Client {
         &self,
         id: &S3ObjectId,
     ) -> Result<(Option<u64>, impl AsyncRead + use<>), Report> {
+        let download = self.download(id).await?;
+        Ok((download.size, download.data))
+    }
+
+    pub async fn download(
+        &self,
+        id: &S3ObjectId,
+    ) -> Result<Download<impl AsyncRead + use<>>, Report> {
         let url = self.object_url(id)?;
         let response = self.signed_get(&url, &[]).await?;
-        let content_length = response.content_length();
+        let size = response.content_length();
+
+        let mut headers = Vec::new();
+        for (name, value) in response.headers() {
+            if OBJECT_HEADERS.contains(&name.as_str()) || name.as_str().starts_with("x-amz-meta-") {
+                let value = value
+                    .to_str()
+                    .context("object header is not visible ASCII")
+                    .attach(format!("header: {name}"))
+                    .attach(format!("object: {id}"))?;
+                headers.push((name.to_string(), value.to_string()));
+            }
+        }
 
         let bytes_stream = response.bytes_stream().map_err(std::io::Error::other);
-
-        Ok((content_length, StreamReader::new(bytes_stream)))
+        Ok(Download {
+            size,
+            headers,
+            data: StreamReader::new(bytes_stream),
+        })
     }
 
     pub async fn head_file(&self, id: &S3ObjectId) -> Result<ObjectInfo, Report> {
@@ -395,6 +449,16 @@ impl S3Client {
 
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
+/// The length of [`chunked_upload_stream`] for `decoded` bytes of data.
+fn chunked_upload_length(decoded: u64) -> u64 {
+    let chunk = |len: u64| format!("{len:x}").len() as u64 + len + 4;
+    let full = decoded / CHUNK_SIZE as u64;
+    let rest = decoded % CHUNK_SIZE as u64;
+    // "0\r\n" and "x-amz-checksum-sha256:<44 base64 chars>\r\n\r\n"
+    let trailer = 3 + "x-amz-checksum-sha256:".len() as u64 + 44 + 4;
+    full * chunk(CHUNK_SIZE as u64) + if rest > 0 { chunk(rest) } else { 0 } + trailer
+}
+
 fn chunked_upload_stream(
     reader: impl AsyncRead + Unpin,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, Report>> {
@@ -538,11 +602,34 @@ async fn check_status(response: Response, method: &Method, url: &Url) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use crate::s3::client::{AddressingStyle, S3Client};
+    use crate::s3::client::{
+        AddressingStyle, CHUNK_SIZE, S3Client, chunked_upload_length, chunked_upload_stream,
+    };
+    use futures_util::TryStreamExt;
     use reqwest::Client;
     use rootcause::Report;
     use std::collections::BTreeMap;
     use url::Url;
+
+    #[tokio::test]
+    async fn chunked_upload_length_matches_stream() -> Result<(), Report> {
+        for len in [
+            0,
+            1,
+            4095,
+            CHUNK_SIZE - 1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            3 * CHUNK_SIZE,
+        ] {
+            let encoded: Vec<Vec<u8>> = chunked_upload_stream(std::io::Cursor::new(vec![7u8; len]))
+                .try_collect()
+                .await?;
+            let encoded = encoded.concat().len() as u64;
+            assert_eq!(encoded, chunked_upload_length(len as u64), "length {len}");
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_list_objects_url_with_continuation_token() -> Result<(), Report> {

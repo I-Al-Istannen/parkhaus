@@ -242,13 +242,15 @@ async fn copy(
     target: &Upstream,
     object: &S3ObjectId,
 ) -> Result<(), Report> {
-    let (size, data) = S3Client::for_upstream(http.clone(), source)
-        .get_file(object)
+    let download = S3Client::for_upstream(http.clone(), source)
+        .download(object)
         .await
         .context("failed to download object from source upstream")?;
-    let size = size.context("source upstream did not report the object size")?;
+    let size = download
+        .size
+        .context("source upstream did not report the object size")?;
     S3Client::for_upstream(http.clone(), target)
-        .put_file(object, data, size)
+        .put_file_with_headers(object, download.data, size, &download.headers)
         .await
         .context("failed to upload object to target upstream")
         .map_err(Report::into_dynamic)

@@ -115,6 +115,14 @@ exposed as the `reconcile_discrepancies` metric) compares the upstreams with
 the database and reports every object where they disagree. With the
 requirements above it should never find anything.
 
+### Migrations
+A migration copies the object body, its content headers (`Content-Type`,
+`Content-Encoding`, `Content-Disposition`, `Content-Language`, `Cache-Control`,
+`Expires`) and its user metadata (`x-amz-meta-*`). It does not copy tags or
+ACLs. The copy gets a new `Last-Modified` and, for objects uploaded in parts, a
+new `ETag`. Objects are copied in a single PUT, so backends that limit PUTs to
+5 GiB cannot receive larger objects.
+
 ## Config format
 
 You can interpolate environment variables (e.g. for secret keys) by using

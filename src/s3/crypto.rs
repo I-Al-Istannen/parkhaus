@@ -107,6 +107,7 @@ pub struct StreamingSignRequest<'a> {
     target: &'a ForwardObjectUrl,
     decoded_content_length: u64,
     current_time: Timestamp,
+    extra_headers: &'a [(String, String)],
 }
 
 impl<'a> StreamingSignRequest<'a> {
@@ -119,11 +120,18 @@ impl<'a> StreamingSignRequest<'a> {
             target,
             decoded_content_length,
             current_time,
+            extra_headers: &[],
         }
     }
 
     pub fn now(target: &'a ForwardObjectUrl, decoded_content_length: u64) -> Self {
         Self::new(target, decoded_content_length, Timestamp::now())
+    }
+
+    /// Additional headers to send and sign. A `content-encoding` is appended to `aws-chunked`.
+    pub fn with_extra_headers(mut self, extra_headers: &'a [(String, String)]) -> Self {
+        self.extra_headers = extra_headers;
+        self
     }
 }
 
@@ -154,15 +162,24 @@ impl SigningConfig {
 
     pub fn sign_streaming(&self, request: StreamingSignRequest<'_>) -> Result<HeaderMap, Report> {
         let decoded_len_str = request.decoded_content_length.to_string();
+        let mut content_encoding = "aws-chunked".to_string();
+        let mut headers = vec![
+            ("x-amz-decoded-content-length", decoded_len_str.as_str()),
+            ("x-amz-sdk-checksum-algorithm", "SHA256"),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+        ];
+        for (name, value) in request.extra_headers {
+            if name.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = format!("{content_encoding},{value}");
+            } else {
+                headers.push((name, value));
+            }
+        }
+        headers.push(("content-encoding", &content_encoding));
         self.sign_impl(
             SignRequest::new(Method::PUT, request.target, request.current_time)
                 .with_payload_hash(STREAMING_UNSIGNED_PAYLOAD_TRAILER)
-                .with_extra_headers(&[
-                    ("content-encoding", "aws-chunked"),
-                    ("x-amz-decoded-content-length", &decoded_len_str),
-                    ("x-amz-sdk-checksum-algorithm", "SHA256"),
-                    ("x-amz-trailer", "x-amz-checksum-sha256"),
-                ]),
+                .with_extra_headers(&headers),
         )?
         .headers()
     }
