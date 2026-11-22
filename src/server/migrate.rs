@@ -2,7 +2,7 @@ use super::metrics::MigrationMetrics;
 use crate::config::{Config, Upstream, UpstreamId};
 use crate::data::{PendingMigration, S3ObjectId};
 use crate::db::{Database, DirtyObject};
-use crate::s3::client::S3Client;
+use crate::s3::client::{S3Client, is_upstream_unavailable};
 use crate::server::resolve::{resolve, sweep};
 use crate::server::state::KeyLocks;
 use crate::server::uploads::reap_abandoned_uploads;
@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 const SAMPLE_ERRORS: usize = 50;
-/// A route that keeps failing is likely down, so trying the rest of its objects only wastes
-/// downloads from the source.
+/// A route whose upstreams keep being unavailable is likely down, so trying the rest of its objects
+/// only waits for timeouts.
 const MAX_FAILURES_IN_A_ROW: usize = 5;
 
 pub async fn migration_task(
@@ -149,7 +149,11 @@ pub async fn execute_migrations(
                 debug!(%e, "Failed to execute pending migration");
                 metrics.failed(migration);
                 failed += 1;
-                *route_failures += 1;
+                *route_failures = if is_upstream_unavailable(&e) {
+                    *route_failures + 1
+                } else {
+                    0
+                };
                 if *route_failures == MAX_FAILURES_IN_A_ROW {
                     warn!(
                         from = %route.0,

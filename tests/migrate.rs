@@ -602,6 +602,45 @@ async fn failing_routes_are_skipped_for_the_rest_of_the_pass() -> Result<(), Rep
 }
 
 #[tokio::test]
+async fn missing_objects_do_not_skip_the_route() -> Result<(), Report> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let router = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+    tokio::spawn(async { axum::serve(listener, router).await });
+
+    let db = Database::in_memory().await?;
+    let objects: Vec<_> = (0..20).map(|i| hot_object("a", &format!("k{i}"))).collect();
+    for object in &objects {
+        db.record_creation(object).await?;
+    }
+    let base = test_config()?;
+    let mut upstreams: Vec<_> = base.upstreams.into_values().collect();
+    for upstream in &mut upstreams {
+        upstream.base_url = base_url.parse()?;
+    }
+    let config = Config::new(
+        base.listen,
+        None,
+        base.db_path,
+        upstreams,
+        base.tiering_rules,
+    )?;
+    let pending = objects
+        .iter()
+        .map(|object| PendingMigration {
+            object: object.id.clone(),
+            source_upstream: UpstreamId(Tier::Hot.to_string()),
+            target_upstream: UpstreamId(Tier::Cold.to_string()),
+        })
+        .collect();
+
+    let failed =
+        execute_migrations(pending, &config, &db, &Client::new(), &KeyLocks::default()).await?;
+    assert_eq!(failed, 20);
+    Ok(())
+}
+
+#[tokio::test]
 async fn plain_numbers_are_seconds() -> Result<(), Report> {
     let mut object = hot_object("a", "k");
     object.last_modified = Zoned::now().timestamp() - Span::new().hours(2);

@@ -31,6 +31,30 @@ pub fn http_client() -> Result<Client, Report> {
         .map_err(Report::into_dynamic)
 }
 
+/// The status an upstream answered a failed request with.
+#[derive(Debug)]
+pub struct UpstreamStatus(pub StatusCode);
+
+impl std::fmt::Display for UpstreamStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "status: {}", self.0)
+    }
+}
+
+/// Whether the error says the upstream is unreachable or overloaded, rather than that the request
+/// itself failed.
+pub fn is_upstream_unavailable(report: &Report) -> bool {
+    report.iter_reports().any(|node| {
+        node.downcast_current_context::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
+            || node.attachments().iter().any(|it| {
+                it.downcast_inner::<UpstreamStatus>().is_some_and(|it| {
+                    it.0.is_server_error() || it.0 == StatusCode::TOO_MANY_REQUESTS
+                })
+            })
+    })
+}
+
 /// Headers describing an object, which a copy must keep (next to `x-amz-meta-*`).
 const OBJECT_HEADERS: [&str; 6] = [
     "cache-control",
@@ -226,7 +250,7 @@ impl S3Client {
             let text = response.text().await.unwrap_or_default();
             return Err(report!("failed S3 request")
                 .attach("method: streaming PUT")
-                .attach(format!("status: {status}"))
+                .attach(UpstreamStatus(status))
                 .attach(format!("url: {}", target.url))
                 .attach(format!("response body: {text}")));
         }
@@ -367,7 +391,7 @@ impl S3Client {
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             return Err(report!("S3 delete failed")
-                .attach(format!("status: {status}"))
+                .attach(UpstreamStatus(status))
                 .attach(format!("object: {id}"))
                 .attach(format!("response body: {text}")));
         }
@@ -595,7 +619,7 @@ async fn check_status(response: Response, method: &Method, url: &Url) -> Result<
         .context("failed to read S3 response body")?;
     Err(report!("failed S3 request")
         .attach(format!("method: {method}"))
-        .attach(format!("status: {status}"))
+        .attach(UpstreamStatus(status))
         .attach(format!("url: {url}"))
         .attach(format!("response body: {body}")))
 }
