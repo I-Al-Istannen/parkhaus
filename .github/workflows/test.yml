@@ -102,7 +102,7 @@ jobs:
       run: |
         # Best effort upload parallel to build
         attic watch-store parkhaus &
-        nix-fast-build --no-nom --flake ".#packages.$(nix eval --raw --impure --expr builtins.currentSystem).docker"
+        nix-fast-build --no-nom --out-link result --flake ".#packages.$(nix eval --raw --impure --expr builtins.currentSystem).docker"
         mv result- result
         sha256sum result
     - name: Load docker image
