@@ -14,8 +14,8 @@ pub struct TieringRuleEnv;
 impl TieringRuleEnv {
     pub fn synthesize_variable_sql(name: &str, now_var: &str) -> String {
         match name {
-            "age" => format!("({now_var} - last_modified)"),
-            "last_accessed" => format!("({now_var} - last_accessed)"),
+            "age" => format!("({now_var} - last_modified / 1000)"),
+            "last_accessed" => format!("({now_var} - last_accessed / 1000)"),
             "bucket" => "bucket".to_string(),
             "object" => "(bucket || '/' || key)".to_string(),
             "key" => "key".to_string(),
@@ -41,7 +41,8 @@ impl TieringRuleEnv {
                     "(SELECT COALESCE(SUM(count), 0) FROM AccessCounters WHERE \
                         obj_bucket = bucket AND \
                         obj_key = key AND \
-                        time_bucket BETWEEN ({now_var} - {} - 86400000) AND ({now_var} - {}))",
+                        time_bucket BETWEEN (({now_var} - {} - 86400) * 1000) \
+                        AND (({now_var} - {}) * 1000))",
                     args[1], args[0]
                 )
             }
@@ -334,7 +335,7 @@ pub(super) async fn get_pending_migrations_for_rule(
         query = match arg {
             SqlArgument::String(str) => query.bind(str),
             SqlArgument::Number(num) => query.bind(num),
-            SqlArgument::TimeSpan(num) => query.bind(num * 1000),
+            SqlArgument::TimeSpan(num) => query.bind(num),
             SqlArgument::Bool(b) => query.bind(b),
         };
     }

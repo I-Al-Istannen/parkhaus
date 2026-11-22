@@ -600,3 +600,15 @@ async fn failing_routes_are_skipped_for_the_rest_of_the_pass() -> Result<(), Rep
     assert_eq!(failed, 5);
     Ok(())
 }
+
+#[tokio::test]
+async fn plain_numbers_are_seconds() -> Result<(), Report> {
+    let mut object = hot_object("a", "k");
+    object.last_modified = Zoned::now().timestamp() - Span::new().hours(2);
+    let objects = [object];
+    let old = pending_for(&[(Tier::Cold, "age > 3600")], &objects).await?;
+    assert_eq!(old, vec!["a/k->Cold".to_string()]);
+    let young = pending_for(&[(Tier::Cold, "age > 10800")], &objects).await?;
+    assert!(young.is_empty(), "{young:?}");
+    Ok(())
+}
