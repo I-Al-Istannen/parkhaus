@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO AccessCounters\n            (obj_bucket, obj_key, time_bucket, count)\n        SELECT bucket, key, ?, ? FROM Objects WHERE bucket = ? AND key = ?\n        ON CONFLICT DO UPDATE SET\n            count = count + excluded.count\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "af9cff9a5b6595b3b9fba3883b719b3e21b85d43a80c5a5e822b83d1128ade17"
+}

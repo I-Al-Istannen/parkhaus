@@ -12,6 +12,7 @@ pub const COUNTER_UPSTREAM_FORWARDS_TOTAL: &str = "upstream_forwards_total";
 pub const COUNTER_UPSTREAM_FALLBACKS_TOTAL: &str = "upstream_fallbacks_total";
 pub const COUNTER_OBJECT_CREATIONS_TOTAL: &str = "object_creations_total";
 pub const COUNTER_OBJECT_DELETIONS_TOTAL: &str = "object_deletions_total";
+pub const COUNTER_ACCESSES_DROPPED_TOTAL: &str = "accesses_dropped_total";
 
 type MigrationMetricKey = (UpstreamId, UpstreamId, MigrationMetricState);
 
@@ -153,6 +154,10 @@ pub fn initialize_metrics() {
     describe_gauge!(
         GAUGE_RECONCILE_DISCREPANCIES,
         "Objects whose location in the database disagrees with the upstreams at the last reconciliation"
+    );
+    describe_counter!(
+        COUNTER_ACCESSES_DROPPED_TOTAL,
+        "Accesses not recorded because the database fell behind"
     );
     describe_counter!(
         COUNTER_OBJECT_DELETIONS_TOTAL,

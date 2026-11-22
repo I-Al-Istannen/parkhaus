@@ -7,6 +7,7 @@ use sqlx::{SqliteConnection, query};
 pub(super) async fn record_access(
     con: &mut SqliteConnection,
     object: &S3ObjectId,
+    count: i64,
     now: &Zoned,
 ) -> Result<(), Report> {
     let time_bucket = to_time_bucket_ms(now)?;
@@ -14,13 +15,14 @@ pub(super) async fn record_access(
         r#"
         INSERT INTO AccessCounters
             (obj_bucket, obj_key, time_bucket, count)
-        VALUES (?, ?, ?, 1)
+        SELECT bucket, key, ?, ? FROM Objects WHERE bucket = ? AND key = ?
         ON CONFLICT DO UPDATE SET
-            count = count + 1
+            count = count + excluded.count
         "#,
+        time_bucket,
+        count,
         object.bucket,
-        object.key,
-        time_bucket
+        object.key
     )
     .execute(&mut *con)
     .await

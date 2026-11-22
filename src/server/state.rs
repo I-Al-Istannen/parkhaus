@@ -7,6 +7,7 @@ use tokio::sync::OwnedMutexGuard;
 use crate::config::Config;
 use crate::data::S3ObjectId;
 use crate::db::Database;
+use crate::server::accesses::AccessRecorder;
 use crate::server::listing::ListingStore;
 
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct AppState {
     pub http: Client,
     pub key_locks: KeyLocks,
     pub listings: ListingStore,
+    pub accesses: AccessRecorder,
 }
 
 /// Serializes everything that changes where an object lives: client mutations, the resolution of

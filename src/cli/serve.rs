@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::cli::logging::env_filter;
 use crate::config::Config;
 use crate::db::Database;
+use crate::server::accesses::AccessRecorder;
 use crate::server::endpoints;
 use crate::server::listing::ListingStore;
 use crate::server::metrics::initialize_metrics;
@@ -105,6 +106,7 @@ async fn start_main_server(
 
     let app_state = AppState {
         config: Arc::clone(&config),
+        accesses: AccessRecorder::spawn(db.clone()),
         db,
         http,
         key_locks,

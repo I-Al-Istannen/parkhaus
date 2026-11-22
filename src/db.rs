@@ -17,14 +17,15 @@ use sqlx::sqlite::{
 use sqlx::{ConnectOptions, Connection, Pool, Sqlite, query, query_scalar};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+/// Reads use a pool and see a consistent snapshot thanks to WAL. Writes share a single
+/// connection, so they never fail on a locked database.
 #[derive(Debug, Clone)]
 pub struct Database {
-    pub con: Arc<RwLock<Pool<Sqlite>>>,
+    reads: Pool<Sqlite>,
+    writes: Pool<Sqlite>,
     path: Option<PathBuf>,
 }
 
@@ -48,33 +49,44 @@ impl Database {
             )
             .await?;
 
-        Self::new_impl(pool, None).await
+        Self::migrate(&pool).await?;
+        Ok(Self {
+            reads: pool.clone(),
+            writes: pool,
+            path: None,
+        })
     }
 
     pub async fn new(path: &Path) -> Result<Self, Report> {
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::default()
-                .foreign_keys(true)
-                .create_if_missing(true)
-                .read_only(false)
-                .journal_mode(SqliteJournalMode::Wal)
-                .optimize_on_close(true, None)
-                .synchronous(SqliteSynchronous::Normal)
-                .pragma("temp_store", "memory")
-                .pragma("mmap_size", "30000000000")
-                .filename(path)
-                .with_regexp(),
-        )
-        .await?;
+        let options = SqliteConnectOptions::default()
+            .foreign_keys(true)
+            .create_if_missing(true)
+            .read_only(false)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("temp_store", "memory")
+            .pragma("mmap_size", "30000000000")
+            .filename(path)
+            .with_regexp();
+        let writes = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone().optimize_on_close(true, None))
+            .await?;
+        Self::migrate(&writes).await?;
+        let reads = SqlitePool::connect_with(options.read_only(true)).await?;
 
-        Self::new_impl(pool, Some(path.to_path_buf())).await
+        Ok(Self {
+            reads,
+            writes,
+            path: Some(path.to_path_buf()),
+        })
     }
 
-    async fn new_impl(pool: Pool<Sqlite>, path: Option<PathBuf>) -> Result<Self, Report> {
-        let applied = Self::applied_migrations(&pool).await;
-        sqlx::migrate!().run(&pool).await?;
+    async fn migrate(pool: &SqlitePool) -> Result<(), Report> {
+        let applied = Self::applied_migrations(pool).await;
+        sqlx::migrate!().run(pool).await?;
 
-        if Self::applied_migrations(&pool).await != applied {
+        if Self::applied_migrations(pool).await != applied {
             // Needs up to twice the size of the database on disk:
             // https://sqlite.org/lang_vacuum.html#how_vacuum_works
             query!("VACUUM")
@@ -84,11 +96,7 @@ impl Database {
                 .execute(&mut *pool.acquire().await?)
                 .await?;
         }
-
-        Ok(Self {
-            con: Arc::new(RwLock::new(pool)),
-            path,
-        })
+        Ok(())
     }
 
     async fn applied_migrations(pool: &SqlitePool) -> i64 {
@@ -98,12 +106,12 @@ impl Database {
             .unwrap_or(0)
     }
 
-    async fn read(&self) -> RwLockReadGuard<'_, SqlitePool> {
-        self.con.read().await
+    async fn read(&self) -> &SqlitePool {
+        &self.reads
     }
 
-    async fn write(&self) -> RwLockWriteGuard<'_, SqlitePool> {
-        self.con.write().await
+    async fn write(&self) -> &SqlitePool {
+        &self.writes
     }
 
     pub async fn get_object(&self, obj: &S3ObjectId) -> Result<S3Object, Report> {
@@ -137,9 +145,22 @@ impl Database {
     }
 
     pub async fn record_access(&self, obj: &S3ObjectId, now: &Zoned) -> Result<(), Report> {
+        self.record_accesses(&[(obj.clone(), 1)], now).await
+    }
+
+    /// Adds `count` accesses to each known object, ignoring unknown ones.
+    pub async fn record_accesses(
+        &self,
+        accesses: &[(S3ObjectId, i64)],
+        now: &Zoned,
+    ) -> Result<(), Report> {
         let con = self.write().await;
-        access_times::record_access(&mut *con.acquire().await.context("acquire con")?, obj, now)
-            .await
+        let mut transaction = con.begin().await.context("begin transaction")?;
+        for (obj, count) in accesses {
+            access_times::record_access(&mut transaction, obj, *count, now).await?;
+        }
+        transaction.commit().await.context("commit accesses")?;
+        Ok(())
     }
 
     /// This calls [record_creation] for all objects in batches. It also updates the progress bar
@@ -318,7 +339,8 @@ impl Database {
 
     pub async fn close(self) -> Result<(), Report> {
         // Close the existing connection to ensure it does not block cleanup
-        self.write().await.close().await;
+        self.reads.close().await;
+        self.writes.close().await;
 
         if let Some(path) = self.path.as_ref() {
             // Clean up WAL files. This should happen above but sqlx does not correctly close sqlite

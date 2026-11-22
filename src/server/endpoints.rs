@@ -18,8 +18,7 @@ use axum::http::response::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
-use jiff::{Timestamp, Zoned};
-use rootcause::Report;
+use jiff::Timestamp;
 use rootcause::prelude::ResultExt;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -94,7 +93,7 @@ async fn proxy_object_request(
     }
     let on_success = async {
         match &op {
-            ObjectOp::Read => drop(tokio::spawn(record_access(state.clone(), object_id))),
+            ObjectOp::Read => state.accesses.record(object_id),
             ObjectOp::AbortMultipart { upload_id } => {
                 if let Err(e) = state.db.remove_upload(upload_id).await {
                     warn!(%e, %upload_id, "failed to forget aborted multipart upload");
@@ -234,7 +233,7 @@ async fn mutate(
             warn!(%e, %upload_id, "failed to forget completed multipart upload");
         }
         if op != ObjectOp::Delete {
-            record_access(state.clone(), object_id).await;
+            state.accesses.record(object_id);
         }
     }
     Ok(response.into_response())
@@ -396,18 +395,6 @@ fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
         .filter(|value| !value.is_empty())
         .filter_map(|value| HeaderName::from_bytes(value.as_bytes()).ok())
         .collect()
-}
-
-async fn record_access(state: AppState, object_id: S3ObjectId) {
-    let recording = async {
-        if state.db.has_object(&object_id).await? {
-            state.db.record_access(&object_id, &Zoned::now()).await?;
-        }
-        Ok::<_, Report>(())
-    };
-    if let Err(e) = recording.await {
-        warn!(%e, %object_id, "failed to record access");
-    }
 }
 
 #[cfg(test)]

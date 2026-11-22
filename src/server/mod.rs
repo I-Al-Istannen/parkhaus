@@ -1,3 +1,4 @@
+pub mod accesses;
 mod batch_delete;
 mod classify;
 pub(super) mod endpoints;
