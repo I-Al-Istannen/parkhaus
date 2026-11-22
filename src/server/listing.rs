@@ -38,6 +38,7 @@ use url::form_urlencoded;
 
 /// Idle time after which a paused listing is forgotten. Every page fetched refreshes it.
 const LISTING_TTL: SignedDuration = SignedDuration::from_hours(1);
+const MAX_PAUSED_LISTINGS: usize = 1024;
 const MAX_PAGE_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_KEYS: usize = 1000;
 
@@ -107,10 +108,14 @@ impl ListingStore {
             params: listing.params.clone(),
             token,
         };
-        self.lock_pruned().entry(key).or_default().push(Paused {
+        let mut paused = self.lock_pruned();
+        paused.entry(key).or_default().push(Paused {
             since: Timestamp::now(),
             listing,
         });
+        if paused.values().map(Vec::len).sum::<usize>() > MAX_PAUSED_LISTINGS {
+            evict_oldest(&mut paused);
+        }
     }
 
     fn lock_pruned(&self) -> MutexGuard<'_, HashMap<TokenKey, Vec<Paused>>> {
@@ -124,7 +129,29 @@ impl ListingStore {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+/// A client resuming an evicted listing gets an error, which is better than running out of memory.
+fn evict_oldest(paused: &mut HashMap<TokenKey, Vec<Paused>>) {
+    let oldest = paused
+        .iter()
+        .flat_map(|(key, listings)| {
+            listings
+                .iter()
+                .enumerate()
+                .map(move |(i, it)| (it.since, key, i))
+        })
+        .min_by_key(|(since, _, _)| *since)
+        .map(|(_, key, i)| (key.clone(), i));
+    if let Some((key, index)) = oldest
+        && let Some(listings) = paused.get_mut(&key)
+    {
+        listings.remove(index);
+        if listings.is_empty() {
+            paused.remove(&key);
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
 struct TokenKey {
     params: ListParams,
     token: String,
@@ -509,11 +536,12 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::{
-        Continuation, LISTING_TTL, ListParams, Listing, ListingStore, TokenKey, UpstreamPage,
+        Continuation, LISTING_TTL, ListParams, Listing, ListingStore, MAX_PAUSED_LISTINGS,
+        TokenKey, UpstreamPage,
     };
     use crate::config::UpstreamId;
     use axum::body::Bytes;
-    use jiff::Timestamp;
+    use jiff::{SignedDuration, Timestamp};
 
     fn page(keys: &[&str], prefixes: &[&str], next_token: Option<&str>) -> UpstreamPage {
         let mut xml = String::from(
@@ -607,6 +635,29 @@ mod tests {
         assert!(listings.claim(&token_key("bucket", "expired")).is_none());
         assert!(listings.claim(&token_key("bucket", "active")).is_some());
         assert!(listings.paused.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evicts_the_oldest_listing_when_full() {
+        let listings = ListingStore::default();
+        for i in 0..MAX_PAUSED_LISTINGS {
+            listings.register(i.to_string(), listing(1, Vec::new()));
+        }
+        listings
+            .paused
+            .lock()
+            .unwrap()
+            .get_mut(&token_key("bucket", "0"))
+            .unwrap()[0]
+            .since = Timestamp::now() - SignedDuration::from_mins(1);
+        listings.register(MAX_PAUSED_LISTINGS.to_string(), listing(1, Vec::new()));
+        assert!(listings.claim(&token_key("bucket", "0")).is_none());
+        assert!(listings.claim(&token_key("bucket", "1")).is_some());
+        assert!(
+            listings
+                .claim(&token_key("bucket", &MAX_PAUSED_LISTINGS.to_string()))
+                .is_some()
+        );
     }
 
     #[test]
