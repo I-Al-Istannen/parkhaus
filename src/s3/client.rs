@@ -134,11 +134,11 @@ impl S3Client {
     ) -> Result<(), Report> {
         let target = self.object_url(id)?;
 
-        let (signed_headers, chunk_signer) = self
+        let signed_headers = self
             .signing
             .sign_streaming(StreamingSignRequest::now(&target, content_length))?;
 
-        let body = reqwest::Body::wrap_stream(chunked_upload_stream(data, chunk_signer));
+        let body = reqwest::Body::wrap_stream(chunked_upload_stream(data));
 
         let response = self
             .client
@@ -328,11 +328,9 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 
 fn chunked_upload_stream(
     reader: impl AsyncRead + Unpin,
-    signer: super::crypto::ChunkSigner,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, Report>> {
     struct ChunkState<R> {
         reader: R,
-        signer: super::crypto::ChunkSigner,
         buf: Vec<u8>,
         checksum: sha2::Sha256,
         done: bool,
@@ -340,7 +338,6 @@ fn chunked_upload_stream(
 
     let state = ChunkState {
         reader: BufReader::new(reader),
-        signer,
         buf: vec![0u8; CHUNK_SIZE],
         checksum: sha2::Sha256::new(),
         done: false,
@@ -363,8 +360,7 @@ fn chunked_upload_stream(
 
         if written > 0 {
             state.checksum.update(&state.buf[..written]);
-            let sig = state.signer.sign_chunk(&state.buf[..written]);
-            write!(chunk, "{written:x};chunk-signature={sig}\r\n").unwrap();
+            write!(chunk, "{written:x}\r\n").unwrap();
             chunk.extend_from_slice(&state.buf[..written]);
             chunk.extend_from_slice(b"\r\n");
         }
@@ -372,12 +368,8 @@ fn chunked_upload_stream(
         if written < CHUNK_SIZE {
             // https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html#trailing-checksums-trailer-chunks
             let checksum_base64 = STANDARD.encode(state.checksum.clone().finalize());
-            let (final_sig, trailer_signature) =
-                state.signer.sign_final_chunk_and_trailer(&checksum_base64);
-
-            write!(chunk, "0;chunk-signature={final_sig}\r\n").unwrap();
-            write!(chunk, "x-amz-checksum-sha256:{checksum_base64}\r\n").unwrap();
-            write!(chunk, "x-amz-trailer-signature:{trailer_signature}\r\n\r\n").unwrap();
+            write!(chunk, "0\r\n").unwrap();
+            write!(chunk, "x-amz-checksum-sha256:{checksum_base64}\r\n\r\n").unwrap();
             state.done = true;
         }
 

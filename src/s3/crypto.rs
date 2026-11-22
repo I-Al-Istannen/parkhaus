@@ -25,9 +25,11 @@ const SIGV4_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 // is not encoded.
 const SIGV4_ENCODE_SET_NAME: &AsciiSet = &SIGV4_ENCODE_SET.remove(b'/');
 
-const STREAMING_PAYLOAD_TRAILER_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+// Unsigned chunks with a SHA-256 trailer. Garage computes signed trailers differently from the
+// AWS spec, so a signed trailer cannot satisfy both. The checksum still guards integrity.
+// https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming-trailers.html
+const STREAMING_UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const CHECKSUM_TRAILER_HEADER: &str = "x-amz-checksum-sha256";
 
 #[derive(Debug, Clone)]
 struct SigningResult {
@@ -35,9 +37,6 @@ struct SigningResult {
     host: String,
     amz_date: String,
     authorization: String,
-    signature: String,
-    scope: String,
-    signing_key: Vec<u8>,
     extra_headers: Vec<(String, String)>,
 }
 
@@ -67,54 +66,6 @@ impl SigningResult {
             );
         }
         Ok(headers)
-    }
-}
-
-pub struct ChunkSigner {
-    signing_key: Vec<u8>,
-    scope: String,
-    amz_date: String,
-    previous_signature: String,
-}
-
-impl ChunkSigner {
-    pub fn sign_chunk(&mut self, chunk_data: &[u8]) -> String {
-        let chunk_hash = hex::encode(Sha256::digest(chunk_data));
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{chunk_hash}",
-            self.amz_date, self.scope, self.previous_signature,
-        );
-        let signature = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
-        self.previous_signature.clone_from(&signature);
-        signature
-    }
-
-    /// Signs the empty final chunk and the trailing headers.
-    ///
-    /// Returns `(final_chunk_sig, trailer_sig)`. The trailer signature is computed
-    /// using the last *data* chunk's signature as the previous.
-    pub fn sign_final_chunk_and_trailer(&mut self, checksum_base64: &str) -> (String, String) {
-        // Compute the empty terminal chunk signature (sig2 = sign(prev=sig1, data=empty))
-        let final_chunk_sig = {
-            let empty_hash = EMPTY_SHA256;
-            let sts = format!(
-                "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{empty_hash}",
-                self.amz_date, self.scope, self.previous_signature,
-            );
-            hex::encode(hmac_sha256(&self.signing_key, sts.as_bytes()))
-        };
-
-        // Compute the trailer signature using *current* previous_signature (sig1),
-        // NOT sig2.
-        let canonical_trailer = format!("{CHECKSUM_TRAILER_HEADER}:{checksum_base64}\n");
-        let trailing_headers_hash = hex::encode(Sha256::digest(canonical_trailer.as_bytes()));
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{trailing_headers_hash}",
-            self.amz_date, self.scope, self.previous_signature,
-        );
-        let trailer_sig = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
-
-        (final_chunk_sig, trailer_sig)
     }
 }
 
@@ -201,30 +152,19 @@ impl SigningConfig {
         res.headers()
     }
 
-    pub fn sign_streaming(
-        &self,
-        request: StreamingSignRequest<'_>,
-    ) -> Result<(HeaderMap, ChunkSigner), Report> {
+    pub fn sign_streaming(&self, request: StreamingSignRequest<'_>) -> Result<HeaderMap, Report> {
         let decoded_len_str = request.decoded_content_length.to_string();
-        let signed = self.sign_impl(
+        self.sign_impl(
             SignRequest::new(Method::PUT, request.target, request.current_time)
-                .with_payload_hash(STREAMING_PAYLOAD_TRAILER_HASH)
+                .with_payload_hash(STREAMING_UNSIGNED_PAYLOAD_TRAILER)
                 .with_extra_headers(&[
                     ("content-encoding", "aws-chunked"),
                     ("x-amz-decoded-content-length", &decoded_len_str),
                     ("x-amz-sdk-checksum-algorithm", "SHA256"),
                     ("x-amz-trailer", "x-amz-checksum-sha256"),
                 ]),
-        )?;
-
-        let chunk_signer = ChunkSigner {
-            signing_key: signed.signing_key.clone(),
-            amz_date: signed.amz_date.clone(),
-            scope: signed.scope.clone(),
-            previous_signature: signed.signature.clone(),
-        };
-
-        Ok((signed.headers()?, chunk_signer))
+        )?
+        .headers()
     }
 
     fn sign_impl(&self, request: SignRequest<'_>) -> Result<SigningResult, Report> {
@@ -270,9 +210,6 @@ impl SigningConfig {
             host: host_header,
             amz_date,
             authorization,
-            signing_key,
-            scope,
-            signature,
             extra_headers: request
                 .extra_headers
                 .iter()
