@@ -3,11 +3,13 @@ use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId, is_addressable_key};
 use crate::db::Database;
 use crate::s3::client::{BucketInfo, S3Client};
+use crate::server::KeyLocks;
+use crate::server::reconcile::{Discrepancy, reconcile};
 use clap::Args;
 use regex::Regex;
 use reqwest::Client;
-use rootcause::Report;
 use rootcause::prelude::ResultExt;
+use rootcause::{Report, bail};
 use rootcause_tracing::RootcauseLayer;
 use std::sync::Arc;
 use tracing::{Instrument, Span, info, info_span, instrument, warn};
@@ -48,7 +50,9 @@ pub async fn run(config: Arc<Config>, db: Database, options: ImportOptions) -> R
 
     let client = crate::s3::client::http_client()?;
 
-    for (name, upstream) in &config.upstreams {
+    // Later imports overwrite earlier ones, so the hottest copy of a key wins.
+    for upstream in config.upstreams_in_order().into_iter().rev() {
+        let name = &upstream.name;
         if let Some(regex) = &options.upstream_regex
             && !regex.is_match(&name.0)
         {
@@ -61,6 +65,24 @@ pub async fn run(config: Arc<Config>, db: Database, options: ImportOptions) -> R
             .context(format!("failed to import from upstream {name}"))?;
     }
 
+    if options.bucket_regex.is_some() || options.upstream_regex.is_some() {
+        return Ok(());
+    }
+    // A stale copy on another upstream can win when a later change to the key fails.
+    let duplicates: Vec<_> = reconcile(&config, &db, &client, &KeyLocks::default())
+        .await?
+        .into_iter()
+        .filter(|it| matches!(it, Discrepancy::Stale { .. }))
+        .collect();
+    for duplicate in &duplicates {
+        warn!(%duplicate, "Found a stale copy");
+    }
+    if !duplicates.is_empty() {
+        bail!(
+            "{} stale copies exist next to the imported ones, delete them before running serve",
+            duplicates.len()
+        );
+    }
     Ok(())
 }
 

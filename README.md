@@ -40,7 +40,9 @@ colder or hotter storage, depending on their age.
    `parkhaus` will use these credentials.
 3. Run `parkhaus --config config.toml import` to import all existing objects.
    `parkhaus` treats objects it does not know as missing, so they are invisible
-   to clients until imported.
+   to clients until imported. If a key exists on several upstreams, the hottest
+   copy wins and `import` fails, listing the stale copies on colder upstreams.
+   Delete them before serving. Do not run `import` while `serve` is running.
 4. Run parkhaus via `parkhaus --config config.toml serve`.
 5. Configure parkhaus as upstream for your applications.
    Remember that `parkhaus` is a _transparent proxy_. This imposes a few unique

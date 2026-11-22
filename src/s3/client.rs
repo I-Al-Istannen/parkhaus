@@ -8,7 +8,7 @@ use futures_util::{TryStreamExt, stream};
 use jiff::Timestamp;
 use reqwest::{Client, Method, Response, StatusCode};
 use rootcause::prelude::ResultExt;
-use rootcause::{Report, report};
+use rootcause::{Report, bail, report};
 use serde::Deserialize;
 use sha2::Digest;
 use std::io::Write;
@@ -78,23 +78,38 @@ impl S3Client {
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Report> {
-        // we just assume this is not paginated, screw it.
-        let body = self
-            .signed_get(&ForwardObjectUrl::no_host(self.endpoint.clone()), &[])
-            .await
-            .context("failed to list buckets")?
-            .text()
-            .await
-            .context("failed to read ListBuckets response body")?;
-        let result: ListAllMyBucketsResult =
-            quick_xml::de::from_str(&body).context("failed to parse ListBuckets XML")?;
+        let mut buckets = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut target = ForwardObjectUrl::no_host(self.endpoint.clone());
+            if let Some(token) = &continuation_token {
+                target
+                    .url
+                    .query_pairs_mut()
+                    .append_pair("continuation-token", token);
+            }
+            let body = self
+                .signed_get(&target, &[])
+                .await
+                .context("failed to list buckets")?
+                .text()
+                .await
+                .context("failed to read ListBuckets response body")?;
+            let result: ListAllMyBucketsResult =
+                quick_xml::de::from_str(&body).context("failed to parse ListBuckets XML")?;
+            buckets.extend(
+                result
+                    .buckets
+                    .bucket
+                    .into_iter()
+                    .map(|b| BucketInfo { name: b.name }),
+            );
 
-        Ok(result
-            .buckets
-            .bucket
-            .into_iter()
-            .map(|b| BucketInfo { name: b.name })
-            .collect())
+            match result.continuation_token {
+                Some(token) if !token.is_empty() => continuation_token = Some(token),
+                _ => return Ok(buckets),
+            }
+        }
     }
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), Report> {
@@ -136,11 +151,13 @@ impl S3Client {
                 last_modified: it.last_modified,
             }));
 
-            if result.is_truncated == Some(true) {
-                continuation_token = result.next_continuation_token;
-            } else {
+            if result.is_truncated != Some(true) {
                 break;
             }
+            let Some(token) = result.next_continuation_token else {
+                bail!("truncated listing of bucket {bucket} has no continuation token");
+            };
+            continuation_token = Some(token);
 
             page_count += 1;
             Span::current().pb_set_message(&format!(" page {page_count}, {object_count} objects"));
@@ -450,6 +467,7 @@ async fn read_full(reader: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Res
 #[serde(rename_all = "PascalCase")]
 struct ListAllMyBucketsResult {
     buckets: Buckets,
+    continuation_token: Option<String>,
 }
 
 #[derive(Deserialize)]
