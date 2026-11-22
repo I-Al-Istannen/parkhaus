@@ -24,12 +24,12 @@ from rich.table import Table
 from e2e_utils import (
     BACKEND_PORT,
     BUCKET_NAME,
-    GARAGE_DEFAULT_ACCESS_KEY,
-    GARAGE_DEFAULT_SECRET_KEY,
+    S3_ACCESS_KEY,
+    S3_SECRET_KEY,
     Backend,
     Tier,
     Upstream,
-    create_garage_container,
+    create_upstream_container,
     error,
     info,
     render_config,
@@ -56,8 +56,8 @@ class Ctx:
         return boto3.client(
             "s3",
             endpoint_url=f"http://localhost:{BACKEND_PORT}",
-            aws_access_key_id=GARAGE_DEFAULT_ACCESS_KEY,
-            aws_secret_access_key=GARAGE_DEFAULT_SECRET_KEY,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
             config=Config(signature_version="s3v4"),
         )
 
@@ -1001,8 +1001,8 @@ def main() -> None:
     info("Starting S3 operations e2e test...")
 
     with (
-        create_garage_container("hot") as hot_container,
-        create_garage_container("cold") as cold_container,
+        create_upstream_container("hot") as hot_container,
+        create_upstream_container("cold") as cold_container,
         TemporaryDirectory(prefix="operations-e2e-") as temp_dir_str,
     ):
         buckets = [BUCKET_NAME]

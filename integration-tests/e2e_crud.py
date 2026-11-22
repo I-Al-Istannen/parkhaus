@@ -17,7 +17,7 @@ from e2e_utils import (
     Backend,
     Tier,
     Upstream,
-    create_garage_container,
+    create_upstream_container,
     info,
     render_config,
     start_backend,
@@ -186,8 +186,8 @@ def main() -> None:
     ]
 
     with (
-        create_garage_container("hot") as hot_container,
-        create_garage_container("cold") as cold_container,
+        create_upstream_container("hot") as hot_container,
+        create_upstream_container("cold") as cold_container,
         TemporaryDirectory(prefix="crud-e2e-") as temp_dir_str,
     ):
         info("Initializing upstreams...", level=2)
