@@ -728,8 +728,35 @@ def check_special_character_key(ctx: Ctx) -> None:
 # ---------------------------------------------------------------- multipart
 
 
-def check_list_multipart_uploads_rejected(ctx: Ctx) -> None:
-    expect_status(501, lambda: ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME))
+def check_list_multipart_uploads(ctx: Ctx) -> None:
+    prefix = ctx.key("list-uploads") + "/"
+    keys = [prefix + "a", prefix + "b", prefix + "dir/c"]
+    ids = {
+        key: ctx.s3.create_multipart_upload(Bucket=BUCKET_NAME, Key=key)["UploadId"]
+        for key in keys
+    }
+    try:
+        listed = ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME, Prefix=prefix)
+        assert [(it["Key"], it["UploadId"]) for it in listed["Uploads"]] == list(ids.items())
+
+        first = ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME, Prefix=prefix, MaxUploads=1)
+        assert first["IsTruncated"]
+        rest = ctx.s3.list_multipart_uploads(
+            Bucket=BUCKET_NAME,
+            Prefix=prefix,
+            KeyMarker=first["NextKeyMarker"],
+            UploadIdMarker=first["NextUploadIdMarker"],
+        )
+        assert [it["Key"] for it in first["Uploads"] + rest["Uploads"]] == keys
+
+        grouped = ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME, Prefix=prefix, Delimiter="/")
+        assert [it["Key"] for it in grouped["Uploads"]] == keys[:2]
+        assert [it["Prefix"] for it in grouped["CommonPrefixes"]] == [prefix + "dir/"]
+    finally:
+        for key, upload_id in ids.items():
+            ctx.s3.abort_multipart_upload(Bucket=BUCKET_NAME, Key=key, UploadId=upload_id)
+    after = ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME, Prefix=prefix)
+    assert "Uploads" not in after
 
 
 def check_multipart_overwrite_cold_object(ctx: Ctx) -> None:
@@ -921,7 +948,7 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("Presigned GET", check_presigned_get),
     ("Presigned PUT", check_presigned_put),
     ("PostObject (rejected with 501)", check_post_object_rejected),
-    ("ListMultipartUploads (rejected with 501)", check_list_multipart_uploads_rejected),
+    ("ListMultipartUploads", check_list_multipart_uploads),
     ("Multipart overwrite of cold object", check_multipart_overwrite_cold_object),
     ("AbortMultipartUpload keeps existing object", check_abort_keeps_existing_object),
     ("Multipart steps follow the upload after a move", check_multipart_follows_upload_after_move),

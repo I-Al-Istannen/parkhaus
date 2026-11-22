@@ -2,6 +2,7 @@ pub mod accesses;
 mod batch_delete;
 mod classify;
 pub(super) mod endpoints;
+mod list_uploads;
 pub mod listing;
 pub(super) mod metrics;
 pub mod migrate;

@@ -283,6 +283,14 @@ impl Database {
         uploads::remove(&mut *con.acquire().await.context("acquire con")?, upload_id).await
     }
 
+    pub async fn get_uploads_in_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<(MultipartUpload, Timestamp)>, Report> {
+        let con = self.read().await;
+        uploads::get_in_bucket(&mut *con.acquire().await.context("acquire con")?, bucket).await
+    }
+
     pub async fn get_uploads_older_than(
         &self,
         cutoff: Timestamp,

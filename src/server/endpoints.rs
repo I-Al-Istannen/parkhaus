@@ -5,6 +5,7 @@ use crate::error::TierError;
 use crate::s3::types::ForwardObjectUrl;
 use crate::server::batch_delete::proxy_delete_objects;
 use crate::server::classify::{BucketOp, Classified, ObjectOp, classify, not_supported};
+use crate::server::list_uploads::list_multipart_uploads;
 use crate::server::listing::proxy_list_objects_v2;
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
@@ -35,6 +36,7 @@ pub async fn proxy_request(
         Classified::ListBuckets => forward_to_hottest(&state, "", None, req).await,
         Classified::Bucket { bucket, op } => match op {
             BucketOp::ListObjectsV2 => proxy_list_objects_v2(&state, &bucket, req).await,
+            BucketOp::ListMultipartUploads => list_multipart_uploads(&state, &bucket, req).await,
             BucketOp::DeleteObjects => proxy_delete_objects(&state, &bucket, req).await,
             BucketOp::Read => forward_to_hottest(&state, &bucket, None, req).await,
         },

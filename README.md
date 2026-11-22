@@ -101,9 +101,9 @@ answers everything else with `501 Not Implemented`:
   `versionId`, writes of tags, ACLs, retention or legal holds, SSE-C and
   PostObject are rejected. Keys with `.` or `..` path segments are rejected.
 - Buckets: ListObjectsV2 (merged across upstreams), DeleteObjects and all
-  read-only requests, which the hottest upstream answers. ListObjects (v1),
-  ListObjectVersions, ListMultipartUploads and any bucket modification are
-  rejected.
+  read-only requests, which the hottest upstream answers.
+  ListMultipartUploads is answered from the database. ListObjects (v1),
+  ListObjectVersions and any bucket modification are rejected.
 - ListBuckets, answered by the hottest upstream.
 
 ### Consistency

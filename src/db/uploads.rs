@@ -81,3 +81,32 @@ pub(super) async fn get_older_than(
     .await
     .context("failed to get old multipart uploads")?)
 }
+
+/// The bucket's uploads with their creation time, ordered by key and upload ID.
+pub(super) async fn get_in_bucket(
+    con: &mut SqliteConnection,
+    bucket: &str,
+) -> Result<Vec<(MultipartUpload, Timestamp)>, Report> {
+    query!(
+        "SELECT upload_id, key, upstream, created FROM MultipartUploads WHERE bucket = ? \
+         ORDER BY key, upload_id",
+        bucket
+    )
+    .fetch_all(con)
+    .await
+    .context("failed to list multipart uploads")
+    .attach(format!("bucket: {bucket}"))?
+    .into_iter()
+    .map(|row| {
+        let upload = MultipartUpload {
+            upload_id: row.upload_id,
+            object: S3ObjectId {
+                bucket: bucket.to_string(),
+                key: row.key,
+            },
+            upstream: UpstreamId(row.upstream),
+        };
+        Ok((upload, Timestamp::from_millisecond(row.created)?))
+    })
+    .collect()
+}

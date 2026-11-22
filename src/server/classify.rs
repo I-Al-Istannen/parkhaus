@@ -20,6 +20,8 @@ pub(super) enum Classified {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BucketOp {
     ListObjectsV2,
+    /// Answered from the database, which knows every upload in progress.
+    ListMultipartUploads,
     DeleteObjects,
     /// Read-only bucket request answered by the hottest upstream.
     Read,
@@ -137,9 +139,8 @@ fn classify_bucket(method: &Method, params: &Params) -> Result<BucketOp, TierErr
         Method::GET | Method::HEAD if params.has("versions") => {
             Err(not_supported("ListObjectVersions"))
         }
-        Method::GET | Method::HEAD if params.has("uploads") => {
-            Err(not_supported("ListMultipartUploads"))
-        }
+        Method::GET if params.has("uploads") => Ok(BucketOp::ListMultipartUploads),
+        Method::HEAD if params.has("uploads") => Err(not_supported("HEAD of multipart uploads")),
         Method::GET | Method::HEAD | Method::OPTIONS => Ok(BucketOp::Read),
         Method::POST if params.is(&["delete"]) => Ok(BucketOp::DeleteObjects),
         _ => Err(not_supported("modifying buckets")),
@@ -471,7 +472,8 @@ mod tests {
             (Method::GET, "prefix=a&marker=b", None),
             (Method::GET, "x-id=ListObjects", None),
             (Method::GET, "versions", None),
-            (Method::GET, "uploads", None),
+            (Method::GET, "uploads", Some(ListMultipartUploads)),
+            (Method::HEAD, "uploads", None),
             (Method::GET, "location", Some(Read)),
             (Method::GET, "cors", Some(Read)),
             (Method::GET, "versioning", Some(Read)),
