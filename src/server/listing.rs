@@ -19,8 +19,8 @@ use crate::server::endpoints;
 use crate::server::state::AppState;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::Request;
+use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, Method};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::try_join_all;
 use jiff::{SignedDuration, Timestamp};
@@ -344,10 +344,6 @@ impl UpstreamPage {
         }
         Ok(page)
     }
-}
-
-pub(super) fn is_list_objects_v2(req: &Request) -> bool {
-    *req.method() == Method::GET && query_param(req, "list-type").is_some_and(|it| it == "2")
 }
 
 pub(super) async fn proxy_list_objects_v2(

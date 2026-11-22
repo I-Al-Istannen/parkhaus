@@ -202,46 +202,41 @@ def check_get_bucket_versioning(ctx: Ctx) -> None:
     assert status in (None, "Suspended"), f"unexpected versioning status {status}"
 
 
-def check_bucket_website(ctx: Ctx) -> None:
-    ctx.s3.put_bucket_website(
-        Bucket=BUCKET_NAME,
-        WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}},
-    )
-    got = ctx.s3.get_bucket_website(Bucket=BUCKET_NAME)
-    assert got["IndexDocument"]["Suffix"] == "index.html", got
-    # Garage keeps answering GetBucketWebsite after a delete, so only check the call.
-    ctx.s3.delete_bucket_website(Bucket=BUCKET_NAME)
-
-
-def check_bucket_cors(ctx: Ctx) -> None:
-    rule = {"AllowedMethods": ["GET"], "AllowedOrigins": ["https://example.com"]}
-    ctx.s3.put_bucket_cors(Bucket=BUCKET_NAME, CORSConfiguration={"CORSRules": [rule]})
-    got = ctx.s3.get_bucket_cors(Bucket=BUCKET_NAME)["CORSRules"]
-    assert got[0]["AllowedOrigins"] == ["https://example.com"], got
-    ctx.s3.delete_bucket_cors(Bucket=BUCKET_NAME)
+def check_bucket_config_reads(ctx: Ctx) -> None:
     expect_status(404, lambda: ctx.s3.get_bucket_cors(Bucket=BUCKET_NAME))
 
 
-def check_bucket_lifecycle(ctx: Ctx) -> None:
-    ctx.s3.put_bucket_lifecycle_configuration(
-        Bucket=BUCKET_NAME,
-        LifecycleConfiguration={
-            "Rules": [
-                {
-                    "ID": "expire-tmp",
-                    "Status": "Enabled",
-                    "Filter": {"Prefix": "tmp/"},
-                    "Expiration": {"Days": 1},
-                }
-            ]
-        },
-    )
-    got = ctx.s3.get_bucket_lifecycle_configuration(Bucket=BUCKET_NAME)["Rules"]
-    assert got[0]["ID"] == "expire-tmp", got
-    ctx.s3.delete_bucket_lifecycle(Bucket=BUCKET_NAME)
-    expect_status(
-        404, lambda: ctx.s3.get_bucket_lifecycle_configuration(Bucket=BUCKET_NAME)
-    )
+def check_bucket_config_writes_rejected(ctx: Ctx) -> None:
+    rule = {"AllowedMethods": ["GET"], "AllowedOrigins": ["https://example.com"]}
+    lifecycle = {
+        "Rules": [
+            {
+                "ID": "expire-tmp",
+                "Status": "Enabled",
+                "Filter": {"Prefix": "tmp/"},
+                "Expiration": {"Days": 1},
+            }
+        ]
+    }
+    calls = [
+        lambda: ctx.s3.put_bucket_cors(
+            Bucket=BUCKET_NAME, CORSConfiguration={"CORSRules": [rule]}
+        ),
+        lambda: ctx.s3.delete_bucket_cors(Bucket=BUCKET_NAME),
+        lambda: ctx.s3.put_bucket_website(
+            Bucket=BUCKET_NAME,
+            WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}},
+        ),
+        lambda: ctx.s3.put_bucket_lifecycle_configuration(
+            Bucket=BUCKET_NAME, LifecycleConfiguration=lifecycle
+        ),
+        lambda: ctx.s3.put_bucket_versioning(
+            Bucket=BUCKET_NAME, VersioningConfiguration={"Status": "Enabled"}
+        ),
+    ]
+    for call in calls:
+        expect_status(501, call)
+    expect_status(404, lambda: ctx.s3.get_bucket_cors(Bucket=BUCKET_NAME))
 
 
 # ---------------------------------------------------------------- listing
@@ -699,50 +694,14 @@ def check_presigned_put(ctx: Ctx) -> None:
     ctx.wait_for_row(key, size=len(body), upstream=Tier.HOT)
 
 
-def check_post_object(ctx: Ctx) -> None:
+def check_post_object_rejected(ctx: Ctx) -> None:
     key = ctx.key("post-object")
-    body = os.urandom(512)
     post = ctx.presigner.generate_presigned_post(BUCKET_NAME, key, ExpiresIn=60)
     res = requests.post(
-        post["url"], data=post["fields"], files={"file": body}, timeout=10
+        post["url"], data=post["fields"], files={"file": b"x"}, timeout=10
     )
-    assert res.status_code in (200, 204), f"HTTP {res.status_code}: {res.text}"
-    assert ctx.get(key) == body
-    ctx.wait_for_row(key, size=len(body), upstream=Tier.HOT)
-
-
-def check_post_object_filename_placeholder(ctx: Ctx) -> None:
-    prefix = ctx.key("post-filename") + "/"
-    body = os.urandom(512)
-    post = ctx.presigner.generate_presigned_post(
-        BUCKET_NAME,
-        prefix + "${filename}",
-        Conditions=[["starts-with", "$key", prefix]],
-        ExpiresIn=60,
-    )
-    res = requests.post(
-        post["url"],
-        data=post["fields"],
-        files={"file": ("up load.bin", body)},
-        timeout=10,
-    )
-    assert res.status_code in (200, 204), f"HTTP {res.status_code}: {res.text}"
-    key = prefix + "up load.bin"
-    assert ctx.get(key) == body
-    ctx.wait_for_row(key, size=len(body), upstream=Tier.HOT)
-
-
-def check_post_object_overwrite_cold_object(ctx: Ctx) -> None:
-    key, _ = ctx.put_cold_indexed("post-overwrite")
-    body = os.urandom(512)
-    post = ctx.presigner.generate_presigned_post(BUCKET_NAME, key, ExpiresIn=60)
-    res = requests.post(
-        post["url"], data=post["fields"], files={"file": body}, timeout=10
-    )
-    assert res.status_code in (200, 204), f"HTTP {res.status_code}: {res.text}"
-    ctx.wait_for_row(key, size=len(body), upstream=Tier.COLD)
-    assert ctx.get(key) == body
-    ctx.assert_only_on(key, Tier.COLD)
+    assert res.status_code == 501, f"HTTP {res.status_code}: {res.text}"
+    assert ctx.holders(key) == [], f"rejected {key} was stored on {ctx.holders(key)}"
 
 
 def check_sse_c_rejected(ctx: Ctx) -> None:
@@ -780,15 +739,8 @@ def check_special_character_key(ctx: Ctx) -> None:
 # ---------------------------------------------------------------- multipart
 
 
-def check_list_multipart_uploads(ctx: Ctx) -> None:
-    key = ctx.key("list-uploads")
-    upload_id = ctx.s3.create_multipart_upload(Bucket=BUCKET_NAME, Key=key)["UploadId"]
-    try:
-        uploads = ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME).get("Uploads", [])
-        assert any(u["UploadId"] == upload_id for u in uploads), uploads
-    finally:
-        ctx.s3.abort_multipart_upload(Bucket=BUCKET_NAME, Key=key, UploadId=upload_id)
-    ctx.wait_for_row(key, size=None, upstream=None)
+def check_list_multipart_uploads_rejected(ctx: Ctx) -> None:
+    expect_status(501, lambda: ctx.s3.list_multipart_uploads(Bucket=BUCKET_NAME))
 
 
 def check_multipart_overwrite_cold_object(ctx: Ctx) -> None:
@@ -896,9 +848,8 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("CreateBucket (rejected with 501)", check_create_bucket_rejected),
     ("DeleteBucket (rejected with 501)", check_delete_bucket_rejected),
     ("GetBucketVersioning", check_get_bucket_versioning),
-    ("Put/Get/DeleteBucketWebsite", check_bucket_website),
-    ("Put/Get/DeleteBucketCors", check_bucket_cors),
-    ("Put/Get/DeleteBucketLifecycle", check_bucket_lifecycle),
+    ("GetBucketCors", check_bucket_config_reads),
+    ("Bucket config writes (rejected with 501)", check_bucket_config_writes_rejected),
     ("ListObjectsV2 (hot + cold)", check_list_objects_v2),
     ("ListObjectsV2 paginated across upstreams", check_list_objects_v2_paginated),
     ("ListObjectsV2 interleaved keys, sorted", check_list_objects_v2_interleaved),
@@ -942,10 +893,8 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("CopyObject special-character source", check_copy_object_special_character_source),
     ("Presigned GET", check_presigned_get),
     ("Presigned PUT", check_presigned_put),
-    ("PostObject", check_post_object),
-    ("PostObject ${filename} key", check_post_object_filename_placeholder),
-    ("PostObject overwrite of cold object", check_post_object_overwrite_cold_object),
-    ("ListMultipartUploads", check_list_multipart_uploads),
+    ("PostObject (rejected with 501)", check_post_object_rejected),
+    ("ListMultipartUploads (rejected with 501)", check_list_multipart_uploads_rejected),
     ("Multipart overwrite of cold object", check_multipart_overwrite_cold_object),
     ("AbortMultipartUpload keeps existing object", check_abort_keeps_existing_object),
     ("UploadPartCopy same upstream", check_upload_part_copy_same_upstream),

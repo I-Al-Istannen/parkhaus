@@ -8,7 +8,6 @@ use crate::config::{Upstream, UpstreamId};
 use crate::data::S3ObjectId;
 use crate::error::TierError;
 use crate::server::endpoints;
-use crate::server::listing::query_param;
 use crate::server::metrics::COUNTER_OBJECT_DELETIONS_TOTAL;
 use crate::server::state::AppState;
 use axum::body::{Body, to_bytes};
@@ -28,10 +27,6 @@ use tracing::warn;
 /// 1000 keys of at most 1024 bytes each, plus markup.
 const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
-
-pub(super) fn is_delete_objects(req: &Request) -> bool {
-    *req.method() == Method::POST && query_param(req, "delete").is_some()
-}
 
 #[derive(Deserialize)]
 struct DeleteRequest {

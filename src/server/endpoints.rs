@@ -1,86 +1,26 @@
-use crate::config::{Config, Upstream};
+use crate::config::Upstream;
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
 use crate::error::TierError;
 use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
-use crate::server::batch_delete::{is_delete_objects, proxy_delete_objects};
-use crate::server::hacks::{is_post_object, read_post_object_key};
-use crate::server::listing::{is_list_objects_v2, proxy_list_objects_v2};
+use crate::server::batch_delete::proxy_delete_objects;
+use crate::server::classify::{BucketOp, Classified, ObjectOp, classify, not_supported};
+use crate::server::listing::proxy_list_objects_v2;
 use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_OBJECT_IMPORTED_ON_THE_FLY, COUNTER_UPSTREAM_FALLBACKS_TOTAL,
     COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
 use crate::server::state::{AppState, MutationLockGuard};
-use crate::server::unsupported;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
-use axum::http::Uri;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
-use percent_encoding::percent_decode_str;
-use reqwest::StatusCode;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use std::collections::HashSet;
 use tracing::{debug, warn};
-use url::form_urlencoded;
-
-/// How a successful request affects the tracked state of an object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ObjectOp {
-    /// The object was created or replaced, its metadata must be fetched from the upstream.
-    Write,
-    Delete,
-    Access,
-    /// Multipart upload bookkeeping that does not (yet) change the object.
-    MultipartStep,
-}
-
-impl ObjectOp {
-    pub(super) fn classify(method: &Method, query: Option<&str>) -> Self {
-        let has_param = |name: &str| {
-            query.is_some_and(|q| form_urlencoded::parse(q.as_bytes()).any(|(k, _)| k == name))
-        };
-        let upload_id = has_param("uploadId");
-
-        match *method {
-            Method::PUT if upload_id => Self::MultipartStep,
-            Method::PUT => Self::Write,
-            // CompleteMultipartUpload
-            Method::POST if upload_id => Self::Write,
-            Method::POST if has_param("uploads") => Self::MultipartStep,
-            Method::DELETE if upload_id => Self::MultipartStep,
-            Method::DELETE => Self::Delete,
-            Method::GET if upload_id => Self::MultipartStep,
-            _ => Self::Access,
-        }
-    }
-}
-
-/// What a request addresses, parsed from its percent-decoded path.
-pub(super) enum Target {
-    Bucket(String),
-    Object(S3ObjectId),
-}
-
-impl Target {
-    fn parse(uri: &Uri) -> Result<Self, TierError> {
-        let path = percent_decode_str(uri.path())
-            .decode_utf8()
-            .context("request path is not valid UTF-8")
-            .attach(StatusCode::BAD_REQUEST)?;
-        let path = path.trim_start_matches('/');
-        Ok(match path.split_once('/') {
-            None => Self::Bucket(path.to_string()),
-            Some((bucket, key)) => Self::Object(S3ObjectId {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            }),
-        })
-    }
-}
 
 pub async fn proxy_request(
     State(state): State<AppState>,
@@ -89,125 +29,110 @@ pub async fn proxy_request(
 ) -> Result<Response, TierError> {
     debug!(%original_uri, method=%req.method(), "received request for URL");
 
-    let target = Target::parse(&original_uri)?;
-    let req = unsupported::reject_unsupported(&state, &target, req).await?;
-
-    match target {
-        Target::Bucket(bucket) => {
-            if is_list_objects_v2(&req) {
-                return proxy_list_objects_v2(&state, &bucket, req).await;
-            }
-            if is_delete_objects(&req) {
-                return proxy_delete_objects(&state, &bucket, req).await;
-            }
-            if is_post_object(&req) {
-                let (object_id, req) = read_post_object_key(&bucket, req).await?;
-                return proxy_object_request(state, object_id, ObjectOp::Write, req, None).await;
-            }
-
-            // bucket-specific operation, nothing for us to track
-            let upstream = state.config.hottest_upstream();
-            debug!(%original_uri, method = %req.method(), %bucket, "handling bucket-level request for URL");
-
-            let mut upstream_url = upstream.format_url(&bucket, None)?;
-            upstream_url.url.set_query(req.uri().query());
-            forward_request(&state, upstream, upstream_url, req, async {}).await
-        }
-        Target::Object(object_id) => {
-            debug!(%original_uri, method=%req.method(), "handling request for URL");
-            let op = ObjectOp::classify(req.method(), req.uri().query());
-            let url_key = object_id.key.clone();
-            proxy_object_request(state, object_id, op, req, Some(&url_key)).await
-        }
+    match classify(req.method(), &original_uri, req.headers())? {
+        Classified::ListBuckets => forward_to_hottest(&state, "", None, req).await,
+        Classified::Bucket { bucket, op } => match op {
+            BucketOp::ListObjectsV2 => proxy_list_objects_v2(&state, &bucket, req).await,
+            BucketOp::DeleteObjects => proxy_delete_objects(&state, &bucket, req).await,
+            BucketOp::Read => forward_to_hottest(&state, &bucket, None, req).await,
+        },
+        Classified::Object { id, op } => proxy_object_request(state, id, op, req).await,
     }
 }
 
-/// Proxies a request affecting a single object. `url_key` is the key in the forwarded URL, which
-/// is absent for PostObject.
+async fn forward_to_hottest(
+    state: &AppState,
+    bucket: &str,
+    key: Option<&str>,
+    req: Request,
+) -> Result<Response, TierError> {
+    let upstream = state.config.hottest_upstream();
+    let mut url = upstream.format_url(bucket, key)?;
+    url.url.set_query(req.uri().query());
+    forward_request(state, upstream, url, req, async {}).await
+}
+
 async fn proxy_object_request(
     state: AppState,
     object_id: S3ObjectId,
     op: ObjectOp,
     req: Request,
-    url_key: Option<&str>,
 ) -> Result<Response, TierError> {
+    if op == ObjectOp::Preflight {
+        return forward_to_hottest(&state, &object_id.bucket, Some(&object_id.key), req).await;
+    }
+
     let mutation_guard = state
         .migration_locks
         .wait_for_migration(req.method(), &object_id)
         .await;
 
     // CopyObject is executed by the upstream holding the source, the destination follows it.
-    let copy_source = match op {
-        ObjectOp::Write => parse_copy_source(req.headers())?,
-        _ => None,
+    let routing_id = match &op {
+        ObjectOp::Copy { source } => source,
+        _ => &object_id,
     };
-    let routing_id = copy_source.as_ref().unwrap_or(&object_id);
+    let upstream = upstream_for(&state, routing_id, &op, req.method()).await?;
 
-    let upstream = state
-        .db
-        .get_upstream(routing_id)
-        .await
-        .context("failed to get upstream for object")?
-        .and_then(|it| {
-            counter!(COUNTER_UPSTREAM_FORWARDS_TOTAL,
-                "upstream" => it.0.clone(),
-                "method" => req.method().to_string()
-            )
-            .increment(1);
-            state.config.upstreams.get(&it)
-        })
-        // default to the coldest upstream
-        .unwrap_or_else(|| {
-            get_fallback_upstream(routing_id, &state.config, &req, op, copy_source.is_some())
-        });
+    if let ObjectOp::UploadPartCopy { source } = &op
+        && upstream_for(&state, source, &op, req.method()).await?.name != upstream.name
+    {
+        return Err(not_supported("UploadPartCopy across upstreams"));
+    }
 
-    let stale_upstream = match &copy_source {
-        Some(_) => state
+    let stale_upstream = match &op {
+        ObjectOp::Copy { .. } => state
             .db
             .get_upstream(&object_id)
             .await
             .context("failed to get upstream for copy destination")?
             .filter(|it| *it != upstream.name),
-        None => None,
+        _ => None,
     };
 
+    let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
+    target_url.url.set_query(req.uri().query());
     let on_success = record_successful_request(
         op,
-        object_id.clone(),
+        object_id,
         state.clone(),
         upstream.name.clone(),
         stale_upstream,
         mutation_guard,
     );
-    let mut target_url = upstream.format_url(&object_id.bucket, url_key)?;
-    target_url.url.set_query(req.uri().query());
     forward_request(&state, upstream, target_url, req, on_success).await
 }
 
-fn get_fallback_upstream<'a>(
-    object_id: &'_ S3ObjectId,
-    config: &'a Config,
-    request: &'_ Request,
-    op: ObjectOp,
-    is_copy: bool,
-) -> &'a Upstream {
-    let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-    let is_delete = request.method() == Method::DELETE;
-    let fallback = if (is_copy || is_read || is_delete) && op != ObjectOp::MultipartStep {
-        config.coldest_upstream()
-    } else {
-        config.hottest_upstream()
-    };
-
-    counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => request.method().to_string())
+async fn upstream_for<'a>(
+    state: &'a AppState,
+    object_id: &S3ObjectId,
+    op: &ObjectOp,
+    method: &Method,
+) -> Result<&'a Upstream, TierError> {
+    let assigned = state
+        .db
+        .get_upstream(object_id)
+        .await
+        .context("failed to get upstream for object")?
+        .and_then(|it| state.config.upstreams.get(&it));
+    if let Some(upstream) = assigned {
+        counter!(COUNTER_UPSTREAM_FORWARDS_TOTAL,
+            "upstream" => upstream.name.0.clone(),
+            "method" => method.to_string()
+        )
         .increment(1);
-    debug!(
-        ?object_id,
-        %fallback.name,
-        "object not found in database, defaulting upstream"
-    );
+        return Ok(upstream);
+    }
 
-    fallback
+    let fallback = match op {
+        ObjectOp::Read | ObjectOp::Delete | ObjectOp::Copy { .. } => {
+            state.config.coldest_upstream()
+        }
+        _ => state.config.hottest_upstream(),
+    };
+    counter!(COUNTER_UPSTREAM_FALLBACKS_TOTAL, "method" => method.to_string()).increment(1);
+    debug!(?object_id, %fallback.name, "object not found in database, defaulting upstream");
+    Ok(fallback)
 }
 
 pub(super) async fn forward_request(
@@ -284,31 +209,6 @@ pub(super) async fn forward_request(
     Ok(out_response)
 }
 
-/// Parses `x-amz-copy-source` (`[/]bucket/key[?versionId=...]`, URL-encoded).
-pub(super) fn parse_copy_source(headers: &HeaderMap) -> Result<Option<S3ObjectId>, TierError> {
-    let Some(value) = headers.get("x-amz-copy-source") else {
-        return Ok(None);
-    };
-    let value = value
-        .to_str()
-        .context("invalid x-amz-copy-source header")
-        .attach(StatusCode::BAD_REQUEST)?;
-    let value = value.split_once('?').map_or(value, |(path, _)| path);
-    let decoded = percent_decode_str(value.trim_start_matches('/'))
-        .decode_utf8()
-        .context("x-amz-copy-source is not valid UTF-8")
-        .attach(StatusCode::BAD_REQUEST)?;
-    let Some((bucket, key)) = decoded.split_once('/') else {
-        return Err(report!("x-amz-copy-source misses key: '{decoded}'")
-            .attach(StatusCode::BAD_REQUEST)
-            .into());
-    };
-    Ok(Some(S3ObjectId {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-    }))
-}
-
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     // https://datatracker.ietf.org/doc/html/rfc2068#section-13.5.1
     //   - Connection
@@ -348,28 +248,37 @@ async fn record_successful_request(
     stale_upstream: Option<UpstreamId>,
     mutation_guard: MutationLockGuard,
 ) {
+    let is_mutation = op.is_mutation();
     let recording = async move {
         let _mutation_guard = mutation_guard;
-        if let Err(e) = record(op, &obj_id, &state, &upstream_name, stale_upstream.as_ref()).await {
+        if let Err(e) = record(
+            &op,
+            &obj_id,
+            &state,
+            &upstream_name,
+            stale_upstream.as_ref(),
+        )
+        .await
+        {
             warn!(%e, object_id=?obj_id, "failed to record object creation/deletion");
         }
     };
     // The client's next request must be routed according to its writes and deletes.
-    match op {
-        ObjectOp::Access => drop(tokio::spawn(recording)),
-        _ => recording.await,
+    if is_mutation {
+        recording.await;
+    } else {
+        drop(tokio::spawn(recording));
     }
 }
 
 async fn record(
-    op: ObjectOp,
+    op: &ObjectOp,
     obj_id: &S3ObjectId,
     state: &AppState,
     upstream_name: &UpstreamId,
     stale_upstream: Option<&UpstreamId>,
 ) -> Result<(), Report> {
     match op {
-        ObjectOp::MultipartStep => return Ok(()),
         ObjectOp::Delete => {
             counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
                 .increment(1);
@@ -381,7 +290,7 @@ async fn record(
                 .attach(format!("object: {obj_id:?}"))?;
             return Ok(());
         }
-        ObjectOp::Write => {
+        ObjectOp::Put | ObjectOp::Copy { .. } | ObjectOp::CompleteMultipart => {
             counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
                 .increment(1);
             record_from_upstream(state, upstream_name, obj_id)
@@ -395,7 +304,7 @@ async fn record(
                     .attach(format!("object: {obj_id:?}"))?;
             }
         }
-        ObjectOp::Access => {
+        ObjectOp::Read => {
             if !state
                 .db
                 .has_object(obj_id)
@@ -410,6 +319,10 @@ async fn record(
                     .increment(1);
             }
         }
+        ObjectOp::Preflight
+        | ObjectOp::CreateMultipart
+        | ObjectOp::MultipartStep
+        | ObjectOp::UploadPartCopy { .. } => return Ok(()),
     }
 
     state
@@ -467,70 +380,8 @@ async fn record_from_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectOp, connection_header_names, is_hop_by_hop_header, parse_copy_source};
-    use crate::data::S3ObjectId;
-    use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
-
-    #[test]
-    fn parses_copy_source() {
-        let parse = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-amz-copy-source", HeaderValue::from_str(value).unwrap());
-            parse_copy_source(&headers).ok().flatten()
-        };
-        let id = |bucket: &str, key: &str| {
-            Some(S3ObjectId {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            })
-        };
-
-        assert_eq!(parse("bucket/a/b"), id("bucket", "a/b"));
-        assert_eq!(parse("/bucket/a/b"), id("bucket", "a/b"));
-        assert_eq!(
-            parse("bucket/k%C3%A4y%20%3F?versionId=1"),
-            id("bucket", "käy ?")
-        );
-        assert_eq!(parse("bucket"), None);
-        assert_eq!(parse_copy_source(&HeaderMap::new()).ok().flatten(), None);
-    }
-
-    #[test]
-    fn classifies_object_operations() {
-        let cases = [
-            (Method::PUT, None, ObjectOp::Write),
-            (Method::PUT, Some("tagging"), ObjectOp::Write),
-            (
-                Method::PUT,
-                Some("partNumber=1&uploadId=abc"),
-                ObjectOp::MultipartStep,
-            ),
-            (Method::POST, Some("uploads"), ObjectOp::MultipartStep),
-            (Method::POST, Some("uploads="), ObjectOp::MultipartStep),
-            (Method::POST, Some("uploadId=abc"), ObjectOp::Write),
-            (Method::DELETE, None, ObjectOp::Delete),
-            (
-                Method::DELETE,
-                Some("uploadId=abc"),
-                ObjectOp::MultipartStep,
-            ),
-            (Method::GET, None, ObjectOp::Access),
-            (
-                Method::GET,
-                Some("uploadId=abc&max-parts=10"),
-                ObjectOp::MultipartStep,
-            ),
-            (Method::GET, Some("x-id=uploadIdent"), ObjectOp::Access),
-            (Method::HEAD, None, ObjectOp::Access),
-        ];
-        for (method, query, expected) in cases {
-            assert_eq!(
-                ObjectOp::classify(&method, query),
-                expected,
-                "{method} ?{query:?}"
-            );
-        }
-    }
+    use super::{connection_header_names, is_hop_by_hop_header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
     #[test]
     fn strips_headers_named_by_connection() {
