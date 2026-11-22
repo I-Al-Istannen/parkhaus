@@ -164,6 +164,7 @@ The expression syntax for tiering rules supports a few constructs:
   | `<=`     | less or equal                   |
   | `==`     | equal                           |
   | `!=`     | not equal                       |
+  | `~=`     | unanchored regex match          |
   | `&&`     | logical and                     |
   | `\|\|`   | logical or                      |
   | `!`      | logical negation (e.g. `!true`) |
@@ -216,8 +217,8 @@ region = "us-east-1"
 to = "hot"
 # the filter expression
 # This expression migrates every object that is in bucket 'always-hot'
-# or in a bucket starting with 'hot-bucket-' to hot, no matter its age
-# or size.
+# or in a bucket whose name contains 'hot-bucket-' to hot, no matter its age
+# or size. `~=` is an unanchored regex match, use `^` to match the start.
 when = "bucket == 'always-hot' || bucket ~= 'hot-bucket-.*'"
 
 [[tiering_rules]]

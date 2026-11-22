@@ -223,12 +223,19 @@ fn p_time_span<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clon
             ))
             .labelled("time span"),
         )
-        .map(|(it, factor)| it * factor);
+        .try_map(|(it, factor), span| {
+            i64::checked_mul(it, factor).ok_or_else(|| Rich::custom(span, "number too large"))
+        });
     p_suffix
         .repeated()
         .at_least(1)
         .collect::<Vec<i64>>()
-        .map(|parts| parts.iter().sum())
+        .try_map(|parts, span| {
+            parts
+                .into_iter()
+                .try_fold(0, i64::checked_add)
+                .ok_or_else(|| Rich::custom(span, "number too large"))
+        })
 }
 
 fn p_byte_size<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clone {
@@ -244,12 +251,19 @@ fn p_byte_size<'src>() -> impl Parser<'src, &'src str, i64, OurErr<'src>> + Clon
             ))
             .labelled("file size"),
         )
-        .map(|(it, factor)| it * factor);
+        .try_map(|(it, factor), span| {
+            i64::checked_mul(it, factor).ok_or_else(|| Rich::custom(span, "number too large"))
+        });
     p_suffix
         .repeated()
         .at_least(1)
         .collect::<Vec<i64>>()
-        .map(|parts| parts.iter().sum())
+        .try_map(|parts, span| {
+            parts
+                .into_iter()
+                .try_fold(0, i64::checked_add)
+                .ok_or_else(|| Rich::custom(span, "number too large"))
+        })
 }
 
 fn p_string<'src>() -> impl Parser<'src, &'src str, String, OurErr<'src>> + Clone {
@@ -416,9 +430,9 @@ pub fn typecheck<E: Env + Clone>(
                         .with_config(
                             ariadne::Config::new().with_index_type(ariadne::IndexType::Byte)
                         )
-                        .with_message("Unknown variable")
+                        .with_message("Cannot compare values of different types")
                         .with_label(
-                            Label::new(((), r.span.into_range()))
+                            Label::new(((), l.span.into_range()))
                                 .with_message(format!("type {}", l.typ()))
                                 .with_color(Color::Red),
                         )
@@ -631,6 +645,14 @@ mod tests {
     ];
 
     type BinaryOpCtor<T> = fn(Box<Spanned<Expr<T>>>, Box<Spanned<Expr<T>>>) -> Operator<T>;
+
+    #[test]
+    fn overflowing_numbers_are_parse_errors() {
+        assert!(parse_expr("age > 9223372036854775807d").is_err());
+        assert!(parse_expr("size > 9223372036854775807KB").is_err());
+        assert!(parse_expr("age > 9223372036854775807s1s").is_err());
+        assert!(parse_expr("age > 1d1h").is_ok());
+    }
 
     #[test]
     fn not_typechecks_to_not() {
