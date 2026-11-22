@@ -20,15 +20,27 @@ pub struct AppState {
     pub accesses: AccessRecorder,
 }
 
-/// Serializes everything that changes where an object lives: client mutations, the resolution of
-/// dirty objects and migrations. Reads do not lock.
+/// Serializes everything that changes where an object lives: client mutations, settling dirty
+/// objects and migrations. Reads do not lock.
 #[derive(Clone, Default)]
 pub struct KeyLocks {
     inner: Arc<Mutex<HashMap<S3ObjectId, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
+/// Proof that the holder has exclusive access to the object.
+pub struct KeyGuard {
+    object: S3ObjectId,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl KeyGuard {
+    pub fn object(&self) -> &S3ObjectId {
+        &self.object
+    }
+}
+
 impl KeyLocks {
-    pub async fn lock(&self, object: &S3ObjectId) -> OwnedMutexGuard<()> {
+    pub async fn lock(&self, object: &S3ObjectId) -> KeyGuard {
         let lock = {
             let mut locks = self.inner.lock().unwrap();
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -41,14 +53,14 @@ impl KeyLocks {
                 }
             }
         };
-        lock.lock_owned().await
+        KeyGuard {
+            object: object.clone(),
+            _guard: lock.lock_owned().await,
+        }
     }
 
     /// Locks in iteration order, callers must pass a sorted set to not deadlock each other.
-    pub async fn lock_all(
-        &self,
-        objects: impl IntoIterator<Item = &S3ObjectId>,
-    ) -> Vec<OwnedMutexGuard<()>> {
+    pub async fn lock_all(&self, objects: impl IntoIterator<Item = &S3ObjectId>) -> Vec<KeyGuard> {
         let mut guards = Vec::new();
         for object in objects {
             guards.push(self.lock(object).await);

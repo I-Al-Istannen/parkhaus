@@ -6,7 +6,7 @@ pub mod listing;
 pub(super) mod metrics;
 pub mod migrate;
 pub mod reconcile;
-pub mod resolve;
+pub mod settle;
 pub(super) mod state;
 pub mod uploads;
 

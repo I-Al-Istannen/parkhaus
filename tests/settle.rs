@@ -9,7 +9,7 @@ use parkhaus::s3::client::S3Client;
 use parkhaus::s3::types::AddressingStyle;
 use parkhaus::server::KeyLocks;
 use parkhaus::server::reconcile::{Discrepancy, reconcile};
-use parkhaus::server::resolve::{resolve, sweep};
+use parkhaus::server::settle::{settle, sweep};
 use parkhaus::server::uploads::{ABANDONED_UPLOAD_AGE, reap_abandoned_uploads};
 use reqwest::Client;
 use rootcause::Report;
@@ -19,7 +19,7 @@ use tokio::sync::OnceCell;
 
 mod common;
 
-const BUCKET: &str = "resolve";
+const BUCKET: &str = "settle";
 
 static HOT: OnceCell<(S3Instance, Upstream)> = OnceCell::const_new();
 static COLD: OnceCell<(S3Instance, Upstream)> = OnceCell::const_new();
@@ -35,7 +35,7 @@ fn shutdown_backends() {
 async fn start(name: &str, order: usize) -> Result<(S3Instance, Upstream), Report> {
     let backend = S3Instance::start().await?;
     let bucket_id = backend.create_bucket(BUCKET).await?;
-    let (key_id, secret) = backend.create_key(&format!("resolve-{name}")).await?;
+    let (key_id, secret) = backend.create_key(&format!("settle-{name}")).await?;
     backend.allow_key_on_bucket(&bucket_id, &key_id).await?;
     let upstream = Upstream {
         name: UpstreamId(name.to_string()),
@@ -102,8 +102,9 @@ impl Env {
             .await
     }
 
-    async fn resolve(&self, id: &S3ObjectId) -> Result<(), Report> {
-        resolve(&self.config, &self.db, &self.http, id).await?;
+    async fn settle(&self, id: &S3ObjectId) -> Result<(), Report> {
+        let guard = KeyLocks::default().lock(id).await;
+        settle(&self.config, &self.db, &self.http, &guard).await?;
         assert_eq!(self.db.find_dirty(id).await?, None);
         Ok(())
     }
@@ -147,7 +148,7 @@ async fn deleted_object_is_forgotten() -> Result<(), Report> {
     env.record(&hot(), &id, 1).await?;
     env.db.mark_dirty(&id, &dirty(hot(), None)).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, None);
     Ok(())
@@ -161,7 +162,7 @@ async fn overwritten_object_is_recorded_again() -> Result<(), Report> {
     env.put(&hot(), &id, b"hello").await?;
     env.db.mark_dirty(&id, &dirty(hot(), None)).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, Some((hot(), 5)));
     Ok(())
@@ -182,7 +183,7 @@ async fn unchanged_object_keeps_its_row() -> Result<(), Report> {
     env.db.record_creation(&recorded).await?;
     env.db.mark_dirty(&id, &dirty(hot(), None)).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     let row = env.db.find_object(&id).await?.expect("row must stay");
     assert_eq!(row.last_modified, info.last_modified);
@@ -197,7 +198,7 @@ async fn new_object_is_recorded() -> Result<(), Report> {
     env.put(&hot(), &id, b"new").await?;
     env.db.mark_dirty(&id, &dirty(hot(), None)).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, Some((hot(), 3)));
     Ok(())
@@ -209,7 +210,7 @@ async fn failed_creation_leaves_nothing() -> Result<(), Report> {
     let id = object("never-created");
     env.db.mark_dirty(&id, &dirty(hot(), None)).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, None);
     Ok(())
@@ -224,7 +225,7 @@ async fn copy_onto_other_upstream_replaces_assigned_copy() -> Result<(), Report>
     env.put(&cold(), &id, b"newer").await?;
     env.db.mark_dirty(&id, &dirty(cold(), Some(hot()))).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, Some((cold(), 5)));
     assert!(
@@ -243,7 +244,7 @@ async fn failed_copy_keeps_assigned_copy() -> Result<(), Report> {
     env.record(&hot(), &id, 3).await?;
     env.db.mark_dirty(&id, &dirty(cold(), Some(hot()))).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, Some((hot(), 3)));
     assert!(env.exists(&hot(), &id).await?);
@@ -259,7 +260,7 @@ async fn interrupted_migration_is_finished() -> Result<(), Report> {
     env.record(&cold(), &id, 4).await?;
     env.db.mark_dirty(&id, &dirty(cold(), Some(hot()))).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(env.assigned(&id).await?, Some((cold(), 4)));
     assert!(
@@ -276,7 +277,7 @@ async fn object_moved_elsewhere_is_left_alone() -> Result<(), Report> {
     env.record(&UpstreamId("other".to_string()), &id, 1).await?;
     env.db.mark_dirty(&id, &dirty(cold(), Some(hot()))).await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     assert_eq!(
         env.assigned(&id).await?,
@@ -286,7 +287,7 @@ async fn object_moved_elsewhere_is_left_alone() -> Result<(), Report> {
 }
 
 #[tokio::test]
-async fn sweep_resolves_every_dirty_object() -> Result<(), Report> {
+async fn sweep_settles_every_dirty_object() -> Result<(), Report> {
     let env = Env::new().await?;
     let created = object("sweep-created");
     let deleted = object("sweep-deleted");
@@ -322,7 +323,7 @@ async fn migration_keeps_the_object_timestamps() -> Result<(), Report> {
         )
         .await?;
 
-    env.resolve(&id).await?;
+    env.settle(&id).await?;
 
     let row = env.db.find_object(&id).await?.expect("row must stay");
     assert_eq!(row.assigned_upstream, cold());

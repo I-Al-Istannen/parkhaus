@@ -2,26 +2,28 @@
 
 use crate::config::{Config, Upstream};
 use crate::data::{S3Object, S3ObjectId, UpstreamId};
-use crate::db::{Database, DirtyObject, Resolution};
+use crate::db::{Database, DirtyObject, Settlement};
 use crate::s3::client::{ObjectInfo, S3Client};
-use crate::server::state::KeyLocks;
+use crate::server::state::{KeyGuard, KeyLocks};
 use reqwest::Client;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tracing::{info, warn};
 
-/// Resolves a dirty object. The caller must hold the object's key lock.
+/// Settles a dirty object: asks the upstreams where it lives now, records that and clears the
+/// dirty mark.
 ///
 /// The target only holds the key if the change created it there, so a copy on the target wins.
 /// Otherwise the previous upstream still holds the object, or it is gone. The DB is updated before
 /// the stale copy is deleted, so readers never see neither, and a crash in between leads to the
 /// same decision again.
-pub async fn resolve(
+pub async fn settle(
     config: &Config,
     db: &Database,
     http: &Client,
-    obj: &S3ObjectId,
+    guard: &KeyGuard,
 ) -> Result<(), Report> {
+    let obj = guard.object();
     let Some(DirtyObject {
         target,
         previous,
@@ -40,17 +42,17 @@ pub async fn resolve(
         },
     };
 
-    let resolution = match (winner, &known) {
+    let settlement = match (winner, &known) {
         (Some((upstream, info)), Some(known))
             if upstream.name == known.assigned_upstream
                 && info.size == known.size
                 && info.last_modified == known.last_modified =>
         {
-            Resolution::Keep
+            Settlement::Keep
         }
         // The copy is new, but the object is not: age and accesses must carry over.
-        (Some((upstream, _)), Some(_)) if migration => Resolution::Move(upstream.name.clone()),
-        (Some((upstream, info)), _) => Resolution::Record(S3Object {
+        (Some((upstream, _)), Some(_)) if migration => Settlement::Move(upstream.name.clone()),
+        (Some((upstream, info)), _) => Settlement::Record(S3Object {
             id: obj.clone(),
             assigned_upstream: upstream.name.clone(),
             last_modified: info.last_modified,
@@ -61,11 +63,11 @@ pub async fn resolve(
             if known.assigned_upstream != target
                 && Some(&known.assigned_upstream) != previous.as_ref() =>
         {
-            Resolution::Keep
+            Settlement::Keep
         }
-        (None, _) => Resolution::Delete,
+        (None, _) => Settlement::Delete,
     };
-    db.apply_resolution(obj, &resolution).await?;
+    db.apply_settlement(obj, &settlement).await?;
 
     if let Some(stale) = stale.and_then(|it| config.upstreams.get(it)) {
         info!(%obj, upstream = %stale.name, "deleting previous copy of object");
@@ -97,7 +99,7 @@ async fn head<'a>(
         .map(|info| (upstream, info)))
 }
 
-/// Resolves all dirty objects, e.g. left behind by a crash.
+/// Settles all dirty objects, e.g. left behind by a crash.
 pub async fn sweep(
     config: &Config,
     db: &Database,
@@ -107,14 +109,13 @@ pub async fn sweep(
     let dirty = db.get_dirty_objects().await?;
     let mut failed = 0;
     for obj in &dirty {
-        let _guard = locks.lock(obj).await;
-        if let Err(e) = resolve(config, db, http, obj).await {
-            warn!(%e, %obj, "failed to resolve dirty object");
+        if let Err(e) = settle(config, db, http, &locks.lock(obj).await).await {
+            warn!(%e, %obj, "failed to settle dirty object");
             failed += 1;
         }
     }
     if !dirty.is_empty() {
-        info!(count = dirty.len(), failed, "resolved dirty objects");
+        info!(count = dirty.len(), failed, "settled dirty objects");
     }
     Ok(failed)
 }

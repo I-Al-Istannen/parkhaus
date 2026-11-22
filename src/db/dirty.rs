@@ -16,7 +16,7 @@ pub struct DirtyObject {
 
 /// What the upstreams of a dirty object say about it.
 #[derive(Debug, Clone)]
-pub enum Resolution {
+pub enum Settlement {
     /// The DB row is still accurate.
     Keep,
     /// The object moved unchanged.
@@ -82,13 +82,13 @@ pub(super) async fn get_all(con: &mut SqliteConnection) -> Result<Vec<S3ObjectId
 pub(super) async fn apply(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
-    resolution: &Resolution,
+    settlement: &Settlement,
 ) -> Result<(), Report> {
-    match resolution {
-        Resolution::Keep => Ok(()),
-        Resolution::Move(upstream) => objects::set_upstream(con, obj, upstream).await,
-        Resolution::Record(object) => objects::record_creation(con, object).await,
-        Resolution::Delete => objects::delete_object(con, obj).await,
+    match settlement {
+        Settlement::Keep => Ok(()),
+        Settlement::Move(upstream) => objects::set_upstream(con, obj, upstream).await,
+        Settlement::Record(object) => objects::record_creation(con, object).await,
+        Settlement::Delete => objects::delete_object(con, obj).await,
     }
 }
 

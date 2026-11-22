@@ -6,13 +6,13 @@
 
 use crate::config::{Upstream, UpstreamId};
 use crate::data::S3ObjectId;
-use crate::db::{DirtyObject, Resolution};
+use crate::db::{DirtyObject, Settlement};
 use crate::error::TierError;
 use crate::server::classify::not_supported;
 use crate::server::endpoints;
 use crate::server::metrics::COUNTER_OBJECT_DELETIONS_TOTAL;
-use crate::server::resolve::resolve;
-use crate::server::state::AppState;
+use crate::server::settle::settle;
+use crate::server::state::{AppState, KeyGuard};
 use axum::body::{Body, to_bytes};
 use axum::extract::Request;
 use axum::http::HeaderValue;
@@ -180,8 +180,8 @@ pub(super) async fn proxy_delete_objects(
     let state = state.clone();
     let bucket = bucket.to_string();
     let results = tokio::spawn(async move {
-        let _guards = state.key_locks.lock_all(&objects).await;
-        let assigned = mark_dirty(&state, &objects).await?;
+        let guards = state.key_locks.lock_all(&objects).await;
+        let assigned = mark_dirty(&state, &guards).await?;
 
         let upstreams = state.config.upstreams_in_order();
         let results = join_all(upstreams.iter().map(|upstream| {
@@ -193,15 +193,15 @@ pub(super) async fn proxy_delete_objects(
         // Responses are not `Sync`, so they must not be borrowed across awaits
         let outcomes = assigned
             .into_iter()
-            .map(|(object, upstream)| {
+            .map(|(guard, upstream)| {
                 let deleted = upstreams.iter().zip(&results).any(|(it, result)| {
                     it.name == upstream
-                        && matches!(result, Ok(Ok(result)) if result.reports_deleted(&object.key))
+                        && matches!(result, Ok(Ok(result)) if result.reports_deleted(&guard.object().key))
                 });
-                (object, upstream, deleted)
+                (guard, upstream, deleted)
             })
             .collect::<Vec<_>>();
-        resolve_deletions(&state, outcomes).await;
+        settle_deletions(&state, outcomes).await;
         Ok::<_, TierError>(results)
     })
     .await
@@ -231,16 +231,17 @@ pub(super) async fn proxy_delete_objects(
     Ok(response)
 }
 
-/// Resolves leftovers and marks every known object dirty on its upstream.
-async fn mark_dirty(
+/// Settles leftovers and marks every known object dirty on its upstream.
+async fn mark_dirty<'a>(
     state: &AppState,
-    objects: &BTreeSet<S3ObjectId>,
-) -> Result<Vec<(S3ObjectId, UpstreamId)>, TierError> {
+    guards: &'a [KeyGuard],
+) -> Result<Vec<(&'a KeyGuard, UpstreamId)>, TierError> {
     let mut assigned = Vec::new();
-    for object in objects {
-        resolve(&state.config, &state.db, &state.http, object)
+    for guard in guards {
+        let object = guard.object();
+        settle(&state.config, &state.db, &state.http, guard)
             .await
-            .context("failed to resolve earlier mutation")?;
+            .context("failed to settle earlier mutation")?;
         let Some(upstream) = state
             .db
             .get_upstream(object)
@@ -261,23 +262,24 @@ async fn mark_dirty(
             )
             .await
             .context("failed to mark object dirty")?;
-        assigned.push((object.clone(), upstream));
+        assigned.push((guard, upstream));
     }
     Ok(assigned)
 }
 
 /// Objects their upstream reported as deleted are forgotten right away, everything else is checked
 /// with a HEAD.
-async fn resolve_deletions(state: &AppState, outcomes: Vec<(S3ObjectId, UpstreamId, bool)>) {
-    for (object, upstream, deleted) in &outcomes {
-        let resolved = if *deleted {
+async fn settle_deletions(state: &AppState, outcomes: Vec<(&KeyGuard, UpstreamId, bool)>) {
+    for (guard, upstream, deleted) in outcomes {
+        let object = guard.object();
+        let settled = if deleted {
             counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream.0.clone()).increment(1);
-            state.db.resolve_dirty(object, &Resolution::Delete).await
+            state.db.settle_dirty(object, &Settlement::Delete).await
         } else {
-            resolve(&state.config, &state.db, &state.http, object).await
+            settle(&state.config, &state.db, &state.http, guard).await
         };
-        if let Err(e) = resolved {
-            warn!(%e, %object, "failed to resolve deletion, leaving it to the sweep");
+        if let Err(e) = settled {
+            warn!(%e, %object, "failed to settle deletion, leaving it to the sweep");
         }
     }
 }

@@ -10,7 +10,7 @@ use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
-use crate::server::resolve::resolve;
+use crate::server::settle::settle;
 use crate::server::state::AppState;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{OriginalUri, Request, State};
@@ -158,7 +158,7 @@ async fn upload_upstream<'a>(
     }
 }
 
-/// Marks the object dirty on every upstream the request may change, forwards it and resolves the
+/// Marks the object dirty on every upstream the request may change, forwards it and settles the
 /// outcome. If anything fails in between, the dirty marks stay for the sweep.
 async fn mutate(
     state: AppState,
@@ -166,10 +166,10 @@ async fn mutate(
     op: ObjectOp,
     req: Request,
 ) -> Result<Response, TierError> {
-    let _guard = state.key_locks.lock(&object_id).await;
-    resolve(&state.config, &state.db, &state.http, &object_id)
+    let guard = state.key_locks.lock(&object_id).await;
+    settle(&state.config, &state.db, &state.http, &guard)
         .await
-        .context("failed to resolve earlier mutation")?;
+        .context("failed to settle earlier mutation")?;
 
     // CopyObject is executed by the upstream holding the source, the destination follows it.
     let routing_id = match &op {
@@ -205,14 +205,14 @@ async fn mutate(
         buffer_response(forward_request(&state, upstream, target_url, req, async {}).await?)
             .await?;
 
-    // A rejected request changed nothing. Resolving would mistake a migrated copy for a new write.
-    let resolved = if response.parts.status.is_client_error() {
+    // A rejected request changed nothing. Settling would mistake a migrated copy for a new write.
+    let settled = if response.parts.status.is_client_error() {
         state.db.clear_dirty(&object_id).await
     } else {
-        resolve(&state.config, &state.db, &state.http, &object_id).await
+        settle(&state.config, &state.db, &state.http, &guard).await
     };
-    if let Err(e) = resolved {
-        warn!(%e, %object_id, "failed to resolve mutation, leaving it to the sweep");
+    if let Err(e) = settled {
+        warn!(%e, %object_id, "failed to settle mutation, leaving it to the sweep");
         // Reads still go to the previous copy, so the change must not look finished yet.
         if response.succeeded() {
             return Err(e

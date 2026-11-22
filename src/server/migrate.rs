@@ -3,7 +3,7 @@ use crate::config::{Config, Upstream, UpstreamId};
 use crate::data::{PendingMigration, S3ObjectId};
 use crate::db::{Database, DirtyObject};
 use crate::s3::client::{S3Client, is_upstream_unavailable};
-use crate::server::resolve::{resolve, sweep};
+use crate::server::settle::{settle, sweep};
 use crate::server::state::KeyLocks;
 use crate::server::uploads::reap_abandoned_uploads;
 use jiff::{Timestamp, Zoned};
@@ -36,7 +36,7 @@ pub async fn migration_task(
             tokio::time::sleep(Duration::from_mins(1)).await;
 
             if let Err(error) = sweep(&config, &db, &http, &key_locks).await {
-                error!(%error, "Failed to resolve dirty objects");
+                error!(%error, "Failed to settle dirty objects");
             }
             if let Err(error) = reap_abandoned_uploads(&config, &db, &http, Timestamp::now()).await
             {
@@ -179,7 +179,7 @@ pub async fn execute_migrations(
     Ok(failed)
 }
 
-/// Copies the object to the target and lets [`resolve`] move the DB entry and delete the source
+/// Copies the object to the target and lets [`settle`] move the DB entry and delete the source
 /// copy. A crash leaves the object dirty, the sweep then finishes or rolls back the migration.
 async fn execute_migration(
     migration: &PendingMigration,
@@ -208,10 +208,10 @@ async fn execute_migration(
         .attach(format!("upstream: {target}"))?;
 
     debug!(from = %source, to = %target, %object, "Executing pending migration");
-    let _key_guard = key_locks.lock(object).await;
-    resolve(config, db, http, object)
+    let guard = key_locks.lock(object).await;
+    settle(config, db, http, &guard)
         .await
-        .context("failed to resolve earlier change")?;
+        .context("failed to settle earlier change")?;
     if db.get_upstream(object).await?.as_ref() != Some(source) {
         debug!(%object, "Object changed since the migration was planned, skipping it");
         return Ok(());
@@ -227,13 +227,13 @@ async fn execute_migration(
     )
     .await?;
     let copied = copy(http, source_upstream, target_upstream, object).await;
-    let resolved = resolve(config, db, http, object).await;
+    let settled = settle(config, db, http, &guard).await;
     copied
         .context("failed to copy object")
         .attach(format!("from: {source}"))
         .attach(format!("to: {target}"))
         .attach(format!("object: {object}"))?;
-    resolved.context("failed to resolve migration")?;
+    settled.context("failed to settle migration")?;
 
     MigrationMetrics::record_migrated_object();
     debug!(from = %source, to = %target, %object, "Finished migration");

@@ -9,7 +9,7 @@ use crate::server::listing::ListingStore;
 use crate::server::metrics::initialize_metrics;
 use crate::server::migrate::migration_task;
 use crate::server::reconcile::reconcile_task;
-use crate::server::resolve::sweep;
+use crate::server::settle::sweep;
 use crate::server::state::{AppState, KeyLocks};
 use axum::Router;
 use axum::routing::{any, get};
@@ -86,7 +86,7 @@ async fn start_main_server(
     let key_locks = KeyLocks::default();
     let http = crate::s3::client::http_client()?;
 
-    info!("resolving dirty objects before accepting requests");
+    info!("settling dirty objects before accepting requests");
     sweep(&config, &db, &http, &key_locks).await?;
 
     tokio::spawn(reconcile_task(

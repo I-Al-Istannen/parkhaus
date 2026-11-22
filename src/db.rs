@@ -4,7 +4,7 @@ mod migrate;
 mod objects;
 mod uploads;
 
-pub use self::dirty::{DirtyObject, Resolution};
+pub use self::dirty::{DirtyObject, Settlement};
 pub use self::objects::TieringRuleEnv;
 pub use self::uploads::MultipartUpload;
 use crate::data::{PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId};
@@ -225,17 +225,17 @@ impl Database {
         dirty::get_all(&mut *con.acquire().await.context("acquire con")?).await
     }
 
-    /// Applies the resolution but keeps the object dirty.
-    pub async fn apply_resolution(
+    /// Applies the settlement but keeps the object dirty.
+    pub async fn apply_settlement(
         &self,
         obj: &S3ObjectId,
-        resolution: &Resolution,
+        settlement: &Settlement,
     ) -> Result<(), Report> {
         let con = self.write().await;
         dirty::apply(
             &mut *con.acquire().await.context("acquire con")?,
             obj,
-            resolution,
+            settlement,
         )
         .await
     }
@@ -245,15 +245,15 @@ impl Database {
         dirty::clear(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
-    /// Applies the resolution and clears the dirty mark atomically.
-    pub async fn resolve_dirty(
+    /// Applies the settlement and clears the dirty mark atomically.
+    pub async fn settle_dirty(
         &self,
         obj: &S3ObjectId,
-        resolution: &Resolution,
+        settlement: &Settlement,
     ) -> Result<(), Report> {
         let con = self.write().await;
         let mut transaction = con.begin().await.context("begin transaction")?;
-        dirty::apply(&mut transaction, obj, resolution).await?;
+        dirty::apply(&mut transaction, obj, settlement).await?;
         dirty::clear(&mut transaction, obj).await?;
         transaction.commit().await.context("commit transaction")?;
         Ok(())
