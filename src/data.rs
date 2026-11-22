@@ -10,6 +10,14 @@ pub struct S3ObjectId {
     pub key: String,
 }
 
+/// URLs normalize away `.` and `..` path segments, even percent-encoded ones, so such keys cannot
+/// be addressed.
+/// URLs normalize `.` and `..` segments away and drop tabs and line breaks, so such keys would
+/// address a different object.
+pub fn is_addressable_key(key: &str) -> bool {
+    !key.split('/').any(|it| it == "." || it == "..") && !key.contains(['\t', '\n', '\r'])
+}
+
 impl Display for S3ObjectId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.pad(&format!("{}/{}", self.bucket, self.key))

@@ -1,7 +1,7 @@
 //! Maps requests onto the subset of S3 parkhaus keeps exact bookkeeping for. Everything else is
 //! rejected, so no request can change an object without parkhaus noticing.
 
-use crate::data::S3ObjectId;
+use crate::data::{S3ObjectId, is_addressable_key};
 use crate::error::TierError;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use percent_encoding::percent_decode_str;
@@ -104,6 +104,13 @@ pub(super) fn classify(
             bucket: bucket.to_string(),
             op: classify_bucket(method, &params)?,
         });
+    }
+    if !is_addressable_key(key) {
+        return Err(report!(
+            "keys with '.' or '..' path segments, tabs or line breaks are not supported"
+        )
+        .attach(StatusCode::BAD_REQUEST)
+        .into());
     }
     let id = S3ObjectId {
         bucket: bucket.to_string(),
@@ -333,6 +340,9 @@ mod tests {
         assert_eq!(run(Method::GET, "/b/k/", &[]), object("k/"));
         assert_eq!(run(Method::GET, "/b/a//c%20d", &[]), object("a//c d"));
         assert_eq!(run(Method::PUT, "/", &[]), None);
+        assert_eq!(run(Method::GET, "/b/a/../k", &[]), None);
+        assert_eq!(run(Method::GET, "/b/a/%2E/k", &[]), None);
+        assert_eq!(run(Method::GET, "/b/a%09b", &[]), None);
     }
 
     #[test]

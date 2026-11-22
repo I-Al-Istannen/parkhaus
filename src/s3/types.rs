@@ -1,4 +1,5 @@
-use rootcause::{Report, report};
+use crate::data::is_addressable_key;
+use rootcause::{Report, bail, report};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use url::Url;
@@ -18,6 +19,11 @@ impl AddressingStyle {
         bucket: &str,
         key: Option<&str>,
     ) -> Result<ForwardObjectUrl, Report> {
+        if let Some(key) = key
+            && !is_addressable_key(key)
+        {
+            bail!("key cannot be addressed in a URL: {key:?}");
+        }
         let mut url = base_url.clone();
         let host = base_url.host_str().ok_or_else(|| {
             report!("base URL must have a host").attach(format!("url: {base_url}"))
@@ -93,5 +99,55 @@ impl ForwardObjectUrl {
             url,
             host_header: Some(host_header),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AddressingStyle;
+    use crate::s3::crypto::canonical_uri;
+    use url::Url;
+
+    fn path(key: &str) -> Option<String> {
+        let base = Url::parse("http://localhost:3900/").unwrap();
+        AddressingStyle::Path
+            .format_url(&base, "b", Some(key))
+            .ok()
+            .map(|it| it.url.path().to_string())
+    }
+
+    #[test]
+    fn formats_keys_exactly() {
+        let cases = [
+            ("k", "/b/k"),
+            ("a//b", "/b/a//b"),
+            ("a/", "/b/a/"),
+            ("/a", "/b//a"),
+            ("a b+c%d", "/b/a%20b+c%25d"),
+            ("ä?#", "/b/%C3%A4%3F%23"),
+            ("a/.b/..c", "/b/a/.b/..c"),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(path(key).as_deref(), Some(expected), "key: {key}");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments() {
+        for key in [
+            "a/./b", "a/../b", "./a", "..", "a/.", "a\tb", "a\nb", "a\rb",
+        ] {
+            assert_eq!(path(key), None, "key: {key}");
+        }
+    }
+
+    #[test]
+    fn signs_the_forwarded_path() {
+        let base = Url::parse("http://localhost:3900/").unwrap();
+        let url = AddressingStyle::Path
+            .format_url(&base, "b", Some("a b/+ä//c"))
+            .unwrap()
+            .url;
+        assert_eq!(canonical_uri(&url), "/b/a%20b/%2B%C3%A4//c");
     }
 }

@@ -1,6 +1,6 @@
 use super::logging::{TierLogFormatter, bar_progress_style, env_filter, get_indicatif_layer};
 use crate::config::{Config, Upstream};
-use crate::data::{S3Object, S3ObjectId};
+use crate::data::{S3Object, S3ObjectId, is_addressable_key};
 use crate::db::Database;
 use crate::s3::client::{BucketInfo, S3Client};
 use clap::Args;
@@ -10,7 +10,7 @@ use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use rootcause_tracing::RootcauseLayer;
 use std::sync::Arc;
-use tracing::{Instrument, Span, info, info_span, instrument};
+use tracing::{Instrument, Span, info, info_span, instrument, warn};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -121,6 +121,13 @@ async fn record_objects_of_bucket(
 
     let objects = objects
         .into_iter()
+        .filter(|obj| {
+            let addressable = is_addressable_key(&obj.key);
+            if !addressable {
+                warn!(bucket = %bucket.name, key = %obj.key, "skipping key with '.' or '..' segments, tabs or line breaks");
+            }
+            addressable
+        })
         .map(|obj| S3Object {
             id: S3ObjectId {
                 bucket: bucket.name.clone(),

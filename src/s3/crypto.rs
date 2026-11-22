@@ -272,7 +272,7 @@ fn build_canonical_request(
 // CanonicalURI is the URI-encoded version of the absolute path component of the URI -- everything
 // starting with the "/" that follows the domain name and up to the end of the string or to the
 // question mark character ('?') if you have query string parameters.
-fn canonical_uri(url: &Url) -> String {
+pub(crate) fn canonical_uri(url: &Url) -> String {
     // path_segments() yields percent-encoded segments; decode first, then
     // re-encode with the SigV4 encode set so encoding is normalized per spec.
     let Some(segments) = url.path_segments() else {
