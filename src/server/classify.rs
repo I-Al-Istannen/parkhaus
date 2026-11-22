@@ -36,19 +36,39 @@ pub(super) enum ObjectOp {
     },
     Delete,
     CreateMultipart,
-    /// UploadPart, ListParts and AbortMultipartUpload.
-    MultipartStep,
+    /// UploadPart and ListParts.
+    MultipartStep {
+        upload_id: String,
+    },
     UploadPartCopy {
         source: S3ObjectId,
+        upload_id: String,
     },
-    CompleteMultipart,
+    AbortMultipart {
+        upload_id: String,
+    },
+    CompleteMultipart {
+        upload_id: String,
+    },
+}
+
+impl ObjectOp {
+    pub(super) fn upload_id(&self) -> Option<&str> {
+        match self {
+            Self::MultipartStep { upload_id }
+            | Self::UploadPartCopy { upload_id, .. }
+            | Self::AbortMultipart { upload_id }
+            | Self::CompleteMultipart { upload_id } => Some(upload_id),
+            _ => None,
+        }
+    }
 }
 
 impl ObjectOp {
     pub(super) fn is_mutation(&self) -> bool {
         matches!(
             self,
-            Self::Put | Self::Copy { .. } | Self::Delete | Self::CompleteMultipart
+            Self::Put | Self::Copy { .. } | Self::Delete | Self::CompleteMultipart { .. }
         )
     }
 }
@@ -125,8 +145,11 @@ fn classify_object(
     headers: &HeaderMap,
 ) -> Result<ObjectOp, TierError> {
     let copy_source = parse_copy_source(headers)?;
+    let upload_id = || params.value("uploadId").unwrap_or_default().to_string();
     let op = match *method {
-        Method::GET | Method::HEAD if params.has("uploadId") => ObjectOp::MultipartStep,
+        Method::GET | Method::HEAD if params.has("uploadId") => ObjectOp::MultipartStep {
+            upload_id: upload_id(),
+        },
         Method::GET | Method::HEAD => ObjectOp::Read,
         Method::OPTIONS => ObjectOp::Preflight,
         Method::PUT if params.is(&[]) => match copy_source {
@@ -134,13 +157,22 @@ fn classify_object(
             None => ObjectOp::Put,
         },
         Method::PUT if params.is(&["partNumber", "uploadId"]) => match copy_source {
-            Some(source) => ObjectOp::UploadPartCopy { source },
-            None => ObjectOp::MultipartStep,
+            Some(source) => ObjectOp::UploadPartCopy {
+                source,
+                upload_id: upload_id(),
+            },
+            None => ObjectOp::MultipartStep {
+                upload_id: upload_id(),
+            },
         },
         Method::POST if params.is(&["uploads"]) => ObjectOp::CreateMultipart,
-        Method::POST if params.is(&["uploadId"]) => ObjectOp::CompleteMultipart,
+        Method::POST if params.is(&["uploadId"]) => ObjectOp::CompleteMultipart {
+            upload_id: upload_id(),
+        },
         Method::DELETE if params.is(&[]) => ObjectOp::Delete,
-        Method::DELETE if params.is(&["uploadId"]) => ObjectOp::MultipartStep,
+        Method::DELETE if params.is(&["uploadId"]) => ObjectOp::AbortMultipart {
+            upload_id: upload_id(),
+        },
         _ => return Err(not_supported("this object request")),
     };
     Ok(op)
@@ -306,6 +338,9 @@ mod tests {
     #[test]
     fn classifies_object_requests() {
         use ObjectOp::*;
+        let step = || MultipartStep {
+            upload_id: "u".to_string(),
+        };
         let cases = [
             (Method::GET, "", Some(Read)),
             (Method::HEAD, "", Some(Read)),
@@ -315,7 +350,7 @@ mod tests {
                 Some(Read),
             ),
             (Method::GET, "tagging", Some(Read)),
-            (Method::GET, "uploadId=u&max-parts=1", Some(MultipartStep)),
+            (Method::GET, "uploadId=u&max-parts=1", Some(step())),
             (Method::OPTIONS, "", Some(Preflight)),
             (Method::PUT, "", Some(Put)),
             (Method::PUT, "x-id=PutObject", Some(Put)),
@@ -324,13 +359,25 @@ mod tests {
                 "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=s&X-Amz-Expires=60",
                 Some(Put),
             ),
-            (Method::PUT, "partNumber=1&uploadId=u", Some(MultipartStep)),
+            (Method::PUT, "partNumber=1&uploadId=u", Some(step())),
             (Method::POST, "uploads", Some(CreateMultipart)),
             (Method::POST, "uploads=", Some(CreateMultipart)),
-            (Method::POST, "uploadId=u", Some(CompleteMultipart)),
+            (
+                Method::POST,
+                "uploadId=u",
+                Some(CompleteMultipart {
+                    upload_id: "u".to_string(),
+                }),
+            ),
             (Method::DELETE, "", Some(Delete)),
             (Method::DELETE, "x-id=DeleteObject", Some(Delete)),
-            (Method::DELETE, "uploadId=u", Some(MultipartStep)),
+            (
+                Method::DELETE,
+                "uploadId=u",
+                Some(AbortMultipart {
+                    upload_id: "u".to_string(),
+                }),
+            ),
             (Method::GET, "versionId=1", None),
             (Method::DELETE, "versionId=1", None),
             (Method::DELETE, "tagging", None),
@@ -364,7 +411,8 @@ mod tests {
                 &[("x-amz-copy-source", "b/src")]
             ),
             Some(ObjectOp::UploadPartCopy {
-                source: id("b", "src")
+                source: id("b", "src"),
+                upload_id: "u".to_string(),
             })
         );
         assert_eq!(

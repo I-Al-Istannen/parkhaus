@@ -750,6 +750,47 @@ def check_multipart_overwrite_cold_object(ctx: Ctx) -> None:
     ctx.assert_only_on(key, Tier.COLD)
 
 
+def _tracked_uploads(ctx: Ctx, key: str) -> int:
+    return ctx.backend.sqlite_connection.execute(
+        "SELECT COUNT(*) FROM MultipartUploads WHERE bucket = ? AND key = ?",
+        (BUCKET_NAME, key),
+    ).fetchone()[0]
+
+
+def check_multipart_follows_upload_after_move(ctx: Ctx) -> None:
+    key, _ = ctx.put_cold_indexed("mpu-moved")
+    upload_id = ctx.s3.create_multipart_upload(Bucket=BUCKET_NAME, Key=key)["UploadId"]
+    assert _tracked_uploads(ctx, key) == 1
+    # Simulate a migration of the old object while the upload is in progress
+    ctx.backend.sqlite_connection.execute(
+        "UPDATE objects SET assigned_upstream = ? WHERE bucket = ? AND key = ?",
+        (Tier.HOT.value, BUCKET_NAME, key),
+    )
+    ctx.backend.sqlite_connection.commit()
+    body = os.urandom(4096)
+    etag = ctx.s3.upload_part(
+        Bucket=BUCKET_NAME, Key=key, UploadId=upload_id, PartNumber=1, Body=body
+    )["ETag"]
+    ctx.s3.complete_multipart_upload(
+        Bucket=BUCKET_NAME,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]},
+    )
+    ctx.wait_for_row(key, size=len(body), upstream=Tier.COLD)
+    assert ctx.get(key) == body
+    ctx.assert_only_on(key, Tier.COLD)
+    assert _tracked_uploads(ctx, key) == 0
+
+
+def check_abort_forgets_upload(ctx: Ctx) -> None:
+    key = ctx.key("abort-forget")
+    upload_id = ctx.s3.create_multipart_upload(Bucket=BUCKET_NAME, Key=key)["UploadId"]
+    assert _tracked_uploads(ctx, key) == 1
+    ctx.s3.abort_multipart_upload(Bucket=BUCKET_NAME, Key=key, UploadId=upload_id)
+    assert _tracked_uploads(ctx, key) == 0
+
+
 def check_abort_keeps_existing_object(ctx: Ctx) -> None:
     key, body = ctx.put_hot("abort-existing")
     upload_id = ctx.s3.create_multipart_upload(Bucket=BUCKET_NAME, Key=key)["UploadId"]
@@ -883,6 +924,8 @@ CHECKS: list[tuple[str, Callable[[Ctx], None]]] = [
     ("ListMultipartUploads (rejected with 501)", check_list_multipart_uploads_rejected),
     ("Multipart overwrite of cold object", check_multipart_overwrite_cold_object),
     ("AbortMultipartUpload keeps existing object", check_abort_keeps_existing_object),
+    ("Multipart steps follow the upload after a move", check_multipart_follows_upload_after_move),
+    ("AbortMultipartUpload forgets the upload", check_abort_forgets_upload),
     ("UploadPartCopy same upstream", check_upload_part_copy_same_upstream),
     (
         "UploadPartCopy from cold source (rejected with 501)",

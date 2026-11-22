@@ -6,5 +6,6 @@ pub(super) mod metrics;
 pub mod migrate;
 pub mod resolve;
 pub(super) mod state;
+pub mod uploads;
 
 pub use state::KeyLocks;

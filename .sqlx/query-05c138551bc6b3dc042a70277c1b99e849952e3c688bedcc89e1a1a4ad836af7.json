@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM MultipartUploads WHERE upload_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "05c138551bc6b3dc042a70277c1b99e849952e3c688bedcc89e1a1a4ad836af7"
+}

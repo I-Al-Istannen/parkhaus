@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT upload_id, bucket, key, upstream FROM MultipartUploads WHERE created < ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "upload_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "bucket",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "key",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "upstream",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e66d28cb5bf73a5cd5546f734e92f16c32e4b587a544a42cff7f5fe8e5aae48d"
+}

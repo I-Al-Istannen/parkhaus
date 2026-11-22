@@ -1,14 +1,15 @@
 #![allow(unused_crate_dependencies)]
 
 use common::S3Instance;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use parkhaus::config::{Config, S3Secret, Upstream, UpstreamId};
 use parkhaus::data::{S3Object, S3ObjectId};
-use parkhaus::db::{Database, DirtyObject};
+use parkhaus::db::{Database, DirtyObject, MultipartUpload};
 use parkhaus::s3::client::S3Client;
 use parkhaus::s3::types::AddressingStyle;
 use parkhaus::server::KeyLocks;
 use parkhaus::server::resolve::{resolve, sweep};
+use parkhaus::server::uploads::{ABANDONED_UPLOAD_AGE, reap_abandoned_uploads};
 use reqwest::Client;
 use rootcause::Report;
 use std::io::Cursor;
@@ -326,5 +327,30 @@ async fn migration_keeps_the_object_timestamps() -> Result<(), Report> {
     assert_eq!(row.assigned_upstream, cold());
     assert_eq!(row.last_modified, Timestamp::UNIX_EPOCH);
     assert!(!env.exists(&hot(), &id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandoned_uploads_are_reaped() -> Result<(), Report> {
+    let env = Env::new().await?;
+    let upload = |id: &str| MultipartUpload {
+        upload_id: id.to_string(),
+        object: object("upload"),
+        upstream: hot(),
+    };
+    let now = Timestamp::now();
+    env.db
+        .add_upload(
+            &upload("old"),
+            now - ABANDONED_UPLOAD_AGE - SignedDuration::from_secs(1),
+        )
+        .await?;
+    env.db.add_upload(&upload("recent"), now).await?;
+
+    let reaped = reap_abandoned_uploads(&env.config, &env.db, &env.http, now).await?;
+
+    assert_eq!(reaped, 1);
+    assert_eq!(env.db.get_upload_upstream("old").await?, None);
+    assert_eq!(env.db.get_upload_upstream("recent").await?, Some(hot()));
     Ok(())
 }

@@ -5,7 +5,8 @@ use crate::db::{Database, DirtyObject};
 use crate::s3::client::S3Client;
 use crate::server::resolve::{resolve, sweep};
 use crate::server::state::KeyLocks;
-use jiff::Zoned;
+use crate::server::uploads::reap_abandoned_uploads;
+use jiff::{Timestamp, Zoned};
 use reqwest::Client;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
@@ -33,6 +34,10 @@ pub async fn migration_task(
 
             if let Err(error) = sweep(&config, &db, &http, &key_locks).await {
                 error!(%error, "Failed to resolve dirty objects");
+            }
+            if let Err(error) = reap_abandoned_uploads(&config, &db, &http, Timestamp::now()).await
+            {
+                error!(%error, "Failed to abort abandoned multipart uploads");
             }
 
             debug!("Computing pending migrations");

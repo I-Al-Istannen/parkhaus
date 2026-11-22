@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO MultipartUploads (upload_id, bucket, key, upstream, created) VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "bc06c057f027882d8372a0728296fd4cb02f2136447e5672e66884d764b73515"
+}

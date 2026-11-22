@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT upstream FROM MultipartUploads WHERE upload_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "upstream",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6e5eeb6c407579f78e56fbb28b478253f65e009f544c35f8f2b91fd744acc0f2"
+}

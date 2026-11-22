@@ -2,9 +2,11 @@ mod access_times;
 mod dirty;
 mod migrate;
 mod objects;
+mod uploads;
 
 pub use self::dirty::{DirtyObject, Resolution};
 pub use self::objects::TieringRuleEnv;
+pub use self::uploads::MultipartUpload;
 use crate::data::{PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId};
 use jiff::{Timestamp, Zoned};
 use rootcause::Report;
@@ -225,6 +227,38 @@ impl Database {
         dirty::clear(&mut transaction, obj).await?;
         transaction.commit().await.context("commit transaction")?;
         Ok(())
+    }
+
+    pub async fn add_upload(
+        &self,
+        upload: &MultipartUpload,
+        created: Timestamp,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        uploads::add(
+            &mut *con.acquire().await.context("acquire con")?,
+            upload,
+            created,
+        )
+        .await
+    }
+
+    pub async fn get_upload_upstream(&self, upload_id: &str) -> Result<Option<UpstreamId>, Report> {
+        let con = self.read().await;
+        uploads::get_upstream(&mut *con.acquire().await.context("acquire con")?, upload_id).await
+    }
+
+    pub async fn remove_upload(&self, upload_id: &str) -> Result<(), Report> {
+        let con = self.write().await;
+        uploads::remove(&mut *con.acquire().await.context("acquire con")?, upload_id).await
+    }
+
+    pub async fn get_uploads_older_than(
+        &self,
+        cutoff: Timestamp,
+    ) -> Result<Vec<MultipartUpload>, Report> {
+        let con = self.read().await;
+        uploads::get_older_than(&mut *con.acquire().await.context("acquire con")?, cutoff).await
     }
 
     pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {

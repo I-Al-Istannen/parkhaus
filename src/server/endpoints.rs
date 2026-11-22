@@ -1,6 +1,6 @@
 use crate::config::Upstream;
 use crate::data::S3ObjectId;
-use crate::db::DirtyObject;
+use crate::db::{DirtyObject, MultipartUpload};
 use crate::error::TierError;
 use crate::s3::types::ForwardObjectUrl;
 use crate::server::batch_delete::proxy_delete_objects;
@@ -12,14 +12,16 @@ use crate::server::metrics::{
 };
 use crate::server::resolve::resolve;
 use crate::server::state::AppState;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{OriginalUri, Request, State};
+use axum::http::response::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
+use serde::Deserialize;
 use std::collections::HashSet;
 use tracing::{debug, warn};
 
@@ -69,8 +71,11 @@ async fn proxy_object_request(
             .context("mutation task failed")?;
     }
 
-    let upstream = upstream_for(&state, &object_id, req.method()).await?;
-    if let ObjectOp::UploadPartCopy { source } = &op
+    let upstream = match op.upload_id() {
+        Some(upload_id) => upload_upstream(&state, &object_id, upload_id, req.method()).await?,
+        None => upstream_for(&state, &object_id, req.method()).await?,
+    };
+    if let ObjectOp::UploadPartCopy { source, .. } = &op
         && upstream_for(&state, source, req.method()).await?.name != upstream.name
     {
         return Err(not_supported("UploadPartCopy across upstreams"));
@@ -78,12 +83,80 @@ async fn proxy_object_request(
 
     let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
     target_url.url.set_query(req.uri().query());
+    if op == ObjectOp::CreateMultipart {
+        // Detached, so a client disconnect cannot lose the upload ID.
+        let upstream = upstream.clone();
+        return tokio::spawn(async move {
+            create_multipart_upload(&state, &upstream, object_id, target_url, req).await
+        })
+        .await
+        .context("multipart creation task failed")?;
+    }
     let on_success = async {
-        if op == ObjectOp::Read {
-            drop(tokio::spawn(record_access(state.clone(), object_id)));
+        match &op {
+            ObjectOp::Read => drop(tokio::spawn(record_access(state.clone(), object_id))),
+            ObjectOp::AbortMultipart { upload_id } => {
+                if let Err(e) = state.db.remove_upload(upload_id).await {
+                    warn!(%e, %upload_id, "failed to forget aborted multipart upload");
+                }
+            }
+            _ => {}
         }
     };
     forward_request(&state, upstream, target_url, req, on_success).await
+}
+
+/// Remembers the upstream of the new upload, so later steps reach it even if the object moves.
+async fn create_multipart_upload(
+    state: &AppState,
+    upstream: &Upstream,
+    object: S3ObjectId,
+    target_url: ForwardObjectUrl,
+    req: Request,
+) -> Result<Response, TierError> {
+    #[derive(Deserialize)]
+    struct InitiateMultipartUploadResult {
+        #[serde(rename = "UploadId")]
+        upload_id: String,
+    }
+
+    let response =
+        buffer_response(forward_request(state, upstream, target_url, req, async {}).await?).await?;
+    if response.succeeded() {
+        let result: InitiateMultipartUploadResult = quick_xml::de::from_reader(&response.body[..])
+            .context("invalid CreateMultipartUpload response")
+            .attach(format!("upstream: {}", upstream.name))?;
+        let upload = MultipartUpload {
+            upload_id: result.upload_id,
+            object,
+            upstream: upstream.name.clone(),
+        };
+        state
+            .db
+            .add_upload(&upload, Timestamp::now())
+            .await
+            .context("failed to record multipart upload")?;
+    }
+    Ok(response.into_response())
+}
+
+/// Uploads created before parkhaus tracked them follow the object.
+async fn upload_upstream<'a>(
+    state: &'a AppState,
+    object_id: &S3ObjectId,
+    upload_id: &str,
+    method: &Method,
+) -> Result<&'a Upstream, TierError> {
+    let recorded = state
+        .db
+        .get_upload_upstream(upload_id)
+        .await
+        .context("failed to get upstream for multipart upload")?
+        .and_then(|it| state.config.upstreams.get(&it));
+    match recorded {
+        Some(upstream) => Ok(upstream),
+        None => upstream_for(state, object_id, method).await,
+    }
 }
 
 /// Marks the object dirty on every upstream the request may change, forwards it and resolves the
@@ -104,7 +177,12 @@ async fn mutate(
         ObjectOp::Copy { source } => source,
         _ => &object_id,
     };
-    let upstream = upstream_for(&state, routing_id, req.method()).await?;
+    let upstream = match &op {
+        ObjectOp::CompleteMultipart { upload_id } => {
+            upload_upstream(&state, &object_id, upload_id, req.method()).await?
+        }
+        _ => upstream_for(&state, routing_id, req.method()).await?,
+    };
     let assigned = state
         .db
         .get_upstream(&object_id)
@@ -129,7 +207,7 @@ async fn mutate(
             .await?;
 
     // A rejected request changed nothing. Resolving would mistake a migrated copy for a new write.
-    let resolved = if response.status().is_client_error() {
+    let resolved = if response.parts.status.is_client_error() {
         state.db.clear_dirty(&object_id).await
     } else {
         resolve(&state.config, &state.db, &state.http, &object_id).await
@@ -137,34 +215,55 @@ async fn mutate(
     if let Err(e) = resolved {
         warn!(%e, %object_id, "failed to resolve mutation, leaving it to the sweep");
         // Reads still go to the previous copy, so the change must not look finished yet.
-        if response.status().is_success() {
+        if response.succeeded() {
             return Err(e
                 .context("failed to record mutation")
                 .attach(StatusCode::SERVICE_UNAVAILABLE)
                 .into());
         }
     }
-    if response.status().is_success() {
+    if response.succeeded() {
         let name = match op {
             ObjectOp::Delete => COUNTER_OBJECT_DELETIONS_TOTAL,
             _ => COUNTER_OBJECT_CREATIONS_TOTAL,
         };
         counter!(name, "upstream" => upstream.name.0.clone()).increment(1);
+        if let ObjectOp::CompleteMultipart { upload_id } = &op
+            && let Err(e) = state.db.remove_upload(upload_id).await
+        {
+            warn!(%e, %upload_id, "failed to forget completed multipart upload");
+        }
         if op != ObjectOp::Delete {
             record_access(state.clone(), object_id).await;
         }
     }
-    Ok(response)
+    Ok(response.into_response())
 }
 
-/// Waits for the complete response, as e.g. CompleteMultipartUpload only reports errors in it.
-async fn buffer_response(response: Response) -> Result<Response, TierError> {
+struct BufferedResponse {
+    parts: Parts,
+    body: Bytes,
+}
+
+impl BufferedResponse {
+    /// CompleteMultipartUpload and CopyObject can report errors in a 200 response.
+    fn succeeded(&self) -> bool {
+        self.parts.status.is_success() && !self.body.windows(7).any(|it| it == b"<Error>")
+    }
+
+    fn into_response(self) -> Response {
+        Response::from_parts(self.parts, Body::from(self.body))
+    }
+}
+
+/// Waits for the complete response, as some operations only report errors in the body.
+async fn buffer_response(response: Response) -> Result<BufferedResponse, TierError> {
     const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
     let (parts, body) = response.into_parts();
     let body = to_bytes(body, MAX_BODY_SIZE)
         .await
         .context("failed to read upstream response")?;
-    Ok(Response::from_parts(parts, Body::from(body)))
+    Ok(BufferedResponse { parts, body })
 }
 
 async fn upstream_for<'a>(

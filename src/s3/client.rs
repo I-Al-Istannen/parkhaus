@@ -241,6 +241,25 @@ impl S3Client {
         }))
     }
 
+    /// Aborts a multipart upload. Returns `false` if the upload did not exist.
+    pub async fn abort_multipart_upload(
+        &self,
+        id: &S3ObjectId,
+        upload_id: &str,
+    ) -> Result<bool, Report> {
+        let mut target = self.object_url(id)?;
+        target
+            .url
+            .query_pairs_mut()
+            .append_pair("uploadId", upload_id);
+        let response = self.send_signed(&target, Method::DELETE, &[]).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        check_status(response, &Method::DELETE, &target.url).await?;
+        Ok(true)
+    }
+
     /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
     /// `true` if it was deleted.
     pub async fn delete_file(&self, id: &S3ObjectId) -> Result<bool, Report> {
