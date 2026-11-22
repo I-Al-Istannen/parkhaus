@@ -34,6 +34,8 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 struct DeleteRequest {
     #[serde(rename = "Object", default)]
     objects: Vec<ObjectVersion>,
+    #[serde(rename = "Quiet", default)]
+    quiet: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -152,6 +154,7 @@ pub(super) async fn proxy_delete_objects(
         .context("invalid DeleteObjects request")
         .attach(StatusCode::BAD_REQUEST)?;
 
+    let quiet = request.quiet;
     let mut seen = HashSet::new();
     let versions: Vec<_> = request
         .objects
@@ -212,8 +215,13 @@ pub(super) async fn proxy_delete_objects(
         }
     }
 
-    let body = quick_xml::se::to_string(&DeleteResult::merge(&successful, &versions))
-        .context("failed to serialize DeleteObjects response")?;
+    let mut merged = DeleteResult::merge(&successful, &versions);
+    // Some upstreams list deletions even in quiet mode
+    if quiet {
+        merged.deleted.clear();
+    }
+    let body =
+        quick_xml::se::to_string(&merged).context("failed to serialize DeleteObjects response")?;
     let mut response = Response::new(Body::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_string() + &body,
     ));
