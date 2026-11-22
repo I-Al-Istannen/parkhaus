@@ -22,9 +22,20 @@ pub(super) async fn record_access(
         object.key,
         time_bucket
     )
-    .execute(con)
+    .execute(&mut *con)
     .await
     .context("Failed to add access counter")?;
+
+    let now_ms = now.timestamp().as_millisecond();
+    query!(
+        "UPDATE Objects SET last_accessed = ? WHERE bucket = ? AND key = ?",
+        now_ms,
+        object.bucket,
+        object.key
+    )
+    .execute(con)
+    .await
+    .context("Failed to update last access time")?;
 
     Ok(())
 }

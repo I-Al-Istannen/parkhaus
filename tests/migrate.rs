@@ -551,3 +551,28 @@ async fn literal_rules_can_be_excluded() -> Result<(), Report> {
     assert_eq!(pending, vec!["a/k->Cold".to_string()]);
     Ok(())
 }
+
+#[tokio::test]
+async fn accesses_update_last_accessed() -> Result<(), Report> {
+    let db = Database::in_memory().await?;
+    let mut object = hot_object("a", "k");
+    object.last_modified = Zoned::now().timestamp() - Span::new().hours(48);
+    db.record_creation(&object).await?;
+    db.record_access(&object.id, &Zoned::now()).await?;
+
+    let base = test_config()?;
+    let expr = "last_accessed > 1h";
+    let config = Config::new(
+        base.listen,
+        None,
+        base.db_path,
+        base.upstreams.into_values().collect(),
+        vec![TieringRule {
+            to: UpstreamId(Tier::Cold.to_string()),
+            filter: typecheck(parse_expr(expr).unwrap(), expr).unwrap(),
+        }],
+    )?;
+    let pending = compute_pending_migrations(&config, &db, Zoned::now()).await?;
+    assert!(pending.is_empty(), "{pending:?}");
+    Ok(())
+}

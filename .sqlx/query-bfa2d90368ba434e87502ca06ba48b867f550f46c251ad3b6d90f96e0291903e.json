@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE Objects SET last_accessed = ? WHERE bucket = ? AND key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "bfa2d90368ba434e87502ca06ba48b867f550f46c251ad3b6d90f96e0291903e"
+}
