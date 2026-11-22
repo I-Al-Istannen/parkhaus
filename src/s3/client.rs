@@ -85,6 +85,17 @@ impl S3Client {
             .collect())
     }
 
+    pub async fn create_bucket(&self, bucket: &str) -> Result<(), Report> {
+        let target = self
+            .addressing_style
+            .format_bucket_url(&self.endpoint, bucket)?;
+        self.signed_request(&target, Method::PUT, &[])
+            .await
+            .context("failed to create bucket")
+            .attach(format!("bucket: {bucket}"))?;
+        Ok(())
+    }
+
     pub async fn list_objects(&self, bucket: &str) -> Result<Vec<ObjectInfo>, Report> {
         let mut all_objects = Vec::new();
         let mut continuation_token: Option<String> = None;
