@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO DirtyObjects (bucket, key, target, previous, migration) VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "7d3e8fd991cf682d50fff7058fc7967df514b0080cf16352c5011c5af5103905"
+}

@@ -1,24 +1,26 @@
-//! DeleteObjects sent to every upstream, as unindexed objects can live on any of them.
+//! DeleteObjects sent to every upstream, as the signed body cannot be split by upstream.
 //!
 //! The client's request is forwarded unchanged, so its signature stays valid. An object is deleted
 //! if no upstream reports an error other than `NoSuchKey` for it, which some upstreams (e.g.
-//! Garage) report for keys held by other upstreams.
+//! Garage) report for keys they do not hold.
 
 use crate::config::{Upstream, UpstreamId};
 use crate::data::S3ObjectId;
+use crate::db::{DirtyObject, Resolution};
 use crate::error::TierError;
+use crate::server::classify::not_supported;
 use crate::server::endpoints;
 use crate::server::metrics::COUNTER_OBJECT_DELETIONS_TOTAL;
+use crate::server::resolve::resolve;
 use crate::server::state::AppState;
 use axum::body::{Body, to_bytes};
 use axum::extract::Request;
+use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, Method};
 use axum::response::{IntoResponse, Response};
 use axum_prometheus::metrics::counter;
 use futures_util::future::join_all;
 use reqwest::StatusCode;
-use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
@@ -98,6 +100,14 @@ impl DeleteResult {
         })
     }
 
+    /// Quiet responses only list errors, so anything without a real error was deleted.
+    fn reports_deleted(&self, key: &str) -> bool {
+        !self
+            .errors
+            .iter()
+            .any(|it| !it.is_missing() && it.key == key)
+    }
+
     fn deleted_for(&self, object: &ObjectVersion) -> Option<&Deleted> {
         self.deleted
             .iter()
@@ -152,6 +162,9 @@ pub(super) async fn proxy_delete_objects(
         })
         .filter(|it| seen.insert(it.clone()))
         .collect();
+    if versions.iter().any(|it| it.version_id.is_some()) {
+        return Err(not_supported("deleting object versions"));
+    }
     let objects: BTreeSet<_> = versions
         .iter()
         .map(|it| S3ObjectId {
@@ -160,48 +173,46 @@ pub(super) async fn proxy_delete_objects(
         })
         .collect();
 
-    // A migration running concurrently could copy an object to its target after we deleted it
-    // there. Readers queue behind waiting migrations, so batches lock in key order (and each key
-    // once) to not deadlock each other.
-    let mut guards = Vec::with_capacity(objects.len());
-    for object in &objects {
-        guards.push(
-            state
-                .migration_locks
-                .wait_for_migration(&Method::POST, object)
-                .await,
-        );
-    }
+    // Detached, so a client disconnect cannot cancel the bookkeeping.
+    let state = state.clone();
+    let bucket = bucket.to_string();
+    let results = tokio::spawn(async move {
+        let _guards = state.key_locks.lock_all(&objects).await;
+        let assigned = mark_dirty(&state, &objects).await?;
 
-    let upstreams = state.config.upstreams_in_order();
-    let results = join_all(upstreams.iter().map(|upstream| {
-        let req = Request::from_parts(parts.clone(), Body::from(body.clone()));
-        async move {
-            match delete_on(state, bucket, upstream, req).await {
-                Ok(result) => result,
-                Err(error) => Err(error.into_response()),
-            }
+        let upstreams = state.config.upstreams_in_order();
+        let results = join_all(upstreams.iter().map(|upstream| {
+            let req = Request::from_parts(parts.clone(), Body::from(body.clone()));
+            delete_on(&state, &bucket, upstream, req)
+        }))
+        .await;
+
+        // Responses are not `Sync`, so they must not be borrowed across awaits
+        let outcomes = assigned
+            .into_iter()
+            .map(|(object, upstream)| {
+                let deleted = upstreams.iter().zip(&results).any(|(it, result)| {
+                    it.name == upstream
+                        && matches!(result, Ok(Ok(result)) if result.reports_deleted(&object.key))
+                });
+                (object, upstream, deleted)
+            })
+            .collect::<Vec<_>>();
+        resolve_deletions(&state, outcomes).await;
+        Ok::<_, TierError>(results)
+    })
+    .await
+    .context("DeleteObjects task failed")??;
+
+    let mut successful = Vec::new();
+    for result in results {
+        match result? {
+            Ok(result) => successful.push(result),
+            Err(response) => return Ok(response.into_response()),
         }
-    }))
-    .await;
-
-    // Responses are not `Sync`, so only the successful results are kept across awaits
-    let succeeded: Vec<_> = upstreams
-        .iter()
-        .zip(&results)
-        .filter_map(|(upstream, result)| Some((&upstream.name, result.as_ref().ok()?)))
-        .collect();
-    if let Err(e) = record_deletions(state, &objects, &succeeded).await {
-        warn!(%e, "failed to record batch deletion");
     }
-    drop(guards);
 
-    let results = match results.into_iter().collect::<Result<Vec<_>, _>>() {
-        Ok(results) => results,
-        Err(response) => return Ok(response),
-    };
-
-    let body = quick_xml::se::to_string(&DeleteResult::merge(&results, &versions))
+    let body = quick_xml::se::to_string(&DeleteResult::merge(&successful, &versions))
         .context("failed to serialize DeleteObjects response")?;
     let mut response = Response::new(Body::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_string() + &body,
@@ -212,13 +223,66 @@ pub(super) async fn proxy_delete_objects(
     Ok(response)
 }
 
+/// Resolves leftovers and marks every known object dirty on its upstream.
+async fn mark_dirty(
+    state: &AppState,
+    objects: &BTreeSet<S3ObjectId>,
+) -> Result<Vec<(S3ObjectId, UpstreamId)>, TierError> {
+    let mut assigned = Vec::new();
+    for object in objects {
+        resolve(&state.config, &state.db, &state.http, object)
+            .await
+            .context("failed to resolve earlier mutation")?;
+        let Some(upstream) = state
+            .db
+            .get_upstream(object)
+            .await
+            .context("failed to get upstream for object")?
+        else {
+            continue;
+        };
+        state
+            .db
+            .mark_dirty(
+                object,
+                &DirtyObject {
+                    target: upstream.clone(),
+                    previous: None,
+                    migration: false,
+                },
+            )
+            .await
+            .context("failed to mark object dirty")?;
+        assigned.push((object.clone(), upstream));
+    }
+    Ok(assigned)
+}
+
+/// Objects their upstream reported as deleted are forgotten right away, everything else is checked
+/// with a HEAD.
+async fn resolve_deletions(state: &AppState, outcomes: Vec<(S3ObjectId, UpstreamId, bool)>) {
+    for (object, upstream, deleted) in &outcomes {
+        let resolved = if *deleted {
+            counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream.0.clone()).increment(1);
+            state.db.resolve_dirty(object, &Resolution::Delete).await
+        } else {
+            resolve(&state.config, &state.db, &state.http, object).await
+        };
+        if let Err(e) = resolved {
+            warn!(%e, %object, "failed to resolve deletion, leaving it to the sweep");
+        }
+    }
+}
+
+type UpstreamResult = Result<Result<DeleteResult, Response>, TierError>;
+
 /// Returns the upstream's error response as is.
 async fn delete_on(
     state: &AppState,
     bucket: &str,
     upstream: &Upstream,
     req: Request,
-) -> Result<Result<DeleteResult, Response>, TierError> {
+) -> UpstreamResult {
     let mut url = upstream.format_url(bucket, None)?;
     url.url.set_query(req.uri().query());
     let response = endpoints::forward_request(state, upstream, url, req, async {}).await?;
@@ -231,42 +295,6 @@ async fn delete_on(
     Ok(Ok(quick_xml::de::from_reader(&body[..])
         .context("invalid DeleteObjects response")
         .attach(format!("upstream: {}", upstream.name))?))
-}
-
-/// Forgets objects that are gone from their assigned upstream, even if others failed.
-async fn record_deletions(
-    state: &AppState,
-    objects: &BTreeSet<S3ObjectId>,
-    succeeded: &[(&UpstreamId, &DeleteResult)],
-) -> Result<(), Report> {
-    for object in objects {
-        let Some(assigned) = state
-            .db
-            .get_upstream(object)
-            .await
-            .context("failed to get upstream for object")?
-        else {
-            continue;
-        };
-        let gone = succeeded.iter().any(|(upstream, result)| {
-            **upstream == assigned
-                && !result
-                    .errors
-                    .iter()
-                    .any(|it| !it.is_missing() && it.key == object.key)
-        });
-        if !gone {
-            continue;
-        }
-        counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => assigned.0.clone()).increment(1);
-        state
-            .db
-            .delete_object(object)
-            .await
-            .context("failed to record deletion")
-            .attach(format!("object: {object:?}"))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

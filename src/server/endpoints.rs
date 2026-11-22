@@ -1,7 +1,7 @@
 use crate::config::Upstream;
-use crate::data::{S3Object, S3ObjectId, UpstreamId};
+use crate::data::S3ObjectId;
+use crate::db::DirtyObject;
 use crate::error::TierError;
-use crate::s3::client::S3Client;
 use crate::s3::types::ForwardObjectUrl;
 use crate::server::batch_delete::proxy_delete_objects;
 use crate::server::classify::{BucketOp, Classified, ObjectOp, classify, not_supported};
@@ -10,14 +10,16 @@ use crate::server::metrics::{
     COUNTER_OBJECT_CREATIONS_TOTAL, COUNTER_OBJECT_DELETIONS_TOTAL,
     COUNTER_UPSTREAM_FALLBACKS_TOTAL, COUNTER_UPSTREAM_FORWARDS_TOTAL,
 };
-use crate::server::state::{AppState, MutationLockGuard};
-use axum::body::Body;
+use crate::server::resolve::resolve;
+use crate::server::state::AppState;
+use axum::body::{Body, to_bytes};
 use axum::extract::{OriginalUri, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum_prometheus::metrics::counter;
+use jiff::Zoned;
+use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use rootcause::{Report, report};
 use std::collections::HashSet;
 use tracing::{debug, warn};
 
@@ -60,11 +62,42 @@ async fn proxy_object_request(
     if op == ObjectOp::Preflight {
         return forward_to_hottest(&state, &object_id.bucket, Some(&object_id.key), req).await;
     }
+    if op.is_mutation() {
+        // Detached, so a client disconnect cannot cancel the bookkeeping.
+        return tokio::spawn(mutate(state, object_id, op, req))
+            .await
+            .context("mutation task failed")?;
+    }
 
-    let mutation_guard = state
-        .migration_locks
-        .wait_for_migration(req.method(), &object_id)
-        .await;
+    let upstream = upstream_for(&state, &object_id, req.method()).await?;
+    if let ObjectOp::UploadPartCopy { source } = &op
+        && upstream_for(&state, source, req.method()).await?.name != upstream.name
+    {
+        return Err(not_supported("UploadPartCopy across upstreams"));
+    }
+
+    let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
+    target_url.url.set_query(req.uri().query());
+    let on_success = async {
+        if op == ObjectOp::Read {
+            drop(tokio::spawn(record_access(state.clone(), object_id)));
+        }
+    };
+    forward_request(&state, upstream, target_url, req, on_success).await
+}
+
+/// Marks the object dirty on every upstream the request may change, forwards it and resolves the
+/// outcome. If anything fails in between, the dirty marks stay for the sweep.
+async fn mutate(
+    state: AppState,
+    object_id: S3ObjectId,
+    op: ObjectOp,
+    req: Request,
+) -> Result<Response, TierError> {
+    let _guard = state.key_locks.lock(&object_id).await;
+    resolve(&state.config, &state.db, &state.http, &object_id)
+        .await
+        .context("failed to resolve earlier mutation")?;
 
     // CopyObject is executed by the upstream holding the source, the destination follows it.
     let routing_id = match &op {
@@ -72,34 +105,66 @@ async fn proxy_object_request(
         _ => &object_id,
     };
     let upstream = upstream_for(&state, routing_id, req.method()).await?;
-
-    if let ObjectOp::UploadPartCopy { source } = &op
-        && upstream_for(&state, source, req.method()).await?.name != upstream.name
-    {
-        return Err(not_supported("UploadPartCopy across upstreams"));
-    }
-
-    let stale_upstream = match &op {
-        ObjectOp::Copy { .. } => state
-            .db
-            .get_upstream(&object_id)
-            .await
-            .context("failed to get upstream for copy destination")?
-            .filter(|it| *it != upstream.name),
-        _ => None,
+    let assigned = state
+        .db
+        .get_upstream(&object_id)
+        .await
+        .context("failed to get upstream for object")?;
+    let dirty = DirtyObject {
+        target: upstream.name.clone(),
+        previous: assigned,
+        migration: false,
     };
+    state
+        .db
+        .mark_dirty(&object_id, &dirty)
+        .await
+        .context("failed to mark object dirty")?;
 
     let mut target_url = upstream.format_url(&object_id.bucket, Some(&object_id.key))?;
     target_url.url.set_query(req.uri().query());
-    let on_success = record_successful_request(
-        op,
-        object_id,
-        state.clone(),
-        upstream.name.clone(),
-        stale_upstream,
-        mutation_guard,
-    );
-    forward_request(&state, upstream, target_url, req, on_success).await
+    // Without a complete response the upstream may still apply the change, so it stays dirty.
+    let response =
+        buffer_response(forward_request(&state, upstream, target_url, req, async {}).await?)
+            .await?;
+
+    // A rejected request changed nothing. Resolving would mistake a migrated copy for a new write.
+    let resolved = if response.status().is_client_error() {
+        state.db.clear_dirty(&object_id).await
+    } else {
+        resolve(&state.config, &state.db, &state.http, &object_id).await
+    };
+    if let Err(e) = resolved {
+        warn!(%e, %object_id, "failed to resolve mutation, leaving it to the sweep");
+        // Reads still go to the previous copy, so the change must not look finished yet.
+        if response.status().is_success() {
+            return Err(e
+                .context("failed to record mutation")
+                .attach(StatusCode::SERVICE_UNAVAILABLE)
+                .into());
+        }
+    }
+    if response.status().is_success() {
+        let name = match op {
+            ObjectOp::Delete => COUNTER_OBJECT_DELETIONS_TOTAL,
+            _ => COUNTER_OBJECT_CREATIONS_TOTAL,
+        };
+        counter!(name, "upstream" => upstream.name.0.clone()).increment(1);
+        if op != ObjectOp::Delete {
+            record_access(state.clone(), object_id).await;
+        }
+    }
+    Ok(response)
+}
+
+/// Waits for the complete response, as e.g. CompleteMultipartUpload only reports errors in it.
+async fn buffer_response(response: Response) -> Result<Response, TierError> {
+    const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+    let (parts, body) = response.into_parts();
+    let body = to_bytes(body, MAX_BODY_SIZE)
+        .await
+        .context("failed to read upstream response")?;
+    Ok(Response::from_parts(parts, Body::from(body)))
 }
 
 async fn upstream_for<'a>(
@@ -234,137 +299,16 @@ fn connection_header_names(headers: &HeaderMap) -> HashSet<HeaderName> {
         .collect()
 }
 
-async fn record_successful_request(
-    op: ObjectOp,
-    obj_id: S3ObjectId,
-    state: AppState,
-    upstream_name: UpstreamId,
-    stale_upstream: Option<UpstreamId>,
-    mutation_guard: MutationLockGuard,
-) {
-    let is_mutation = op.is_mutation();
-    let recording = async move {
-        let _mutation_guard = mutation_guard;
-        if let Err(e) = record(
-            &op,
-            &obj_id,
-            &state,
-            &upstream_name,
-            stale_upstream.as_ref(),
-        )
-        .await
-        {
-            warn!(%e, object_id=?obj_id, "failed to record object creation/deletion");
+async fn record_access(state: AppState, object_id: S3ObjectId) {
+    let recording = async {
+        if state.db.has_object(&object_id).await? {
+            state.db.record_access(&object_id, &Zoned::now()).await?;
         }
+        Ok::<_, Report>(())
     };
-    // The client's next request must be routed according to its writes and deletes.
-    if is_mutation {
-        recording.await;
-    } else {
-        drop(tokio::spawn(recording));
+    if let Err(e) = recording.await {
+        warn!(%e, %object_id, "failed to record access");
     }
-}
-
-async fn record(
-    op: &ObjectOp,
-    obj_id: &S3ObjectId,
-    state: &AppState,
-    upstream_name: &UpstreamId,
-    stale_upstream: Option<&UpstreamId>,
-) -> Result<(), Report> {
-    match op {
-        ObjectOp::Delete => {
-            counter!(COUNTER_OBJECT_DELETIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                .increment(1);
-            state
-                .db
-                .delete_object(obj_id)
-                .await
-                .context("failed to record deletion")
-                .attach(format!("object: {obj_id:?}"))?;
-            return Ok(());
-        }
-        ObjectOp::Put | ObjectOp::Copy { .. } | ObjectOp::CompleteMultipart => {
-            counter!(COUNTER_OBJECT_CREATIONS_TOTAL, "upstream" => upstream_name.0.clone())
-                .increment(1);
-            record_from_upstream(state, upstream_name, obj_id)
-                .await
-                .context("failed to record creation")
-                .attach(format!("object: {obj_id:?}"))?;
-            if let Some(stale) = stale_upstream {
-                delete_from_upstream(state, stale, obj_id)
-                    .await
-                    .context("failed to delete overwritten object")
-                    .attach(format!("object: {obj_id:?}"))?;
-            }
-        }
-        ObjectOp::Read => {
-            if !state
-                .db
-                .has_object(obj_id)
-                .await
-                .context("failed to check object existence")?
-            {
-                return Ok(());
-            }
-        }
-        ObjectOp::Preflight
-        | ObjectOp::CreateMultipart
-        | ObjectOp::MultipartStep
-        | ObjectOp::UploadPartCopy { .. } => return Ok(()),
-    }
-
-    state
-        .db
-        .record_access(obj_id, &jiff::Zoned::now())
-        .await
-        .context("failed to record access")
-        .attach(format!("object: {obj_id:?}"))?;
-
-    Ok(())
-}
-
-async fn delete_from_upstream(
-    state: &AppState,
-    upstream_name: &UpstreamId,
-    obj_id: &S3ObjectId,
-) -> Result<(), Report> {
-    let upstream = state.config.upstreams.get(upstream_name).ok_or_else(|| {
-        report!("upstream not found in config").attach(format!("upstream: '{upstream_name:?}'"))
-    })?;
-    S3Client::for_upstream(state.http.clone(), upstream)
-        .delete_file(obj_id)
-        .await
-        .context("failed to DELETE file")
-        .attach(format!("upstream: '{upstream_name:?}'"))?;
-    Ok(())
-}
-
-async fn record_from_upstream(
-    state: &AppState,
-    upstream_name: &UpstreamId,
-    obj_id: &S3ObjectId,
-) -> Result<(), Report> {
-    let upstream = state.config.upstreams.get(upstream_name).ok_or_else(|| {
-        report!("upstream not found in config").attach(format!("upstream: '{upstream_name:?}'"))
-    })?;
-    let metadata = S3Client::for_upstream(state.http.clone(), upstream)
-        .head_file(obj_id)
-        .await
-        .context("failed to HEAD file")
-        .attach(format!("object: {obj_id:?}"))?;
-    state
-        .db
-        .record_creation(&S3Object {
-            id: obj_id.clone(),
-            assigned_upstream: upstream_name.clone(),
-            last_modified: metadata.last_modified,
-            size: metadata.size,
-        })
-        .await
-        .context("failed to record object")?;
-
-    Ok(())
 }
 
 #[cfg(test)]

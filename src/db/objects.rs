@@ -38,7 +38,7 @@ impl TieringRuleEnv {
                 //                       wanted timerange
                 // Which encloses the wanted timerange but no other bucket.
                 format!(
-                    "(SELECT SUM(count) FROM AccessCounters WHERE \
+                    "(SELECT COALESCE(SUM(count), 0) FROM AccessCounters WHERE \
                         obj_bucket = bucket AND \
                         obj_key = key AND \
                         time_bucket BETWEEN ({now_var} - {} - 86400000) AND ({now_var} - {}))",
@@ -102,6 +102,28 @@ impl TryFrom<DbObject> for S3Object {
     }
 }
 
+pub(super) async fn find_object(
+    con: &mut SqliteConnection,
+    obj: &S3ObjectId,
+) -> Result<Option<S3Object>, Report> {
+    query_as!(
+        DbObject,
+        r#"
+        SELECT
+            bucket, key, assigned_upstream, last_modified, size
+        FROM objects
+        WHERE bucket = $1 AND key = $2"#,
+        obj.bucket,
+        obj.key
+    )
+    .fetch_optional(con)
+    .await
+    .context("failed to fetch object")
+    .attach(format!("object: {obj}"))?
+    .map(S3Object::try_from)
+    .transpose()
+}
+
 pub(super) async fn get_object(
     con: &mut SqliteConnection,
     obj: &S3ObjectId,
@@ -155,6 +177,24 @@ pub(super) async fn get_upstream(
     .context("failed to fetch object")
     .attach(format!("object: {obj}"))?
     .map(UpstreamId))
+}
+
+pub(super) async fn set_upstream(
+    con: &mut SqliteConnection,
+    obj: &S3ObjectId,
+    upstream: &UpstreamId,
+) -> Result<(), Report> {
+    query!(
+        "UPDATE Objects SET assigned_upstream = ? WHERE bucket = ? AND key = ?",
+        upstream,
+        obj.bucket,
+        obj.key
+    )
+    .execute(con)
+    .await
+    .context("failed to move object")
+    .attach(format!("object: {obj}"))?;
+    Ok(())
 }
 
 pub(super) async fn delete_object(
@@ -236,30 +276,6 @@ pub(super) async fn record_creation_keep_last_modified(
     Ok(())
 }
 
-pub(super) async fn set_upstream(
-    con: &mut SqliteConnection,
-    obj: &S3ObjectId,
-    upstream: &UpstreamId,
-) -> Result<(), Report> {
-    sqlx::query!(
-        r#"
-        UPDATE objects
-        SET assigned_upstream = ?
-        WHERE bucket = ? AND key = ?
-        "#,
-        upstream,
-        obj.bucket,
-        obj.key
-    )
-    .execute(con)
-    .await
-    .context("failed to set upstream for object")
-    .attach(format!("upstream: {upstream}"))
-    .attach(format!("object: '{}'", obj))?;
-
-    Ok(())
-}
-
 pub(super) async fn get_all_buckets(
     con: &mut SqliteConnection,
 ) -> Result<std::collections::HashSet<String>, Report> {
@@ -293,7 +309,9 @@ pub(super) async fn get_pending_migrations_for_rule(
     }
 
     let sql = format!(
-        "SELECT * FROM Objects WHERE assigned_upstream != $1 AND {} {exclude_sql}",
+        "SELECT * FROM Objects WHERE assigned_upstream != $1 AND {} {exclude_sql} \
+         AND NOT EXISTS (SELECT 1 FROM DirtyObjects d \
+                         WHERE d.bucket = Objects.bucket AND d.key = Objects.key)",
         &rule_query.condition,
     );
 

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT bucket, key FROM DirtyObjects",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "218b5df33b7b493147f16558a4769a64e601d97fe285569422ab93b7348739fa"
+}

@@ -188,8 +188,21 @@ impl S3Client {
     }
 
     pub async fn head_file(&self, id: &S3ObjectId) -> Result<ObjectInfo, Report> {
+        self.try_head_file(id).await?.ok_or_else(|| {
+            report!("object not found")
+                .attach(format!("status: {}", StatusCode::NOT_FOUND))
+                .attach(format!("object: {id}"))
+        })
+    }
+
+    /// Like [`Self::head_file`], but returns `None` if the object does not exist.
+    pub async fn try_head_file(&self, id: &S3ObjectId) -> Result<Option<ObjectInfo>, Report> {
         let url = self.object_url(id)?;
-        let response = self.signed_request(&url, Method::HEAD, &[]).await?;
+        let response = self.send_signed(&url, Method::HEAD, &[]).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = check_status(response, &Method::HEAD, &url.url).await?;
 
         let last_modified = response.headers().get("last-modified").ok_or_else(|| {
             report!("missing Last-Modified header in HEAD response").attach(format!("object: {id}"))
@@ -221,11 +234,11 @@ impl S3Client {
             .attach(format!("object: {id}"))
             .attach(format!("header value: {size:?}"))?;
 
-        Ok(ObjectInfo {
+        Ok(Some(ObjectInfo {
             last_modified: last_modified.timestamp(),
             key: id.key.clone(),
             size,
-        })
+        }))
     }
 
     /// Tries to delete a file. Returns `false` if the file did not exist in the first place and
@@ -266,35 +279,32 @@ impl S3Client {
         method: Method,
         extra_headers: &[(&str, &str)],
     ) -> Result<Response, Report> {
-        // S3 SigV4 signed GET with an explicit payload hash header.
-        // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+        let response = self
+            .send_signed(target, method.clone(), extra_headers)
+            .await?;
+        check_status(response, &method, &target.url).await
+    }
+
+    // S3 SigV4 signed request with an explicit payload hash header.
+    // https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+    async fn send_signed(
+        &self,
+        target: &ForwardObjectUrl,
+        method: Method,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response, Report> {
         let url = &target.url;
         let signed_headers = self
             .signing
             .sign(SignRequest::now(method.clone(), target).with_extra_headers(extra_headers))?;
-        let response = self
-            .client
-            .request(method.clone(), url.clone())
+        self.client
+            .request(method, url.clone())
             .headers(signed_headers)
             .send()
             .await
             .context("failed to send S3 request")
-            .attach(format!("url: {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .context("failed to read S3 response body")?;
-            return Err(report!("failed S3 request")
-                .attach(format!("method: {method}"))
-                .attach(format!("status: {status}"))
-                .attach(format!("url: {url}"))
-                .attach(format!("response body: {body}")));
-        }
-
-        Ok(response)
+            .attach(format!("url: {url}"))
+            .map_err(Report::into_dynamic)
     }
 
     async fn signed_get(
@@ -459,6 +469,22 @@ struct ChecksumXml {
     #[serde(rename = "ChecksumSHA256")]
     sha256: String,
     checksum_type: String,
+}
+
+async fn check_status(response: Response, method: &Method, url: &Url) -> Result<Response, Report> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response
+        .text()
+        .await
+        .context("failed to read S3 response body")?;
+    Err(report!("failed S3 request")
+        .attach(format!("method: {method}"))
+        .attach(format!("status: {status}"))
+        .attach(format!("url: {url}"))
+        .attach(format!("response body: {body}")))
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use parkhaus::db::Database;
 use parkhaus::policy::expr::{parse_expr, typecheck};
 use parkhaus::s3::client::{ObjectInfo, S3Client};
 use parkhaus::s3::types::AddressingStyle;
-use parkhaus::server::MigrationLocks;
+use parkhaus::server::KeyLocks;
 use parkhaus::server::migrate::{compute_pending_migrations, execute_migrations};
 use rand::prelude::IndexedRandom;
 use rand::rngs::StdRng;
@@ -304,14 +304,7 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         .collect::<HashSet<_>>();
     assert_eq!(pending_set, expected_pending, "pending migrations mismatch");
 
-    let errors = execute_migrations(
-        pending,
-        Vec::new(),
-        &config,
-        &db,
-        &MigrationLocks::default(),
-    )
-    .await?;
+    let errors = execute_migrations(pending, &config, &db, &KeyLocks::default()).await?;
     assert_eq!(0, errors, "migration execution failed: {errors:?}");
 
     let tier_to_keys = [
@@ -358,8 +351,7 @@ async fn e2e_executes_expected_migrations_across_three_upstreams() -> Result<(),
         assert_eq!(actual_payload, object.payload);
     }
 
-    let left_in_flight = db.get_in_flight().await?;
-    assert!(left_in_flight.is_empty());
+    assert!(db.get_dirty_objects().await?.is_empty());
 
     db.close().await?;
     Ok(())
@@ -460,5 +452,46 @@ fn print_migrations(
         );
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn objects_without_accesses_reach_catch_all_rule() -> Result<(), Report> {
+    let db = Database::in_memory().await?;
+    let rule = |tier: Tier, expr: &str| TieringRule {
+        to: UpstreamId(tier.to_string()),
+        filter: typecheck(parse_expr(expr).unwrap(), expr).unwrap(),
+    };
+    let base = test_config()?;
+    let config = Config::new(
+        base.listen,
+        None,
+        base.db_path,
+        base.upstreams.into_values().collect(),
+        vec![
+            rule(Tier::Hot, "access_counts(0d, 3d) >= 8"),
+            rule(Tier::Cold, "true"),
+        ],
+    )?;
+    let id = S3ObjectId {
+        bucket: "test".to_owned(),
+        key: "never-accessed".to_owned(),
+    };
+    db.record_creation(&S3Object {
+        id: id.clone(),
+        assigned_upstream: UpstreamId(Tier::Hot.to_string()),
+        last_modified: Zoned::now().timestamp(),
+        size: 1,
+    })
+    .await?;
+
+    let pending = compute_pending_migrations(&config, &db, Zoned::now()).await?;
+
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].object, id);
+    assert_eq!(
+        pending[0].target_upstream,
+        UpstreamId(Tier::Cold.to_string())
+    );
     Ok(())
 }

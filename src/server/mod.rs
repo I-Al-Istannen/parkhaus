@@ -4,6 +4,7 @@ pub(super) mod endpoints;
 pub mod listing;
 pub(super) mod metrics;
 pub mod migrate;
+pub mod resolve;
 pub(super) mod state;
 
-pub use state::MigrationLocks;
+pub use state::KeyLocks;

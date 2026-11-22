@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM DirtyObjects WHERE bucket = ? AND key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3c2853425aec5a41d8e56ea29ea52bb8118033a001ad32a8a05f8bff488ff426"
+}

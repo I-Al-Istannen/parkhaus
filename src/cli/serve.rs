@@ -7,7 +7,8 @@ use crate::server::endpoints;
 use crate::server::listing::ListingStore;
 use crate::server::metrics::initialize_metrics;
 use crate::server::migrate::migration_task;
-use crate::server::state::{AppState, MigrationLocks};
+use crate::server::resolve::sweep;
+use crate::server::state::{AppState, KeyLocks};
 use axum::Router;
 use axum::routing::{any, get};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
@@ -75,21 +76,26 @@ async fn start_main_server(
     prometheus_layer: GenericMetricLayer<'static, PrometheusHandle, Handle>,
     shutdown_token: CancellationToken,
 ) -> Result<(), Report> {
-    let migration_locks = MigrationLocks::default();
+    let key_locks = KeyLocks::default();
+    let http = Client::builder()
+        .build()
+        .context("failed to build HTTP client")?;
+
+    info!("resolving dirty objects before accepting requests");
+    sweep(&config, &db, &http, &key_locks).await?;
+
     tokio::spawn(migration_task(
         (*config).clone(),
         db.clone(),
-        migration_locks.clone(),
+        key_locks.clone(),
         shutdown_token.clone(),
     ));
 
     let app_state = AppState {
         config: Arc::clone(&config),
         db,
-        http: Client::builder()
-            .build()
-            .context("failed to build HTTP client")?,
-        migration_locks,
+        http,
+        key_locks,
         listings: ListingStore::default(),
     };
 

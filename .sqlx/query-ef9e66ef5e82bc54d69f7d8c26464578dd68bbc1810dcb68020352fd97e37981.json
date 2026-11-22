@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT target, previous, migration FROM DirtyObjects WHERE bucket = ? AND key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "target",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "previous",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "migration",
+        "ordinal": 2,
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "ef9e66ef5e82bc54d69f7d8c26464578dd68bbc1810dcb68020352fd97e37981"
+}

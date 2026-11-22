@@ -1,11 +1,11 @@
 mod access_times;
+mod dirty;
 mod migrate;
 mod objects;
 
+pub use self::dirty::{DirtyObject, Resolution};
 pub use self::objects::TieringRuleEnv;
-use crate::data::{
-    InFlightMigration, PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId,
-};
+use crate::data::{PendingMigration, S3Object, S3ObjectId, TieringRule, UpstreamId};
 use jiff::{Timestamp, Zoned};
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
@@ -100,6 +100,11 @@ impl Database {
         objects::get_object(&mut *con.acquire().await.context("acquire con")?, obj).await
     }
 
+    pub async fn find_object(&self, obj: &S3ObjectId) -> Result<Option<S3Object>, Report> {
+        let con = self.read().await;
+        objects::find_object(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
     pub async fn has_object(&self, obj: &S3ObjectId) -> Result<bool, Report> {
         let con = self.read().await;
         objects::has_object(&mut *con.acquire().await.context("acquire con")?, obj).await
@@ -168,51 +173,58 @@ impl Database {
         .await
     }
 
-    pub async fn set_upstream(
-        &self,
-        obj: &S3ObjectId,
-        upstream: &UpstreamId,
-    ) -> Result<(), Report> {
+    pub async fn mark_dirty(&self, obj: &S3ObjectId, dirty: &DirtyObject) -> Result<(), Report> {
         let con = self.write().await;
-        objects::set_upstream(
+        dirty::mark(
             &mut *con.acquire().await.context("acquire con")?,
             obj,
-            upstream,
+            dirty,
         )
         .await
     }
 
-    /// Adds all migrations in a transaction (to speed up database operations).
-    /// Duplicates are silently ignored and their state is not adjusted.
-    pub async fn upsert_in_flight_migration(
-        &self,
-        migration: &InFlightMigration,
-    ) -> Result<(), Report> {
-        let con = self.write().await;
-        migrate::add_or_update_in_flight(
-            &mut *con.acquire().await.context("acquire con")?,
-            migration,
-        )
-        .await
-    }
-
-    pub async fn delete_in_flight(
-        &self,
-        source_upstream: &UpstreamId,
-        object: &S3ObjectId,
-    ) -> Result<(), Report> {
-        let con = self.write().await;
-        migrate::delete_in_flight(
-            &mut *con.acquire().await.context("acquire con")?,
-            source_upstream,
-            object,
-        )
-        .await
-    }
-
-    pub async fn get_in_flight(&self) -> Result<Vec<InFlightMigration>, Report> {
+    pub async fn find_dirty(&self, obj: &S3ObjectId) -> Result<Option<DirtyObject>, Report> {
         let con = self.read().await;
-        migrate::get_in_flight(&mut *con.acquire().await.context("acquire con")?).await
+        dirty::find(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    pub async fn get_dirty_objects(&self) -> Result<Vec<S3ObjectId>, Report> {
+        let con = self.read().await;
+        dirty::get_all(&mut *con.acquire().await.context("acquire con")?).await
+    }
+
+    /// Applies the resolution but keeps the object dirty.
+    pub async fn apply_resolution(
+        &self,
+        obj: &S3ObjectId,
+        resolution: &Resolution,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        dirty::apply(
+            &mut *con.acquire().await.context("acquire con")?,
+            obj,
+            resolution,
+        )
+        .await
+    }
+
+    pub async fn clear_dirty(&self, obj: &S3ObjectId) -> Result<(), Report> {
+        let con = self.write().await;
+        dirty::clear(&mut *con.acquire().await.context("acquire con")?, obj).await
+    }
+
+    /// Applies the resolution and clears the dirty mark atomically.
+    pub async fn resolve_dirty(
+        &self,
+        obj: &S3ObjectId,
+        resolution: &Resolution,
+    ) -> Result<(), Report> {
+        let con = self.write().await;
+        let mut transaction = con.begin().await.context("begin transaction")?;
+        dirty::apply(&mut transaction, obj, resolution).await?;
+        dirty::clear(&mut transaction, obj).await?;
+        transaction.commit().await.context("commit transaction")?;
+        Ok(())
     }
 
     pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {

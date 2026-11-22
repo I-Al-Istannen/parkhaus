@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE Objects SET assigned_upstream = ? WHERE bucket = ? AND key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "085dfd1713404da76ed3939863eda71071c95fe57b34412139c966ddca9b4371"
+}

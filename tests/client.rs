@@ -361,6 +361,7 @@ async fn test_head_file_missing_object_errors() -> Result<(), Report> {
         err_text.contains("404"),
         "expected error to mention 404, got: {err_text}"
     );
+    assert!(client.try_head_file(&id).await?.is_none());
 
     Ok(())
 }

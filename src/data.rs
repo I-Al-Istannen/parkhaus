@@ -1,7 +1,6 @@
 pub(crate) use crate::config::UpstreamId;
 use crate::db::TieringRuleEnv;
 use crate::policy::expr::{Expr, Typechecked};
-use derive_more::Display;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
 
@@ -26,29 +25,11 @@ pub struct S3Object {
     pub size: u64,
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Display, sqlx::Type)]
-pub enum MigrationState {
-    Started,
-    CopiedToTarget,
-}
-
-impl MigrationState {
-    pub fn all() -> &'static [Self] {
-        &[Self::Started, Self::CopiedToTarget]
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingMigration {
     pub object: S3ObjectId,
     pub source_upstream: UpstreamId,
     pub target_upstream: UpstreamId,
-}
-
-#[derive(Debug, Clone)]
-pub struct InFlightMigration {
-    pub pending: PendingMigration,
-    pub state: MigrationState,
 }
 
 #[derive(Debug, Clone)]

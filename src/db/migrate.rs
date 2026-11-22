@@ -1,8 +1,8 @@
-use crate::data::{InFlightMigration, MigrationState, PendingMigration, S3ObjectId, UpstreamId};
+use crate::data::{S3ObjectId, UpstreamId};
 use jiff::Timestamp;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
-use sqlx::{SqliteConnection, query, query_as};
+use sqlx::SqliteConnection;
 
 pub(super) async fn get_objects_not_in_range(
     con: &mut SqliteConnection,
@@ -44,99 +44,4 @@ pub(super) async fn get_objects_not_in_range(
     .collect::<Result<Vec<_>, Report>>()?;
 
     Ok(objects)
-}
-
-pub(super) async fn add_or_update_in_flight(
-    con: &mut SqliteConnection,
-    migration: &InFlightMigration,
-) -> Result<(), Report> {
-    let pending = &migration.pending;
-    query!(
-        r#"
-        INSERT INTO InFlightMigrations
-            (source_upstream, target_upstream, bucket, key, state)
-        VALUES
-            ($1, $2, $3, $4, $5)
-        ON CONFLICT DO UPDATE SET
-            state = EXCLUDED.state,
-            target_upstream = EXCLUDED.target_upstream
-        "#,
-        pending.source_upstream,
-        pending.target_upstream,
-        pending.object.bucket,
-        pending.object.key,
-        migration.state
-    )
-    .execute(con)
-    .await
-    .context("failed to add or update in-flight migration")
-    .attach(format!("migration: {:?}", migration))?;
-
-    Ok(())
-}
-
-pub(super) async fn delete_in_flight(
-    con: &mut SqliteConnection,
-    source_upstream: &UpstreamId,
-    object: &S3ObjectId,
-) -> Result<(), Report> {
-    query!(
-        r#"
-        DELETE FROM InFlightMigrations
-        WHERE source_upstream = $1 AND bucket = $2 AND key = $3
-        "#,
-        source_upstream,
-        object.bucket,
-        object.key
-    )
-    .execute(con)
-    .await
-    .context("failed to delete in-flight migration")
-    .attach(format!("upstream: {source_upstream}"))
-    .attach(format!("object: {object}"))?;
-
-    Ok(())
-}
-
-pub(super) async fn get_in_flight(
-    con: &mut SqliteConnection,
-) -> Result<Vec<InFlightMigration>, Report> {
-    query_as!(
-        DbInFlightMigration,
-        r#"
-        SELECT
-            source_upstream, target_upstream, bucket, key, state as "state: MigrationState"
-        FROM InFlightMigrations
-        "#
-    )
-    .map(InFlightMigration::from)
-    .fetch_all(con)
-    .await
-    .context("failed to get pending migrations")
-    .map_err(Report::into_dynamic)
-}
-
-#[derive(Debug, Clone)]
-struct DbInFlightMigration {
-    bucket: String,
-    key: String,
-    source_upstream: UpstreamId,
-    target_upstream: UpstreamId,
-    state: MigrationState,
-}
-
-impl From<DbInFlightMigration> for InFlightMigration {
-    fn from(value: DbInFlightMigration) -> Self {
-        Self {
-            pending: PendingMigration {
-                object: S3ObjectId {
-                    bucket: value.bucket,
-                    key: value.key,
-                },
-                source_upstream: value.source_upstream,
-                target_upstream: value.target_upstream,
-            },
-            state: value.state,
-        }
-    }
 }
