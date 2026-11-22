@@ -5,6 +5,11 @@ on:
 jobs:
   run-cargo-tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        backend: ["garage", "rustfs"]
+    env:
+      PARKHAUS_TEST_BACKEND: ${{ matrix.backend }}
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5
@@ -28,6 +33,9 @@ jobs:
     strategy:
       matrix:
         command: ["tiering True", "tiering False", "access-log", "crud", "multipart"]
+        backend: ["garage", "rustfs"]
+    env:
+      PARKHAUS_TEST_BACKEND: ${{ matrix.backend }}
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5
