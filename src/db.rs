@@ -261,6 +261,18 @@ impl Database {
         uploads::get_older_than(&mut *con.acquire().await.context("acquire con")?, cutoff).await
     }
 
+    pub async fn get_assignments_in_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<(String, UpstreamId)>, Report> {
+        let con = self.read().await;
+        objects::get_assignments_in_bucket(
+            &mut *con.acquire().await.context("acquire con")?,
+            bucket,
+        )
+        .await
+    }
+
     pub async fn get_all_buckets(&self) -> Result<HashSet<String>, Report> {
         let con = self.read().await;
         objects::get_all_buckets(&mut *con.acquire().await.context("acquire con")?).await

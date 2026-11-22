@@ -276,6 +276,21 @@ pub(super) async fn record_creation_keep_last_modified(
     Ok(())
 }
 
+pub(super) async fn get_assignments_in_bucket(
+    con: &mut SqliteConnection,
+    bucket: &str,
+) -> Result<Vec<(String, UpstreamId)>, Report> {
+    Ok(query!(
+        "SELECT key, assigned_upstream FROM objects WHERE bucket = ?",
+        bucket
+    )
+    .map(|row| (row.key, UpstreamId(row.assigned_upstream)))
+    .fetch_all(con)
+    .await
+    .context("failed to fetch objects of bucket")
+    .attach(format!("bucket: {bucket}"))?)
+}
+
 pub(super) async fn get_all_buckets(
     con: &mut SqliteConnection,
 ) -> Result<std::collections::HashSet<String>, Report> {

@@ -8,6 +8,7 @@ use parkhaus::db::{Database, DirtyObject, MultipartUpload};
 use parkhaus::s3::client::S3Client;
 use parkhaus::s3::types::AddressingStyle;
 use parkhaus::server::KeyLocks;
+use parkhaus::server::reconcile::{Discrepancy, reconcile};
 use parkhaus::server::resolve::{resolve, sweep};
 use parkhaus::server::uploads::{ABANDONED_UPLOAD_AGE, reap_abandoned_uploads};
 use reqwest::Client;
@@ -352,5 +353,56 @@ async fn abandoned_uploads_are_reaped() -> Result<(), Report> {
     assert_eq!(reaped, 1);
     assert_eq!(env.db.get_upload_upstream("old").await?, None);
     assert_eq!(env.db.get_upload_upstream("recent").await?, Some(hot()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_reports_every_disagreement() -> Result<(), Report> {
+    let env = Env::new().await?;
+    let bucket = "reconcile";
+    for cell in [&HOT, &COLD] {
+        let (backend, upstream) = cell.get().expect("started by Env::new");
+        let bucket_id = backend.create_bucket(bucket).await?;
+        backend
+            .allow_key_on_bucket(&bucket_id, &upstream.s3_access_key)
+            .await?;
+    }
+    let id = |key: &str| S3ObjectId {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    };
+
+    env.put(&hot(), &id("fine"), b"a").await?;
+    env.record(&hot(), &id("fine"), 1).await?;
+    env.put(&cold(), &id("untracked"), b"a").await?;
+    env.put(&hot(), &id("stale"), b"a").await?;
+    env.put(&cold(), &id("stale"), b"a").await?;
+    env.record(&hot(), &id("stale"), 1).await?;
+    env.record(&cold(), &id("missing"), 1).await?;
+    env.put(&cold(), &id("dirty"), b"a").await?;
+    env.db
+        .mark_dirty(&id("dirty"), &dirty(cold(), None))
+        .await?;
+
+    let mut found: Vec<_> = reconcile(&env.config, &env.db, &env.http, &KeyLocks::default())
+        .await?
+        .into_iter()
+        .filter(|it| match it {
+            Discrepancy::Untracked { object, .. }
+            | Discrepancy::Stale { object, .. }
+            | Discrepancy::Missing { object, .. } => object.bucket == bucket,
+        })
+        .map(|it| it.to_string())
+        .collect();
+    found.sort();
+
+    assert_eq!(
+        found,
+        vec![
+            "reconcile/missing is assigned to cold but missing there".to_string(),
+            "reconcile/stale exists on cold but is assigned to hot".to_string(),
+            "reconcile/untracked exists on cold but is not in the database".to_string(),
+        ]
+    );
     Ok(())
 }

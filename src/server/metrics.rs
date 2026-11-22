@@ -4,6 +4,7 @@ use axum_prometheus::metrics::{counter, describe_counter, describe_gauge, gauge}
 use std::collections::HashMap;
 
 pub const GAUGE_PENDING_ACTIONS: &str = "pending_actions";
+pub const GAUGE_RECONCILE_DISCREPANCIES: &str = "reconcile_discrepancies";
 pub const COUNTER_MIGRATION_RUNS_TOTAL: &str = "migration_runs_total";
 pub const COUNTER_MIGRATION_RULE_MIGRATIONS_TOTAL: &str = "migration_rule_migrations_total";
 pub const COUNTER_MIGRATED_OBJECTS_TOTAL: &str = "migrated_objects_total";
@@ -148,6 +149,10 @@ pub fn initialize_metrics() {
     describe_counter!(
         COUNTER_OBJECT_CREATIONS_TOTAL,
         "Total number of object creation requests"
+    );
+    describe_gauge!(
+        GAUGE_RECONCILE_DISCREPANCIES,
+        "Objects whose location in the database disagrees with the upstreams at the last reconciliation"
     );
     describe_counter!(
         COUNTER_OBJECT_DELETIONS_TOTAL,

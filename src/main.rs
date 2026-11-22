@@ -26,6 +26,8 @@ enum Command {
     Serve,
     /// Import objects from all configured upstreams into the local database.
     Import(ImportOptions),
+    /// Report objects whose location in the database disagrees with the upstreams.
+    Reconcile,
 }
 
 #[tokio::main]
@@ -49,6 +51,7 @@ async fn run() -> Result<(), Report> {
     let result = match cli.command {
         Command::Serve => cli::serve::run(config, db.clone()).await,
         Command::Import(options) => cli::import::run(config, db.clone(), options).await,
+        Command::Reconcile => cli::reconcile::run(config, db.clone()).await,
     };
 
     if let Err(error) = db.close().await {

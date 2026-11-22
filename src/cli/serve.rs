@@ -7,6 +7,7 @@ use crate::server::endpoints;
 use crate::server::listing::ListingStore;
 use crate::server::metrics::initialize_metrics;
 use crate::server::migrate::migration_task;
+use crate::server::reconcile::reconcile_task;
 use crate::server::resolve::sweep;
 use crate::server::state::{AppState, KeyLocks};
 use axum::Router;
@@ -84,6 +85,13 @@ async fn start_main_server(
     info!("resolving dirty objects before accepting requests");
     sweep(&config, &db, &http, &key_locks).await?;
 
+    tokio::spawn(reconcile_task(
+        Arc::clone(&config),
+        db.clone(),
+        http.clone(),
+        key_locks.clone(),
+        shutdown_token.clone(),
+    ));
     tokio::spawn(migration_task(
         (*config).clone(),
         db.clone(),

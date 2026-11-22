@@ -80,6 +80,38 @@ colder or hotter storage, depending on their age.
      <img alt="Fallback image description" src="./assets/host-modification-light.svg">
    </picture>
   </div>
+- parkhaus must be the only one writing to the upstreams. Its database is the
+  source of truth for where an object lives, objects it does not know are
+  treated as missing.
+- Versioning and lifecycle rules must be disabled on all upstreams, as they
+  change objects behind parkhaus' back. parkhaus aborts multipart uploads that
+  were not completed within seven days itself.
+- Bucket configuration (CORS, policies, ...) must be identical on all
+  upstreams and is applied to each upstream directly. Reads may be answered by
+  any upstream.
+- Upstreams must provide read-after-write consistency.
+
+### Supported operations
+parkhaus only forwards operations whose effect on objects it understands and
+answers everything else with `501 Not Implemented`:
+- Objects: GET, HEAD, PUT, CopyObject, DELETE and multipart uploads
+  (including UploadPartCopy within one upstream). Requests naming a
+  `versionId`, writes of tags, ACLs, retention or legal holds, SSE-C and
+  PostObject are rejected. Keys with `.` or `..` path segments are rejected.
+- Buckets: ListObjectsV2 (merged across upstreams), DeleteObjects and all
+  read-only requests, which the hottest upstream answers. ListObjects (v1),
+  ListObjectVersions, ListMultipartUploads and any bucket modification are
+  rejected.
+- ListBuckets, answered by the hottest upstream.
+
+### Consistency
+Every change is first recorded as pending in the database, then forwarded,
+then settled by asking the upstreams. Changes interrupted by crashes or client
+disconnects are settled at the next start and then every minute.
+`parkhaus --config config.toml reconcile` (or the daily check in `serve`,
+exposed as the `reconcile_discrepancies` metric) compares the upstreams with
+the database and reports every object where they disagree. With the
+requirements above it should never find anything.
 
 ## Config format
 
