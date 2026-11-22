@@ -23,10 +23,10 @@ const SAMPLE_ERRORS: usize = 50;
 pub async fn migration_task(
     config: Config,
     db: Database,
+    http: Client,
     key_locks: KeyLocks,
     shutdown: CancellationToken,
 ) {
-    let http = Client::new();
     let work = async {
         loop {
             // Only check sometimes :)
@@ -48,7 +48,7 @@ pub async fn migration_task(
                 }
                 Ok(migrations) => migrations,
             };
-            match execute_migrations(pending, &config, &db, &key_locks).await {
+            match execute_migrations(pending, &config, &db, &http, &key_locks).await {
                 Err(error) => error!(%error, "Failed to execute pending migrations"),
                 Ok(0) => {}
                 Ok(errors) => error!(error_count = errors, "Failed to perform migrations",),
@@ -117,16 +117,16 @@ pub async fn execute_migrations(
     pending: Vec<PendingMigration>,
     config: &Config,
     db: &Database,
+    http: &Client,
     key_locks: &KeyLocks,
 ) -> Result<usize, Report> {
     let mut metrics = MigrationMetrics::snapshot(config, &pending);
     debug!(count = pending.len(), "Executing pending migrations");
 
-    let http = Client::new();
     let mut failed = 0;
     let mut sampled_errors = Vec::with_capacity(SAMPLE_ERRORS);
     for migration in &pending {
-        match execute_migration(migration, config, db, &http, key_locks).await {
+        match execute_migration(migration, config, db, http, key_locks).await {
             Ok(()) => metrics.completed(migration),
             Err(e) => {
                 debug!(%e, "Failed to execute pending migration");

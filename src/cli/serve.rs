@@ -14,7 +14,6 @@ use axum::Router;
 use axum::routing::{any, get};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use axum_prometheus::{GenericMetricLayer, Handle, PrometheusMetricLayer};
-use reqwest::Client;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 use tokio::net::TcpListener;
@@ -78,9 +77,7 @@ async fn start_main_server(
     shutdown_token: CancellationToken,
 ) -> Result<(), Report> {
     let key_locks = KeyLocks::default();
-    let http = Client::builder()
-        .build()
-        .context("failed to build HTTP client")?;
+    let http = crate::s3::client::http_client()?;
 
     info!("resolving dirty objects before accepting requests");
     sweep(&config, &db, &http, &key_locks).await?;
@@ -95,6 +92,7 @@ async fn start_main_server(
     tokio::spawn(migration_task(
         (*config).clone(),
         db.clone(),
+        http.clone(),
         key_locks.clone(),
         shutdown_token.clone(),
     ));

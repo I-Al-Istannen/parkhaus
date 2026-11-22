@@ -46,9 +46,7 @@ pub async fn run(config: Arc<Config>, db: Database, options: ImportOptions) -> R
         .with(env_filter())
         .init();
 
-    let client = Client::builder()
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = crate::s3::client::http_client()?;
 
     for (name, upstream) in &config.upstreams {
         if let Some(regex) = &options.upstream_regex

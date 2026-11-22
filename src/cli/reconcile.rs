@@ -3,8 +3,6 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::server::KeyLocks;
 use crate::server::reconcile::reconcile;
-use reqwest::Client;
-use rootcause::prelude::ResultExt;
 use rootcause::{Report, bail};
 use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
@@ -21,9 +19,7 @@ pub async fn run(config: Arc<Config>, db: Database) -> Result<(), Report> {
         .with(env_filter())
         .init();
 
-    let http = Client::builder()
-        .build()
-        .context("failed to build HTTP client")?;
+    let http = crate::s3::client::http_client()?;
     let discrepancies = reconcile(&config, &db, &http, &KeyLocks::default()).await?;
     for discrepancy in &discrepancies {
         println!("{discrepancy}");

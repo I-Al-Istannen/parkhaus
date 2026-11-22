@@ -12,11 +12,23 @@ use rootcause::{Report, report};
 use serde::Deserialize;
 use sha2::Digest;
 use std::io::Write;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use url::Url;
+
+/// Client for talking to upstreams: never follows redirects, so signed requests and their
+/// credentials stay with the configured endpoint.
+pub fn http_client() -> Result<Client, Report> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")
+        .map_err(Report::into_dynamic)
+}
 
 pub struct S3Client {
     client: Client,
