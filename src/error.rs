@@ -15,18 +15,31 @@ pub struct TierError {
     report: Report,
 }
 
+impl TierError {
+    /// The status attached to the error and the message of the report it is attached to, if any.
+    fn status_and_message(&self) -> Option<(StatusCode, String)> {
+        self.report.iter_reports().find_map(|node| {
+            node.attachments()
+                .iter()
+                .find_map(|it| it.downcast_inner::<StatusCode>())
+                .map(|status| (*status, node.format_current_context().to_string()))
+        })
+    }
+
+    /// The message of an error answered with `501 Not Implemented`.
+    pub fn not_implemented_message(&self) -> Option<String> {
+        self.status_and_message()
+            .filter(|(status, _)| *status == StatusCode::NOT_IMPLEMENTED)
+            .map(|(_, message)| message)
+    }
+}
+
 impl IntoResponse for TierError {
     /// Answers with an S3 error document. Only errors with a status carry their message to the
     /// client, everything else is logged and reported as an internal error.
     fn into_response(self) -> Response {
         let request_id = format!("{:016x}", rand::random::<u64>());
-        let with_status = self.report.iter_reports().find_map(|node| {
-            node.attachments()
-                .iter()
-                .find_map(|it| it.downcast_inner::<StatusCode>())
-                .map(|status| (*status, node.format_current_context().to_string()))
-        });
-        let (status, message) = with_status.unwrap_or_else(|| {
+        let (status, message) = self.status_and_message().unwrap_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "We encountered an internal error. Please try again.".to_string(),

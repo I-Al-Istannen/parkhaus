@@ -32,7 +32,43 @@ pub async fn proxy_request(
 ) -> Result<Response, TierError> {
     debug!(%original_uri, method=%req.method(), "received request for URL");
 
-    match classify(req.method(), &original_uri, req.headers())? {
+    let method = req.method().clone();
+    let user_agent = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|it| it.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let result = route(state, &original_uri, req).await;
+    if let Err(error) = &result
+        && let Some(reason) = error.not_implemented_message()
+    {
+        // Only the names of query parameters, as presigned URLs carry signatures in their values.
+        let query: Vec<&str> = original_uri
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|it| !it.is_empty())
+            .map(|it| it.split_once('=').map_or(it, |(name, _)| name))
+            .collect();
+        warn!(
+            %method,
+            path = %original_uri.path(),
+            query = %query.join("&"),
+            %user_agent,
+            %reason,
+            "rejected unsupported request"
+        );
+    }
+    result
+}
+
+async fn route(
+    state: AppState,
+    original_uri: &axum::http::Uri,
+    req: Request,
+) -> Result<Response, TierError> {
+    match classify(req.method(), original_uri, req.headers())? {
         Classified::ListBuckets => forward_to_hottest(&state, "", None, req).await,
         Classified::Bucket { bucket, op } => match op {
             BucketOp::ListObjectsV2 => proxy_list_objects_v2(&state, &bucket, req).await,

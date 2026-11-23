@@ -482,7 +482,10 @@ def start_backend(temp_dir: Path, config_path: Path):
 
     has_errors = False
     for line in logfile.read_text().splitlines():
-        if ("WARN" in line or "ERROR" in line) and "SIGTERM" not in line:
+        if not ("WARN" in line or "ERROR" in line):
+            continue
+        # Tests provoke 501s on purpose, which parkhaus logs as a warning.
+        if "SIGTERM" not in line and "rejected unsupported request" not in line:
             has_errors = True
 
     if has_errors:
